@@ -14,23 +14,22 @@
 # ==============================================================================
 """Additional XLA devices to be included in the unit test suite."""
 
-# Example:
-#
-# plugins = {
-#   "foo": {
-#     "deps": [
-#       "//tensorflow/compiler/plugin/foo:foo_lib",
-#       "//tensorflow/compiler/plugin/foo:test_macros",
-#     ],
-#     "disabled_manifest": "tensorflow/compiler/plugin/foo/disabled_test_manifest.txt",
-#     "copts": [],
-#     "tags": [],
-#     "args": []
-#     "data": [
-#       "//tensorflow/compiler/plugin/foo:disabled_test_manifest.txt",
-#     ],
-#   },
-# }
-
-plugins = {}
+plugins = {
+  "poplar": {
+    "deps": [
+      "//tensorflow/compiler/plugin/poplar:poplar_lib",
+      "//tensorflow/compiler/xla/tests:test_macros_poplar",
+    ],
+    "disabled_manifest": "tensorflow/compiler/plugin/poplar/disabled_xla_tests_manifest.txt",
+    "copts": [
+      "-DXLA_BACKEND_DOES_NOT_SUPPORT_FLOAT64",
+      "-DXLA_BACKEND_DOES_NOT_SUPPORT_COMPLEX",
+    ],
+    "tags": [],
+    "args": [],
+    "data": [
+      "//tensorflow/compiler/plugin/poplar:disabled_xla_tests_manifest.txt",
+    ],
+  },
+}
 

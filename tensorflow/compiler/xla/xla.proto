@@ -238,6 +238,12 @@ message ExecutionOptions {
   // computation on. The computation will be partitioned across these devices.
   // If not provided, the default device will be chosen.
   repeated DeviceHandle device_handles = 5;
+
+  // The number of inputs which are resource variable inputs
+  uint32 resource_input_count = 6;
+
+  // The number of outputs which are updates for resource variables
+  repeated int32 resource_update_to_input_index = 7;
 }
 
 message GetDeviceHandlesRequest {
