@@ -42,18 +42,9 @@ struct CompilerAnnotations {
 
   ConvClassification classification_map;
 
-  absl::flat_hash_map<const HloInstruction*,
-                      InplaceUtil::InplaceHloInstructionDescription>
-      inplace_calls;
-
   InplaceUtil::InplaceInstructions inplace_instructions;
 
   std::map<const HloComputation*, const HloInstruction*> fusion_map;
-
-  // A map from a while instruction to the repeat count. If the while
-  // instruction is not present in this map then it can't be executed as a
-  // repeat.
-  std::map<const HloInstruction*, uint64> while_loop_num_iterations;
 };
 
 }  // namespace poplarplugin

@@ -14,8 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/compiler/plugin/poplar/driver/inplace_util.h"
+#include "tensorflow/compiler/plugin/poplar/driver/util.h"
 
-#include "tensorflow/compiler/plugin/poplar/driver/compiler_annotations.h"
 #include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
 
 #include "tensorflow/compiler/xla/service/hlo_module.h"
@@ -24,32 +24,47 @@ namespace xla {
 namespace poplarplugin {
 namespace InplaceUtil {
 namespace {
+// Map from name to the number of the first x operands which are inplace
+static std::map<std::string, uint64> fused_inplace_info_map = {
+    {"relu", 1},           {"sigmoid", 1},    {"conv_biasadd", 1},
+    {"matmul_biasadd", 1}, {"bias_apply", 1}, {"conv_scaled_inplace", 1},
+    {"scaled_inplace", 1},
+};
+
 bool IsNotDependencyOfPeers(HloInstruction* inplace,
                             HloInstruction* inplace_parent,
                             HloReachabilityMap* reachability_map,
                             std::vector<HloInstruction*>& added_dependencies) {
   HloComputation* comp = inplace->parent();
-  // Verify that inplace is not a dependency of any of the peers (cond 3b).
   for (auto* peer : inplace_parent->users()) {
     if (peer == inplace) {
       continue;
     }
-
-    // If peer is a depenency of inplace, this can't be inplace
-    if (reachability_map->IsReachable(inplace, peer)) {
-      return false;
+    if (inplace->opcode() == HloOpcode::kGetTupleElement) {
+      // Special case for GTE - it's not a dependency if all other users of
+      // parent are GTEs and there is no other GTE with the same GTE index.
+      if (peer->opcode() != HloOpcode::kGetTupleElement) {
+        return false;
+      }
+      if (peer->tuple_index() == inplace->tuple_index()) {
+        return false;
+      }
     } else {
-      // If there already wasn't a control depdenency then insert it
-      if (!reachability_map->IsReachable(peer, inplace)) {
-        peer->AddControlDependencyTo(inplace);
-        comp->UpdateReachabilityThroughInstruction(inplace, reachability_map);
-        added_dependencies.push_back(peer);
+      if (reachability_map->IsReachable(inplace, peer)) {
+        return false;
+      } else {
+        // If there already wasn't a control dependency then insert it
+        if (!reachability_map->IsReachable(peer, inplace)) {
+          peer->AddControlDependencyTo(inplace);
+          comp->UpdateReachabilityThroughInstruction(inplace, reachability_map);
+          added_dependencies.push_back(peer);
+        }
       }
     }
   }
   return true;
 }
-}
+}  // namespace
 
 HloInstructionDescription::HloInstructionDescription() {}
 bool HloInstructionDescription::IsInPlaceType(const HloInstruction*) {
@@ -73,7 +88,7 @@ InplaceHloInstructionDescription::GetInplaceOperandIndexes() const {
 }
 
 std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
-    const HloInstruction* inst, const CompilerAnnotations& annotations) {
+    const HloInstruction* inst) {
   switch (inst->opcode()) {
     // Unary Elementwise ops - inplace on operand 0.
     case HloOpcode::kAbs:
@@ -141,6 +156,7 @@ std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
 
     // Inplace on all operands.
     case HloOpcode::kConcatenate:
+    case HloOpcode::kConditional:
     case HloOpcode::kFusion:
     case HloOpcode::kMap:
     case HloOpcode::kTuple:
@@ -151,13 +167,21 @@ std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
     }
 
     case HloOpcode::kCall: {
-      // Check if the call is inplace.
-      auto it = annotations.inplace_calls.find(inst);
-      if (it != annotations.inplace_calls.end()) {
-        // If the call is inplace, then get the operands at affected indexes.
-        auto inplace_call_description = it->second;
-        return absl::make_unique<InplaceHloInstructionDescription>(
-            inplace_call_description.GetInplaceOperandIndexes());
+      if (IsPopOpsCall(inst)) {
+        auto comp_name = inst->to_apply()->name();
+        auto end = comp_name.find('.');
+        std::string popops_name = comp_name.substr(8, end - 8);
+
+        if (fused_inplace_info_map.count(popops_name) == 1) {
+          OperandIndexes indexes(fused_inplace_info_map.at(popops_name));
+          std::iota(indexes.begin(), indexes.end(), 0);
+          return absl::make_unique<InplaceHloInstructionDescription>(indexes);
+        } else {
+          return absl::make_unique<NotInplaceHloInstructionDescription>();
+        }
+      } else if (IsRepeatCall(inst)) {
+        // TODO T4848
+        return absl::make_unique<NotInplaceHloInstructionDescription>();
       } else {
         // TODO T4848
         return absl::make_unique<NotInplaceHloInstructionDescription>();
@@ -206,7 +230,6 @@ std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
     case HloOpcode::kTupleSelect:
     case HloOpcode::kRng:
     case HloOpcode::kSelectAndScatter:
-    case HloOpcode::kConditional:
     case HloOpcode::kConstant:
     case HloOpcode::kConvolution:
     case HloOpcode::kDot:
@@ -242,13 +265,12 @@ std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
   }
 }
 
-bool IsInPlace(HloInstruction* inst, const CompilerAnnotations& annotations,
-               HloReachabilityMap* reachability_map) {
+bool IsInPlace(HloInstruction* inst, HloReachabilityMap* reachability_map) {
   // An instruction is inplace if:
   // 1. It has an inplace type, and
   // 2. For each inplace operand instruction, instruction is not a dependency of
   // peer (users of the same operands).
-  auto info = GetHloInstructionDescription(inst, annotations);
+  auto info = GetHloInstructionDescription(inst);
 
   // Verify it is inplace (cond 1).
   if (!info->IsInPlaceType(inst)) {

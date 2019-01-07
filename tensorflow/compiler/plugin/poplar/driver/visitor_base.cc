@@ -48,19 +48,18 @@ limitations under the License.
 namespace xla {
 namespace poplarplugin {
 
-typedef StatusOr<poplar::program::Program> (*FusedCallFn)(CompilerResources&,
-                                                          const HloInstruction*,
-                                                          const xla::Shape&,
-                                                          TensorMap&);
+typedef StatusOr<poplar::program::Program> (*CustomCallFn)(
+    CompilerResources&, const HloInstruction*, const xla::Shape&, TensorMap&);
 
-static std::map<std::string, FusedCallFn> fused_call_map = {
+static std::map<std::string, CustomCallFn> custom_call_map = {
     {"const_slice_update", CreateSliceUpdateOp},
     {"const_slice", CreateSliceOp},
     {"relu", CreateReluOp},
     {"relugrad", CreateReluGradOp},
     {"sigmoid", CreateSigmoidOp},
     {"sigmoidgrad", CreateSigmoidGradOp},
-    {"biasadd", CreateBiasAddOp},
+    {"conv_biasadd", CreateConvBiasAddOp},
+    {"matmul_biasadd", CreateMatMulBiasAddOp},
     {"trunc_norm", TruncatedNormal},
     {"norm_scale_add", RandomNormalScale},
     {"uniform_scale_add", RandomUniformScale},
@@ -290,17 +289,22 @@ Status BaseVisitor::HandleCall(HloInstruction* inst) {
     auto end = comp->name().find('.');
     std::string name = comp->name().substr(8, end - 8);
 
-    if (fused_call_map.count(name) == 1) {
+    if (custom_call_map.count(name) == 1) {
       poplar::program::Program prog;
       TF_ASSIGN_OR_RETURN(
-          prog, fused_call_map.at(name)(resources_, inst, GetOutputShape(inst),
-                                        tensor_map));
+          prog, custom_call_map.at(name)(resources_, inst, GetOutputShape(inst),
+                                         tensor_map));
       sequence.add(prog);
       return Status::OK();
     } else {
       return xla::FailedPrecondition("Unrecognized special call op %s: %s",
                                      inst->name().c_str(), name.c_str());
     }
+  } else if (IsRepeatCall(comp)) {
+    TF_ASSIGN_OR_RETURN(
+        poplar::program::Program prog,
+        CreateRepeatOp(resources_, inst, GetOutputShape(inst), tensor_map));
+    sequence.add(prog);
   } else {
     poplar::program::Program prog;
     TF_ASSIGN_OR_RETURN(

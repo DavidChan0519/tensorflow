@@ -3,8 +3,8 @@
 #include "absl/strings/str_cat.h"
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
+#include "tensorflow/compiler/plugin/poplar/driver/conv_graph_caching.h"
 #include "tensorflow/compiler/plugin/poplar/driver/convolution_classifier.h"
-#include "tensorflow/compiler/plugin/poplar/driver/graph_caching_util.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/util.h"
@@ -242,8 +242,9 @@ poplar::Tensor AddGroupsDimensionToWeights(const poplin::ConvParams& p,
     chan_div[out_dim] = out.dim(out_dim) / p.getNumOutputChansPerConvGroup();
 
     // OI... ->(GO)(GI)...
-    out = out.reshapePartial(0, 2, {chan_div[0], out.dim(0) / chan_div[0],
-                                    chan_div[1], out.dim(1) / chan_div[1]});
+    out = out.reshapePartial(0, 2,
+                             {chan_div[0], out.dim(0) / chan_div[0],
+                              chan_div[1], out.dim(1) / chan_div[1]});
 
     // (GO)(GI)... -> (GG)OI...
     out = out.dimShufflePartial({2}, {1});
@@ -283,7 +284,7 @@ StatusOr<poplar::program::Program> CreateConv2D(CompilerResources& res,
 
   const auto conv_type = GetConvClassificationType(conv, res.annotations);
 
-  auto out = graph_caching_util::DoCachedConvolution(graph, res, in, kernel,
+  auto out = conv_graph_caching::DoCachedConvolution(graph, res, in, kernel,
                                                      params, conv_type, false,
                                                      prog, GetDebugName(conv));
 
@@ -323,7 +324,7 @@ StatusOr<poplar::program::Program> Create2DConvWithReverse(
 
   auto conv_type = GetConvClassificationType(inst, res.annotations);
 
-  auto out = graph_caching_util::DoCachedConvolution(graph, res, in, kernel,
+  auto out = conv_graph_caching::DoCachedConvolution(graph, res, in, kernel,
                                                      params, conv_type, true,
                                                      prog, GetDebugName(conv));
 
@@ -369,7 +370,7 @@ StatusOr<poplar::program::Program> CreateDepthwiseBackpropFilter(
 
   auto conv_type = GetConvClassificationType(inst, res.annotations);
 
-  poplar::Tensor out = graph_caching_util::DoCachedConvolution(
+  poplar::Tensor out = conv_graph_caching::DoCachedConvolution(
       graph, res, in, kernel, params, conv_type, false, prog,
       GetDebugName(conv));
 
@@ -414,7 +415,7 @@ StatusOr<poplar::program::Program> CreateConvScaledInplace(
   poplin::ConvParams params;
   TF_ASSIGN_OR_RETURN(params, GetConvolutionParameters(inst, conv, 1, 2));
 
-  TF_CHECK_OK(graph_caching_util::DoCachedConvolutionWithScaledAdd(
+  TF_CHECK_OK(conv_graph_caching::DoCachedConvolutionWithScaledAdd(
       graph, res, w, in, deltas, params, prog, root, conv));
 
   TF_CHECK_OK(AddOutputTensor(tensor_map, inst, 0, w));
@@ -422,19 +423,22 @@ StatusOr<poplar::program::Program> CreateConvScaledInplace(
   return prog;
 }
 
-StatusOr<poplar::program::Program> CreateBiasAddOp(
+StatusOr<poplar::program::Program> CreateConvBiasAddOp(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output_shape, TensorMap& tensor_map) {
   poplar::Graph& graph = GetGraph(res, inst);
 
   poplar::program::Sequence prog;
 
-  poplar::Tensor in;
-  TF_ASSIGN_OR_RETURN(in, FindInstructionInput(tensor_map, res, inst, 0, prog));
+  TF_ASSIGN_OR_RETURN(ArgVectors inputs,
+                      GetInplaceOutputTensors(tensor_map, res, inst, prog));
+  CHECK_EQ(inputs.size(), 1);
+  CHECK_EQ(inputs[0].size(), 1);
+  poplar::Tensor in = inputs[0][0];
 
   poplar::Tensor bias;
-  TF_ASSIGN_OR_RETURN(bias,
-                      FindInstructionInput(tensor_map, res, inst, 1, prog));
+  TF_ASSIGN_OR_RETURN(
+      bias, FindInstructionInput(tensor_map, res, inst, 1, prog, false));
 
   const auto* conv_op = FindConvolutionOp(inst->operand(0), res.annotations);
 
@@ -457,9 +461,11 @@ StatusOr<poplar::program::Program> ConvBiasApply(CompilerResources& res,
   const HloInstruction* root = inst->to_apply()->root_instruction();
 
   // Find the biases
-  poplar::Tensor biases;
-  TF_ASSIGN_OR_RETURN(biases,
-                      FindInstructionInput(tensor_map, res, inst, 0, prog));
+  TF_ASSIGN_OR_RETURN(ArgVectors inputs,
+                      GetInplaceOutputTensors(tensor_map, res, inst, prog));
+  CHECK_EQ(inputs.size(), 1);
+  CHECK_EQ(inputs[0].size(), 1);
+  poplar::Tensor biases = inputs[0][0];
 
   // Find the deltas
   poplar::Tensor deltas;

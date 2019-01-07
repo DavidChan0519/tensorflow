@@ -23,13 +23,17 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
 #include "tensorflow/compiler/plugin/poplar/driver/conversions.h"
 #include "tensorflow/compiler/plugin/poplar/driver/custom_ops/custom_ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/matcher_predicates.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/util.h"
 #include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
+
 #include "tensorflow/compiler/xla/layout_util.h"
 #include "tensorflow/compiler/xla/literal_util.h"
+#include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
+#include "tensorflow/compiler/xla/service/hlo_instructions.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/core/lib/strings/str_util.h"
@@ -38,6 +42,7 @@ limitations under the License.
 
 #include <poplar/Engine.hpp>
 #include <poplar/OptionFlags.hpp>
+#include <popnn/BatchNorm.hpp>
 #include <poputil/TileMapping.hpp>
 
 #include <functional>
@@ -62,16 +67,6 @@ bool InstructionSharded(const HloInstruction* a) {
   return false;
 }
 
-uint64 GetShard(const HloInstruction* inst) {
-  if (inst->has_sharding()) {
-    const auto& sharding = inst->sharding();
-    if (sharding.HasUniqueDevice()) {
-      return sharding.GetUniqueDevice();
-    }
-  }
-  return 0;
-}
-
 TensorVector GetAllTensorsInMap(const TensorMap& map,
                                 const HloInstruction* inst) {
   auto lower = std::make_pair(inst->name(), 0);
@@ -83,9 +78,9 @@ TensorVector GetAllTensorsInMap(const TensorMap& map,
   return outputs;
 }
 
-ArgVector GetExpandedTensors(
+ArgVector GetTensorsMaybeExpand(
     TensorMap& map, CompilerResources& res, const HloInstruction* inst,
-    poplar::program::Sequence& seq,
+    poplar::program::Sequence& seq, const bool expand_constants,
     absl::optional<int64> opt_tensors_start = absl::nullopt,
     absl::optional<int64> opt_tensors_end = absl::nullopt) {
   TensorVector tensor_vector = GetAllTensorsInMap(map, inst);
@@ -97,7 +92,7 @@ ArgVector GetExpandedTensors(
     const auto key = tensor_vector[i].first;
     poplar::Tensor tensor = tensor_vector[i].second;
     // Check if we need to expand the constant tensor.
-    if (tensor.containsConstant()) {
+    if (tensor.containsConstant() && expand_constants) {
       const auto& mapping = graph.getTileMapping(tensor);
       // We only expand the constant tensor if it's mapped to 1 tile and it is
       // not a tensor of scalar shape.
@@ -402,20 +397,36 @@ static StatusOr<poplar::Tensor> AddConvolutionWeights(
   return ShuffleConvolutionWeightsToTensorflow(conv_target, out);
 }
 
-static StatusOr<poplar::Tensor> AddBiasTensor(poplar::Graph& graph,
-                                              const std::string& debug_name,
-                                              const HloInstruction* conv,
-                                              const TensorMap& tensor_map) {
-  OutVector outputs = FindInstructionOutputs(tensor_map, conv);
+static StatusOr<poplar::Tensor> AddConvAddBiasTensor(
+    poplar::Graph& graph, const std::string& debug_name,
+    const HloInstruction* layout, int64 layout_output_idx,
+    const TensorMap& tensor_map) {
+  OutVector outputs = FindInstructionOutputs(tensor_map, layout);
 
-  if (outputs.size() != 1) {
+  if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
     return xla::FailedPrecondition("Convolution %s output not found for %s",
-                                   conv->name(), debug_name);
+                                   layout->name(), debug_name);
   }
 
-  poplar::Tensor acts = outputs[0];
+  poplar::Tensor acts = outputs[layout_output_idx];
 
-  acts = ShuffleConvolutionOutputToPoplar(conv, acts);
+  acts = ShuffleConvolutionOutputToPoplar(layout, acts);
+
+  return poplin::createBiases(graph, acts, debug_name);
+}
+
+static StatusOr<poplar::Tensor> AddMatMulAddBiasTensor(
+    poplar::Graph& graph, const std::string& debug_name,
+    const HloInstruction* layout, int64 layout_output_idx,
+    const TensorMap& tensor_map) {
+  OutVector outputs = FindInstructionOutputs(tensor_map, layout);
+
+  if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
+    return xla::FailedPrecondition("Matmul %s output not found for %s",
+                                   layout->name(), debug_name);
+  }
+
+  poplar::Tensor acts = outputs[layout_output_idx];
 
   return poplin::createBiases(graph, acts, debug_name);
 }
@@ -448,6 +459,64 @@ static StatusOr<poplar::Tensor> AddRightMatMul(poplar::Graph& graph,
   poplar::OptionFlags opts;
   return poplin::createMatMulInputRHS(graph, type, aShape, bShape, name, opts,
                                       &resources.dot_cache);
+}
+
+static StatusOr<poplar::Tensor> AddBatchNormScale(poplar::Graph& graph,
+                                                  const std::string& debug_name,
+                                                  const HloInstruction* target,
+                                                  const HloInstruction* layout,
+                                                  int64 layout_output_idx,
+                                                  const TensorMap& tensor_map) {
+  OutVector outputs = FindInstructionOutputs(tensor_map, layout);
+
+  if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
+    return xla::FailedPrecondition(
+        "Batch Norm %s layout input not found for %s", layout->name(),
+        debug_name);
+  }
+
+  const auto* bn = Cast<HloBatchNormInstruction>(target);
+
+  poplar::Tensor acts = outputs[layout_output_idx];
+  auto pair = ShuffleBatchNormInputToPoplar(acts, bn->feature_index());
+
+  return popnn::bn::createBatchNormGamma(graph, pair.first);
+}
+
+static StatusOr<poplar::Tensor> AddBatchNormOffset(
+    poplar::Graph& graph, const std::string& debug_name,
+    const HloInstruction* target, const HloInstruction* layout,
+    int64 layout_output_idx, const TensorMap& tensor_map) {
+  OutVector outputs = FindInstructionOutputs(tensor_map, layout);
+
+  if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
+    return xla::FailedPrecondition(
+        "Batch Norm %s layout input not found for %s", layout->name(),
+        debug_name);
+  }
+
+  const auto* bn = Cast<HloBatchNormInstruction>(target);
+
+  poplar::Tensor acts = outputs[layout_output_idx];
+  auto pair = ShuffleBatchNormInputToPoplar(acts, bn->feature_index());
+
+  return popnn::bn::createBatchNormBeta(graph, pair.first);
+}
+
+static StatusOr<poplar::Tensor> AddElementwiseBinary(
+    poplar::Graph& graph, const std::string& debug_name,
+    const HloInstruction* layout, int64 layout_output_idx,
+    const TensorMap& tensor_map) {
+  OutVector outputs = FindInstructionOutputs(tensor_map, layout);
+
+  if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
+    return xla::FailedPrecondition(
+        "Elementwise %s layout input not found for %s", layout->name(),
+        debug_name);
+  }
+
+  poplar::Tensor other_side = outputs[layout_output_idx];
+  return graph.clone(other_side, debug_name);
 }
 
 static StatusOr<poplar::Tensor> PathTransform(
@@ -497,7 +566,34 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
   if (target != resources.annotations.tensor_allocation_map.end()) {
     const auto* tgt = target->second.tgt;
     auto tshape = tgt->operand(target->second.input_index)->shape();
+    const auto optional_layout = target->second.layout;
+    const auto optional_layout_output_idx = target->second.layout_output_idx;
+
     switch (tgt->opcode()) {
+      case HloOpcode::kBatchNormInference:
+      case HloOpcode::kBatchNormTraining: {
+        switch (target->second.input_index) {
+          case 1: {
+            TF_ASSIGN_OR_RETURN(
+                out,
+                AddBatchNormScale(graph, name, tgt, *optional_layout,
+                                  *optional_layout_output_idx, tensor_map));
+            break;
+          }
+          case 2: {
+            TF_ASSIGN_OR_RETURN(
+                out,
+                AddBatchNormOffset(graph, name, tgt, *optional_layout,
+                                   *optional_layout_output_idx, tensor_map));
+            break;
+          }
+          default:
+            return xla::FailedPrecondition(
+                "invalid operand for tensor allocation on %s",
+                src.first->name().c_str());
+        }
+        break;
+      }
       case HloOpcode::kConvolution: {
         switch (target->second.input_index) {
           case 0: {
@@ -559,9 +655,7 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
       case HloOpcode::kCall: {
         const HloComputation* comp = tgt->to_apply();
         if (IsPopOpsCall(comp)) {
-          auto end = comp->name().find('.');
-          std::string name = comp->name().substr(8, end - 8);
-          if (name == "depthwise_conv") {
+          if (IsPopOpsCall(comp, "depthwise_conv")) {
             const HloInstruction* conv_inst = comp->root_instruction();
             switch (target->second.input_index) {
               case 0: {
@@ -581,10 +675,21 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
                     "invalid operand for tensor allocation on %s",
                     src.first->name().c_str());
             }
-          } else if (name == "biasadd") {
-            const auto* conv = target->second.layout;
-            TF_ASSIGN_OR_RETURN(out,
-                                AddBiasTensor(graph, name, conv, tensor_map));
+          } else if (IsPopOpsCall(comp, "conv_biasadd")) {
+            TF_ASSIGN_OR_RETURN(
+                out,
+                AddConvAddBiasTensor(graph, name, *optional_layout,
+                                     *optional_layout_output_idx, tensor_map));
+          } else if (IsPopOpsCall(comp, "matmul_biasadd")) {
+            TF_ASSIGN_OR_RETURN(
+                out, AddMatMulAddBiasTensor(graph, name, *optional_layout,
+                                            *optional_layout_output_idx,
+                                            tensor_map));
+          } else if (IsPopOpsCall(comp, "scaled_inplace")) {
+            TF_ASSIGN_OR_RETURN(
+                out,
+                AddElementwiseBinary(graph, name, *optional_layout,
+                                     *optional_layout_output_idx, tensor_map));
           } else {
             return xla::FailedPrecondition(
                 "Unknown poplibs fusion for tensor %s: %s",
@@ -606,9 +711,16 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
         break;
       }
       default:
-        return xla::FailedPrecondition("Unknown tensor target for %s: %s",
-                                       src.first->name().c_str(),
-                                       tgt->name().c_str());
+        if (IsPopOpsElementwiseBinary(tgt)) {
+          TF_ASSIGN_OR_RETURN(
+              out,
+              AddElementwiseBinary(graph, name, *optional_layout,
+                                   *optional_layout_output_idx, tensor_map));
+        } else {
+          return xla::FailedPrecondition("Unknown tensor target for %s: %s",
+                                         src.first->name().c_str(),
+                                         tgt->name().c_str());
+        }
     }
 
     TF_ASSIGN_OR_RETURN(
@@ -945,7 +1057,8 @@ std::pair<int64, int64> FindTupleInputIndices(const HloInstruction* tuple,
 
 ArgVector FindTupleInInstructionInput(TensorMap& map, CompilerResources& res,
                                       const HloInstruction* inst, int64 input,
-                                      int64 n, poplar::program::Sequence& seq) {
+                                      int64 n, poplar::program::Sequence& seq,
+                                      const bool expand_constants) {
   const HloInstruction* operand = inst->operand(input);
   const Shape& shape = operand->shape();
   int64 start = 0;
@@ -953,43 +1066,32 @@ ArgVector FindTupleInInstructionInput(TensorMap& map, CompilerResources& res,
     start += CountShapes(ShapeUtil::GetTupleElementShape(shape, i));
   }
   int64 end = start + CountShapes(ShapeUtil::GetTupleElementShape(shape, n));
-  ArgVector inputs = GetExpandedTensors(map, res, operand, seq, start, end);
+  ArgVector inputs = GetTensorsMaybeExpand(map, res, operand, seq,
+                                           expand_constants, start, end);
   return inputs;
 }
 
-StatusOr<poplar::Tensor> FindInstructionInput(TensorMap& map,
-                                              CompilerResources& res,
-                                              const HloInstruction* inst,
-                                              int64 input,
-                                              poplar::program::Sequence& seq) {
+StatusOr<poplar::Tensor> FindInstructionInput(
+    TensorMap& map, CompilerResources& res, const HloInstruction* inst,
+    int64 input, poplar::program::Sequence& seq, const bool expand_constants) {
   const HloInstruction* operand = inst->operand(input);
-  ArgVector inputs = GetExpandedTensors(map, res, operand, seq);
+  ArgVector inputs =
+      GetTensorsMaybeExpand(map, res, operand, seq, expand_constants, 0, 1);
 
   if (inputs.size() == 0) {
     return tensorflow::errors::Unknown(
         StrCat("[Poplar] Couldn't find input ", input, " for ", inst->name()));
   }
 
-  poplar::Tensor out = inputs[0];
-  if (InstructionSharded(inst)) {
-    out = poputil::copyToIpu(res.main_graph, out, seq, GetShard(inst));
-  }
-  return out;
+  return inputs[0];
 }
 
 ArgVector FindInstructionInputs(TensorMap& map, CompilerResources& res,
                                 const HloInstruction* inst, int64 input,
-                                poplar::program::Sequence& seq) {
+                                poplar::program::Sequence& seq,
+                                const bool expand_constants) {
   const HloInstruction* operand = inst->operand(input);
-  ArgVector inputs = GetExpandedTensors(map, res, operand, seq);
-
-  if (InstructionSharded(inst)) {
-    for (unsigned int i = 0; i < inputs.size(); i++) {
-      inputs[i] =
-          poputil::copyToIpu(res.main_graph, inputs[i], seq, GetShard(inst));
-    }
-  }
-  return inputs;
+  return GetTensorsMaybeExpand(map, res, operand, seq, expand_constants);
 }
 
 OutVector FindInstructionOutputs(const TensorMap& map,
@@ -1007,17 +1109,17 @@ OutVector FindInstructionOutputs(const TensorMap& map,
 OutVector FindExpandedInstructionOutputs(TensorMap& map, CompilerResources& res,
                                          const HloInstruction* inst,
                                          poplar::program::Sequence& seq) {
-  OutVector outputs = GetExpandedTensors(map, res, inst, seq);
+  OutVector outputs = GetTensorsMaybeExpand(map, res, inst, seq, true);
   return outputs;
 }
 
 StatusOr<ArgVectors> GetInplaceOutputTensors(TensorMap& map,
                                              CompilerResources& res,
                                              const HloInstruction* inst,
-                                             poplar::program::Sequence& seq) {
+                                             poplar::program::Sequence& seq,
+                                             const bool expand_constants) {
   // Check that the instruction description is for an inplace operation.
-  auto inst_description =
-      InplaceUtil::GetHloInstructionDescription(inst, res.annotations);
+  auto inst_description = InplaceUtil::GetHloInstructionDescription(inst);
   if (!inst_description->IsInPlaceType(inst)) {
     LOG(FATAL) << "Trying to execute " << inst->name()
                << " as an inplace operation, but it is not.";
@@ -1037,12 +1139,12 @@ StatusOr<ArgVectors> GetInplaceOutputTensors(TensorMap& map,
     // This should *always* be true
     CHECK_EQ(inplace_indexes.size(), 1);
     CHECK_EQ(inplace_indexes[0], 0);
-    tensors[0] = FindTupleInInstructionInput(map, res, inst, 0,
-                                             inst->tuple_index(), seq);
+    tensors[0] = FindTupleInInstructionInput(
+        map, res, inst, 0, inst->tuple_index(), seq, expand_constants);
   } else {
     for (uint64 i = 0; i < inplace_indexes.size(); i++) {
-      tensors[i] =
-          FindInstructionInputs(map, res, inst, inplace_indexes[i], seq);
+      tensors[i] = FindInstructionInputs(map, res, inst, inplace_indexes[i],
+                                         seq, expand_constants);
     }
   }
 

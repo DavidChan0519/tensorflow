@@ -16,6 +16,7 @@
 #include <poplar/Graph.hpp>
 #include <popops/DynamicSlice.hpp>
 #include <popops/Pad.hpp>
+#include <poputil/TileMapping.hpp>
 
 namespace xla {
 namespace poplarplugin {
@@ -39,11 +40,10 @@ StatusOr<poplar::program::Program> CreateSliceUpdateOp(
   std::vector<int64> begin;
   if (root->operand(2)->opcode() == HloOpcode::kConstant) {
     TF_ASSIGN_OR_RETURN(
-        begin, LiteralVectorToInt64Vector(root->operand(2)->literal()));
+        begin, LiteralVectorToNativeType<int64>(root->operand(2)->literal()));
   } else {
-    const HloInstruction* bcast = root->operand(2);
-    const HloInstruction* constant = bcast->operand(0);
-    TF_ASSIGN_OR_RETURN(begin, WideConstToInt64Vector(bcast, constant));
+    const HloInstruction* wide_const = root->operand(2);
+    TF_ASSIGN_OR_RETURN(begin, WideConstToNativeType<int64>(wide_const));
   }
 
   if (begin.size() != input.rank()) {
@@ -96,11 +96,10 @@ StatusOr<poplar::program::Program> CreateSliceOp(CompilerResources& res,
   std::vector<int64> begin;
   if (root->operand(1)->opcode() == HloOpcode::kConstant) {
     TF_ASSIGN_OR_RETURN(
-        begin, LiteralVectorToInt64Vector(root->operand(1)->literal()));
+        begin, LiteralVectorToNativeType<int64>(root->operand(1)->literal()));
   } else {
-    const HloInstruction* bcast = root->operand(1);
-    const HloInstruction* constant = bcast->operand(0);
-    TF_ASSIGN_OR_RETURN(begin, WideConstToInt64Vector(bcast, constant));
+    const HloInstruction* wide_const = root->operand(1);
+    TF_ASSIGN_OR_RETURN(begin, WideConstToNativeType<int64>(wide_const));
   }
 
   if (begin.size() != input.rank()) {
@@ -276,6 +275,31 @@ StatusOr<poplar::program::Program> CreateZeroPadOp(CompilerResources& res,
     paddingUpper.push_back(d.edge_padding_high());
   }
   out = popops::pad(graph, out, paddingLower, paddingUpper);
+
+  TF_CHECK_OK(AddOutputTensor(tensor_map, inst, 0, out));
+  return seq;
+}
+
+StatusOr<poplar::program::Program> CreateInterIpuCopy(
+    CompilerResources& res, const HloInstruction* inst,
+    const xla::Shape& output, TensorMap& tensor_map) {
+  poplar::program::Sequence seq;
+
+  poplar::Tensor out;
+  TF_ASSIGN_OR_RETURN(out, FindInstructionInput(tensor_map, res, inst, 0, seq));
+
+  if (!inst->has_sharding()) {
+    return xla::FailedPrecondition("Missing shard information on %s",
+                                   inst->name());
+  }
+
+  const auto& sharding = inst->sharding();
+  if (!sharding.HasUniqueDevice()) {
+    return xla::FailedPrecondition("No unique IPU number on %s", inst->name());
+  }
+
+  out =
+      poputil::copyToIpu(res.main_graph, out, seq, sharding.GetUniqueDevice());
 
   TF_CHECK_OK(AddOutputTensor(tensor_map, inst, 0, out));
   return seq;

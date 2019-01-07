@@ -2,6 +2,7 @@ licenses(["restricted"])
 
 package(default_visibility = ["//visibility:public"])
 
+load("//tensorflow/compiler/xla/tests:build_defs.bzl", "xla_test")
 load("@local_config_poplar//poplar:build_defs.bzl", "poplar_lib_directory")
 load("@local_config_poplar//poplar:build_defs.bzl", "poplibs_lib_directory")
 load("//tensorflow:tensorflow.bzl", "tf_cc_test")
@@ -14,22 +15,6 @@ genrule(
     name = "tf_graph_program",
     srcs = ["vertices/tf.cpp"],
     outs = ["tf.gp"],
-    tools = ["@local_config_poplar//poplar:popc"],
-    cmd = "$(location @local_config_poplar//poplar:popc) -DNDEBUG -O3 -I . -o $@ $<",
-)
-
-genrule(
-    name = "tf_sort",
-    srcs = ["vertices/heap_sort.cpp"],
-    outs = ["heap_sort.gp"],
-    tools = ["@local_config_poplar//poplar:popc"],
-    cmd = "$(location @local_config_poplar//poplar:popc) -DNDEBUG -O3 -I . -o $@ $<",
-)
-
-genrule(
-    name = "tf_batch_norm",
-    srcs = ["vertices/batch_norm.cpp"],
-    outs = ["batch_norm.gp"],
     tools = ["@local_config_poplar//poplar:popc"],
     cmd = "$(location @local_config_poplar//poplar:popc) -DNDEBUG -O3 -I . -o $@ $<",
 )
@@ -73,6 +58,7 @@ cc_library(
         "driver/computation_flattener.cc",
         "driver/convolution_classifier.cc",
         "driver/expression_outliner.cc",
+        "driver/find_all_users.cc",
         "driver/fuse_max_pool.cc",
         "driver/fuse_ops_early.cc",
         "driver/fuse_ops_late.cc",
@@ -84,6 +70,7 @@ cc_library(
         "driver/input_output_aliasing_map.cc",
         "driver/matcher_predicates.cc",
         "driver/scheduler.cc",
+        "driver/sharding_pass.cc",
         "driver/single_hlo_matcher.cc",
         "driver/util.cc",
         "driver/while_loop_condition_simplify.cc",
@@ -101,6 +88,7 @@ cc_library(
         "driver/computation_flattener.h",
         "driver/convolution_classifier.h",
         "driver/expression_outliner.h",
+        "driver/find_all_users.h",
         "driver/fuse_max_pool.h",
         "driver/fuse_ops_early.h",
         "driver/fuse_ops_late.h",
@@ -111,7 +99,9 @@ cc_library(
         "driver/inplace_util.h",
         "driver/input_output_aliasing_map.h",
         "driver/matcher_predicates.h",
+        "driver/meta_graph.h",
         "driver/scheduler.h",
+        "driver/sharding_pass.h",
         "driver/single_hlo_matcher.h",
         "driver/util.h",
         "driver/while_loop_condition_simplify.h",
@@ -151,6 +141,8 @@ cc_library(
         "driver/executable.cc",
         "driver/executor.cc",
         "driver/graph_caching_util.cc",
+        "driver/batch_norm_graph_caching.cc",
+        "driver/conv_graph_caching.cc",
         "driver/map_ops.cc",
         "driver/math_ops.cc",
         "driver/platform.cc",
@@ -181,6 +173,8 @@ cc_library(
         "driver/executable.h",
         "driver/executor.h",
         "driver/graph_caching_util.h",
+        "driver/batch_norm_graph_caching.h",
+        "driver/conv_graph_caching.h",
         "driver/ops.h",
         "driver/platform.h",
         "driver/platform_id.h",
@@ -204,7 +198,6 @@ cc_library(
         "//tensorflow/compiler/tf2xla:common",
         "//tensorflow/compiler/xla:xla_headers_lib",
         "//tensorflow/compiler/xla/service:algebraic_simplifier",
-        "//tensorflow/compiler/xla/service:batchnorm_expander",
         "//tensorflow/compiler/xla/service:dot_decomposer",
         "//tensorflow/compiler/xla/service:generic_transfer_manager",
         "//tensorflow/compiler/xla/service:gather_expander",
@@ -323,8 +316,6 @@ cc_library(
     ],
     data = [
         ":tf_graph_program",
-        ":tf_sort",
-        ":tf_batch_norm",
         ":protos_py",
         "@local_config_poplar//poplar:poplar_lib",
     ],
@@ -354,6 +345,9 @@ cc_library(
     srcs = [],
     hdrs = [
         "tests/test_utils.h",
+    ],
+    deps = [
+        "//tensorflow/compiler/xla:array3d",
     ],
 )
 
@@ -529,6 +523,67 @@ tf_cc_test(
     name = "scheduler_test",
     srcs = ["tests/scheduler_test.cc"],
     size = "small",
+    deps = [
+        ":optimizers",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+    ],
+)
+
+xla_test(
+    name = "fused_batch_norm_test",
+    srcs = ["tests/fused_batch_norm_test.cc"],
+    backends = [
+        "poplar",
+    ],
+    size = "medium",
+    deps = [
+        ":optimizers",
+        ":test_utils",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla:array3d",
+        "//tensorflow/compiler/xla:literal",
+        "//tensorflow/compiler/xla:reference_util",
+        "//tensorflow/compiler/xla:shape_util",
+        "//tensorflow/compiler/xla:status_macros",
+        "//tensorflow/compiler/xla:statusor",
+        "//tensorflow/compiler/xla:test",
+        "//tensorflow/compiler/xla:util",
+        "//tensorflow/compiler/xla:xla_data_proto",
+        "//tensorflow/compiler/xla/client:global_data",
+        "//tensorflow/compiler/xla/client:local_client",
+        "//tensorflow/compiler/xla/client:xla_builder",
+        "//tensorflow/compiler/xla/client:xla_computation",
+        "//tensorflow/compiler/xla/client/lib:arithmetic",
+        "//tensorflow/compiler/xla/client/lib:math",
+        "//tensorflow/compiler/xla/service:hlo",
+        "//tensorflow/compiler/xla/tests:client_library_test_base",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+        "//tensorflow/compiler/xla/tests:literal_test_util",
+        "//tensorflow/compiler/xla/tests:xla_internal_test_main",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:test",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+tf_cc_test(
+    name = "sharding_pass_test",
+    srcs = ["tests/sharding_pass_test.cc"],
+    size = "small",
+    deps = [
+        ":optimizers",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+    ],
+)
+
+tf_cc_test(
+    name = "find_all_users_test",
+    srcs = ["tests/find_all_users_test.cc"],
+    extra_copts = [
+        "-fexceptions",
+    ],
     deps = [
         ":optimizers",
         "//tensorflow/compiler/xla/service:hlo_matchers",
@@ -840,9 +895,25 @@ py_test(
 )
 
 py_test(
-    name = "cache_graph_test",
+    name = "batch_norm_graph_caching_test",
     size = "medium",
-    srcs = ["tests/cache_graph_test.py"],
+    srcs = ["tests/batch_norm_graph_caching_test.py"],
+    deps = [
+        ":ipu_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:layers",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+    ],
+    srcs_version = "PY2AND3",
+)
+
+py_test(
+    name = "conv_graph_caching_test",
+    size = "medium",
+    srcs = ["tests/conv_graph_caching_test.py"],
     deps = [
         ":ipu_ops_py",
         "//tensorflow/compiler/tests:xla_test",
@@ -922,13 +993,17 @@ test_suite(
         "casts_elimination_test",
         "update_op_dependencies_test",
         "fuse_wide_const_test",
-        "cache_graph_test",
+        "batch_norm_graph_caching_test",
+        "conv_graph_caching_test",
         "scheduler_test",
+        "sharding_pass_test",
         "dynamic_slice_layout_test",
         "sort_op_test",
         "while_loop_to_repeat_simplify_test",
         "lstm_test",
         "wide_const_expansion_test",
+        "fused_batch_norm_test",
+        "find_all_users_test",
     ],
 )
 

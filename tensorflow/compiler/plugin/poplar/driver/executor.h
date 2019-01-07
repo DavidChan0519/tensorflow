@@ -268,6 +268,8 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   poplar::OptionFlags GetConvolutionOptions() const { return conv_options_; }
 
+  poplar::OptionFlags GetPoolingOptions() const { return pooling_options_; }
+
   void AddCompileBeginEventRecord(const std::string& module_name,
                                   const std::string& xla_graph);
 
@@ -312,8 +314,12 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
     std::string output_handle;
     ConversionFn output_convertor;
     std::vector<char> converted_data;
-    char data[0];
+    char* data;
+
+    TensorControl(size_t size_);
+    ~TensorControl();
   };
+
   struct InputDef {
     TensorControl* tc;
     ConversionFn fn;
@@ -385,8 +391,12 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   class RemapOutputAllocation : public OutputAllocation {
    public:
-    RemapOutputAllocation(const std::vector<uint64>& remap_map)
-        : remap_map_(remap_map) {}
+    RemapOutputAllocation(PoplarExecutor* executor,
+                          const std::vector<uint64>& remap_map,
+                          const InputOutputAliasingMap& io_map)
+        : executor_(executor),
+          remap_map_(remap_map),
+          input_output_aliasing_map_(io_map) {}
 
     se::DeviceMemoryBase GetAllocation(
         xla::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
@@ -394,7 +404,9 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
         const ArgsHandleMap&, const int) const override;
 
    private:
+    PoplarExecutor* executor_;
     const std::vector<uint64>& remap_map_;
+    const InputOutputAliasingMap& input_output_aliasing_map_;
   };
 
   class BufferOutputAllocation : public OutputAllocation {
@@ -461,6 +473,8 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   poplar::OptionFlags option_flags_;
 
   poplar::OptionFlags conv_options_;
+
+  poplar::OptionFlags pooling_options_;
 
   poplar::OptionFlags report_options_;
 

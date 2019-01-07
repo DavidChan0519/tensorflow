@@ -120,7 +120,7 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
       int64 op_index = user->operand_index(tgt);
       switch (user->opcode()) {
         case HloOpcode::kConvolution: {
-          auto t = TensorTarget(user, op_index, nullptr, {}, path);
+          auto t = TensorTarget(user, op_index, path);
           auto i = tensor_allocation_map.find(src);
           if (i != tensor_allocation_map.end() &&
               CompareTargets(t, i->second)) {
@@ -130,7 +130,7 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
           break;
         }
         case HloOpcode::kDot: {
-          auto t = TensorTarget(user, op_index, nullptr, {}, path);
+          auto t = TensorTarget(user, op_index, path);
           auto i = tensor_allocation_map.find(src);
           if (i != tensor_allocation_map.end() &&
               CompareTargets(t, i->second)) {
@@ -141,7 +141,7 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
         }
         case HloOpcode::kDynamicSlice: {
           if (op_index == 0) {
-            auto t = TensorTarget(user, op_index, nullptr, {}, path);
+            auto t = TensorTarget(user, op_index, path);
             auto i = tensor_allocation_map.find(src);
             if (i != tensor_allocation_map.end()) {
               tensor_allocation_map.erase(src);
@@ -152,7 +152,7 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
         }
         case HloOpcode::kDynamicUpdateSlice: {
           if (op_index == 0 || op_index == 1) {
-            auto t = TensorTarget(user, op_index, nullptr, {}, path);
+            auto t = TensorTarget(user, op_index, path);
             auto i = tensor_allocation_map.find(src);
             if (i != tensor_allocation_map.end()) {
               tensor_allocation_map.erase(src);
@@ -163,20 +163,26 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
         }
         case HloOpcode::kCall: {
           HloComputation* comp = user->to_apply();
-          if (!IsPopOpsCall(comp)) {
-            HloInstruction* param = comp->parameter_instruction(op_index);
-            FindConsumers(src, param, index);
-          } else {
+          if (IsPopOpsCall(comp)) {
             auto end = comp->name().find('.');
             std::string name = comp->name().substr(8, end - 8);
             if (name == "depthwise_conv") {
-              auto t = TensorTarget(user, op_index, nullptr, {}, path);
+              auto t = TensorTarget(user, op_index, path);
               auto i = tensor_allocation_map.find(src);
               if (i != tensor_allocation_map.end()) {
                 tensor_allocation_map.erase(src);
               }
               tensor_allocation_map.insert(std::make_pair(src, t));
             }
+          } else if (IsRepeatCall(comp)) {
+            if (op_index == 1) {
+              HloComputation* comp = GetRepeatBody(user);
+              HloInstruction* param = comp->parameter_instruction(0);
+              FindConsumers(src, param, index);
+            }
+          } else {
+            HloInstruction* param = comp->parameter_instruction(op_index);
+            FindConsumers(src, param, index);
           }
           break;
         }
@@ -195,7 +201,7 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
             absl::flat_hash_set<int64> allocating_indexes =
                 statusor.ValueOrDie();
             if (allocating_indexes.count(op_index)) {
-              auto t = TensorTarget(user, op_index, nullptr, {}, path);
+              auto t = TensorTarget(user, op_index, path);
               auto i = tensor_allocation_map.find(src);
               if (i != tensor_allocation_map.end() &&
                   CompareTargets(t, i->second)) {
@@ -204,7 +210,10 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
               tensor_allocation_map.insert(std::make_pair(src, t));
             }
           } else {
-            LOG(FATAL) << "Unsupported custom call " << user->name();
+            auto shapes = FlattenedXlaShape(src.first->shape());
+            if (ShapeUtil::Equal(shapes[src.second], user->shape())) {
+              FindConsumers(src, user, index);
+            }
           }
           break;
         }
@@ -253,6 +262,9 @@ StatusOr<bool> AllocationFinder::Run(HloModule* module) {
   FindAllocatingInstructions finder;
 
   for (const auto& comp : module->computations()) {
+    if (IsRepeatCall(comp)) {
+      continue;
+    }
     TF_RETURN_IF_ERROR(comp->Accept(&finder));
   }
 

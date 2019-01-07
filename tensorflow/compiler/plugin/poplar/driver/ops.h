@@ -115,6 +115,10 @@ StatusOr<poplar::program::Program> CreateMatMulForDotOp(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output, TensorMap& tensor_map);
 
+StatusOr<poplar::program::Program> CreateMatMulBiasAddOp(
+    CompilerResources& res, const HloInstruction* inst,
+    const xla::Shape& output_shape, TensorMap& tensor_map);
+
 StatusOr<poplar::program::Program> CreateSelectOp(CompilerResources& res,
                                                   const HloInstruction* inst,
                                                   const xla::Shape& output,
@@ -180,7 +184,7 @@ StatusOr<poplar::program::Program> CreateConv2D(CompilerResources& res,
                                                 const xla::Shape& output_shape,
                                                 TensorMap& tensor_map);
 
-StatusOr<poplar::program::Program> CreateBiasAddOp(
+StatusOr<poplar::program::Program> CreateConvBiasAddOp(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output_shape, TensorMap& tensor_map);
 
@@ -271,6 +275,10 @@ StatusOr<poplar::program::Program> CreateZeroPadOp(CompilerResources& res,
                                                    const xla::Shape& output,
                                                    TensorMap& tensor_map);
 
+StatusOr<poplar::program::Program> CreateInterIpuCopy(
+    CompilerResources& res, const HloInstruction* inst,
+    const xla::Shape& output_shape, TensorMap& tensor_map);
+
 StatusOr<poplar::program::Program> CreatePaddingReduceWindow(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output, TensorMap& tensor_map);
@@ -278,6 +286,13 @@ StatusOr<poplar::program::Program> CreatePaddingReduceWindow(
 StatusOr<poplar::program::Program> CreateSort(CompilerResources& res,
                                               const HloInstruction* inst,
                                               TensorMap& tensor_map);
+std::pair<poplar::Tensor, std::vector<std::size_t>>
+ShuffleBatchNormInputToPoplar(const poplar::Tensor& input,
+                              const unsigned feature_dimension);
+
+poplar::Tensor ShuffleBatchNormOutputToTensorflow(
+    const poplar::Tensor& output, const unsigned feature_dimension,
+    const std::vector<std::size_t>& non_broadcast_dims);
 
 StatusOr<poplar::program::Program> CreateBatchNormInf(
     CompilerResources& res, const HloInstruction* inst, TensorMap& tensor_map);

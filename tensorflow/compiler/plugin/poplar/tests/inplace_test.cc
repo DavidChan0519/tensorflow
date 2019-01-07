@@ -16,7 +16,6 @@
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_annotations.h"
 #include "tensorflow/compiler/plugin/poplar/driver/fuse_ops_late.h"
 #include "tensorflow/compiler/plugin/poplar/driver/inplace_finder.h"
-// #include "tensorflow/compiler/plugin/poplar/driver/inplace_instructions.h"
 #include "tensorflow/compiler/plugin/poplar/driver/scheduler.h"
 #include "tensorflow/compiler/plugin/poplar/driver/util.h"
 
@@ -49,6 +48,7 @@ ENTRY c1 {
 
   auto config = GetModuleConfigForTest();
   config.set_resource_input_count(2);
+  config.set_input_mapping({0, 1});
   config.set_resource_update_to_input_index({0});
   auto module = ParseHloString(hlo, config);
   EXPECT_TRUE(module.ok());
@@ -61,10 +61,11 @@ ENTRY c1 {
 
   auto inplace_instructions = annotations.inplace_instructions;
 
-  EXPECT_THAT(inplace_instructions.size(), 1);
-
-  const auto* inst = *(inplace_instructions.begin());
-  EXPECT_THAT(inst->name(), "s");
+  EXPECT_THAT(inplace_instructions.size(), 2);
+  std::set<std::string> in_place_ops = {"s", "t"};
+  for (const auto* inst : inplace_instructions) {
+    EXPECT_THAT(in_place_ops.count(inst->name()), 1);
+  }
 }
 
 TEST_F(HloInplaceDependencyTest, DynamicSliceUpdateInWhile) {
@@ -104,6 +105,7 @@ ENTRY c1 {
 
   auto config = GetModuleConfigForTest();
   config.set_resource_input_count(3);
+  config.set_input_mapping({0, 1, 2});
   config.set_resource_update_to_input_index({0, 1, 2});
   auto module = ParseHloString(hlo, config);
   EXPECT_TRUE(module.ok());
@@ -114,10 +116,11 @@ ENTRY c1 {
   InplaceFinder inplaceFinder(annotations);
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
-  std::set<std::string> in_place_ops = {"u0_b", "u1_b"};
+  std::set<std::string> in_place_ops = {"p0_b", "p1_b",   "p2_b", "u0_b",
+                                        "u1_b", "root_b", "p0_c", "t"};
   auto inplace_instructions = annotations.inplace_instructions;
 
-  EXPECT_THAT(inplace_instructions.size(), 2);
+  EXPECT_THAT(inplace_instructions.size(), 8);
   for (const auto* inst : inplace_instructions) {
     EXPECT_THAT(in_place_ops.count(inst->name()), 1);
   }
@@ -143,6 +146,7 @@ ENTRY c1 {
 
   auto config = GetModuleConfigForTest();
   config.set_resource_input_count(1);
+  config.set_input_mapping({0, 1, 2});
   config.set_resource_update_to_input_index({2});
   auto module = ParseHloString(hlo, config);
   EXPECT_TRUE(module.ok());
@@ -154,10 +158,10 @@ ENTRY c1 {
   InplaceFinder inplaceFinder(annotations);
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
-  std::set<std::string> in_place_ops = {"u0", "u1"};
+  std::set<std::string> in_place_ops = {"u0", "u1", "root", "i"};
   auto inplace_instructions = annotations.inplace_instructions;
 
-  EXPECT_THAT(inplace_instructions.size(), 2);
+  EXPECT_THAT(inplace_instructions.size(), 4);
   for (const auto* inst : inplace_instructions) {
     EXPECT_THAT(in_place_ops.count(inst->name()), 1);
   }
@@ -208,6 +212,7 @@ TEST_F(HloInplaceDependencyTest, MultipleUpdateInPlacePeers) {
 
   auto config = GetModuleConfigForTest();
   config.set_resource_input_count(2);
+  config.set_input_mapping({0, 1});
   config.set_resource_update_to_input_index({0, 1});
   auto module = ParseHloString(hlo, config);
   EXPECT_TRUE(module.ok());
@@ -219,13 +224,15 @@ TEST_F(HloInplaceDependencyTest, MultipleUpdateInPlacePeers) {
   InplaceFinder inplaceFinder(annotations);
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
-  std::set<std::string> in_place_ops = {"u0", "u1"};
+  std::set<std::string> either_in_place_ops = {"u0", "u1"};
+  std::set<std::string> in_place_ops = {"root"};
   auto& inplace_instructions = annotations.inplace_instructions;
   // Only one of the binary ops can be update in place
-  EXPECT_THAT(inplace_instructions.size(), 1);
-
-  auto* inst = *(inplace_instructions.begin());
-  EXPECT_TRUE(inst->name() == "u1" || inst->name() == "u0");
+  EXPECT_THAT(inplace_instructions.size(), 2);
+  for (const auto* inst : inplace_instructions) {
+    EXPECT_TRUE(either_in_place_ops.count(inst->name()) == 1 ||
+                in_place_ops.count(inst->name()) == 1);
+  }
 
   Scheduler scheduler;
   EXPECT_TRUE(scheduler.Run(module0).ValueOrDie());
@@ -274,14 +281,14 @@ TEST_F(HloInplaceDependencyTest, MultipleInplaceWithInterdependency) {
   InplaceFinder inplaceFinder(annotations);
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
-  std::set<std::string> in_place_ops = {"u0", "u1"};
   auto& inplace_instructions = annotations.inplace_instructions;
 
   // Only one of the binary ops can be update in place
-  EXPECT_THAT(inplace_instructions.size(), 1);
-
-  auto* inst = *(inplace_instructions.begin());
-  EXPECT_THAT(inst->name(), "u1");
+  std::set<std::string> in_place_ops = {"u1", "root"};
+  EXPECT_THAT(inplace_instructions.size(), 2);
+  for (const auto* inst : inplace_instructions) {
+    EXPECT_THAT(in_place_ops.count(inst->name()), 1);
+  }
 
   Scheduler scheduler;
   EXPECT_TRUE(scheduler.Run(module0).ValueOrDie());
@@ -321,6 +328,7 @@ TEST_F(HloInplaceDependencyTest, MultipleInplaceWithRightOrder) {
 
   auto config = GetModuleConfigForTest();
   config.set_resource_input_count(2);
+  config.set_input_mapping({0, 1, 2});
   config.set_resource_update_to_input_index({1, 2});
   auto module = ParseHloString(hlo, config);
   EXPECT_TRUE(module.ok());
@@ -332,10 +340,10 @@ TEST_F(HloInplaceDependencyTest, MultipleInplaceWithRightOrder) {
   InplaceFinder inplaceFinder(annotations);
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
-  std::set<std::string> in_place_ops = {"u0", "u1"};
   auto& inplace_instructions = annotations.inplace_instructions;
 
-  EXPECT_THAT(inplace_instructions.size(), 2);
+  std::set<std::string> in_place_ops = {"u0", "u1", "root"};
+  EXPECT_THAT(inplace_instructions.size(), 3);
   for (const auto* inst : inplace_instructions) {
     EXPECT_THAT(in_place_ops.count(inst->name()), 1);
   }
@@ -388,11 +396,11 @@ TEST_F(HloInplaceDependencyTest, InplaceCorrectDependencies) {
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
   auto& inplace_instructions = annotations.inplace_instructions;
 
-  // Only u1 is inplace
-  EXPECT_THAT(inplace_instructions.size(), 1);
-
-  auto* inst = *(inplace_instructions.begin());
-  EXPECT_THAT(inst->name(), "u1");
+  std::set<std::string> in_place_ops = {"u1", "root"};
+  EXPECT_THAT(inplace_instructions.size(), 2);
+  for (const auto* inst : inplace_instructions) {
+    EXPECT_THAT(in_place_ops.count(inst->name()), 1);
+  }
 
   Scheduler scheduler;
   EXPECT_TRUE(scheduler.Run(module0).ValueOrDie());
@@ -429,7 +437,9 @@ TEST_F(HloInplaceDependencyTest, InplaceInputOuputStreamedAndResourceVariable) {
     )";
 
   auto config = GetModuleConfigForTest();
+  config.set_argument_count(1);
   config.set_resource_input_count(1);
+  config.set_input_mapping({0, 1});
   config.set_resource_update_to_input_index({1});
   auto module = ParseHloString(hlo, config);
   EXPECT_TRUE(module.ok());
@@ -440,12 +450,10 @@ TEST_F(HloInplaceDependencyTest, InplaceInputOuputStreamedAndResourceVariable) {
   InplaceFinder inplaceFinder(annotations);
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
-  std::set<std::string> in_place_ops_high = {"u1"};
   auto& inplace_instructions = annotations.inplace_instructions;
-  // Expect that only the high priority instruction got inplaced
-  EXPECT_THAT(inplace_instructions.size(), 2);
 
-  std::set<std::string> in_place_ops = {"u0", "u1"};
+  EXPECT_THAT(inplace_instructions.size(), 3);
+  std::set<std::string> in_place_ops = {"u0", "u1", "root"};
   for (auto i : inplace_instructions) {
     EXPECT_TRUE(in_place_ops.count(i->name()));
   }
@@ -508,7 +516,6 @@ ENTRY c1 {
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
   // Make sure that the only inplace instruction is a call to scaled add to.
-
   auto& inplace_instructions = annotations.inplace_instructions;
   EXPECT_THAT(inplace_instructions.size(), 1);
 
@@ -556,14 +563,13 @@ ENTRY entry {
   InplaceFinder inplaceFinder(annotations);
   EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
-  // Make sure that the only inplace instruction is a call to scaled add to.
-
   auto& inplace_instructions = annotations.inplace_instructions;
-  EXPECT_THAT(inplace_instructions.size(), 1);
-
-  // Make sure "add" in while loop body is inplace
-  auto* inst = *(inplace_instructions.begin());
-  EXPECT_THAT(inst->name(), "add");
+  EXPECT_THAT(inplace_instructions.size(), 6);
+  std::set<std::string> in_place_ops = {"p_body.2", "root",     "p_body.1",
+                                        "add",      "p_cond.1", "while_init"};
+  for (auto i : inplace_instructions) {
+    EXPECT_TRUE(in_place_ops.count(i->name()));
+  }
 }
 
 TEST_F(HloInplaceDependencyTest, CustomPoplibsOpInplace) {
@@ -574,7 +580,7 @@ ENTRY c1 {
   p0 = s32[20] parameter(0)
   p1 = s32[20] parameter(1)
 
-  c = s32[20] custom-call(p0, p1), custom_call_target="{\"allocating_indexes\":\"\",\"num_inplace_operands\":1}\n", metadata={op_type="popnn" op_name="_"}
+  c = s32[20] custom-call(p0, p1), custom_call_target="popnn::_", opaque="{\"allocating_indexes\":\"\",\"num_inplace_operands\":1}\n"
 
   ROOT t = (s32[20]) tuple(c)
 }
@@ -582,7 +588,46 @@ ENTRY c1 {
 )";
 
   auto config = GetModuleConfigForTest();
+  config.set_argument_count(2);
   config.set_resource_input_count(2);
+  config.set_input_mapping({0, 1});
+  config.set_resource_update_to_input_index({0});
+  auto module = ParseHloString(hlo, config);
+  EXPECT_TRUE(module.ok());
+  auto* module0 = module.ValueOrDie().get();
+
+  CompilerAnnotations annotations(module0);
+
+  InplaceFinder inplaceFinder(annotations);
+  EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
+
+  auto inplace_instructions = annotations.inplace_instructions;
+  EXPECT_THAT(inplace_instructions.size(), 2);
+  std::set<std::string> in_place_ops = {"c", "t"};
+  for (auto i : inplace_instructions) {
+    EXPECT_TRUE(in_place_ops.count(i->name()));
+  }
+}
+
+TEST_F(HloInplaceDependencyTest, CustomPoplibsOpNotInplace) {
+  std::string hlo = R"(
+HloModule top
+
+ENTRY c1 {
+  p0 = s32[20] parameter(0)
+  p1 = s32[20] parameter(1)
+
+  c = s32[20] custom-call(p0, p1), custom_call_target="popnn::_", opaque="{\"allocating_indexes\":\"\",\"num_inplace_operands\":0}\n"
+
+  ROOT t = (s32[20]) tuple(c)
+}
+
+)";
+
+  auto config = GetModuleConfigForTest();
+  config.set_argument_count(2);
+  config.set_resource_input_count(2);
+  config.set_input_mapping({0, 1});
   config.set_resource_update_to_input_index({0});
   auto module = ParseHloString(hlo, config);
   EXPECT_TRUE(module.ok());
@@ -596,28 +641,29 @@ ENTRY c1 {
   auto inplace_instructions = annotations.inplace_instructions;
 
   EXPECT_THAT(inplace_instructions.size(), 1);
-
-  const auto* inst = *(inplace_instructions.begin());
-  EXPECT_THAT(inst->name(), "c");
+  auto* inst = *(inplace_instructions.begin());
+  EXPECT_THAT(inst->name(), "t");
 }
 
-TEST_F(HloInplaceDependencyTest, CustomPoplibsOpNotInplace) {
+TEST_F(HloInplaceDependencyTest, TestAllGTEsInplace) {
   std::string hlo = R"(
 HloModule top
 
 ENTRY c1 {
-  p0 = s32[20] parameter(0)
-  p1 = s32[20] parameter(1)
-
-  c = s32[20] custom-call(p0, p1), custom_call_target="{\"allocating_indexes\":\"\",\"num_inplace_operands\":0}\n", metadata={op_type="popnn" op_name="_"}
-
-  ROOT t = (s32[20]) tuple(c)
+  p0 = (s32[20], s32[20], s32[20], s32[20]) parameter(0)
+  p0_0 = s32[20] get-tuple-element(p0), index=0
+  p0_1 = s32[20] get-tuple-element(p0), index=1
+  p0_2 = s32[20] get-tuple-element(p0), index=2
+  a = s32[20] add(p0_0, p0_1)
+  ROOT a2 = s32[20] add(a, p0_2)
 }
 
 )";
 
   auto config = GetModuleConfigForTest();
-  config.set_resource_input_count(2);
+  config.set_argument_count(4);
+  config.set_resource_input_count(0);
+  config.set_input_mapping({0});
   config.set_resource_update_to_input_index({0});
   auto module = ParseHloString(hlo, config);
   EXPECT_TRUE(module.ok());
@@ -626,11 +672,50 @@ ENTRY c1 {
   CompilerAnnotations annotations(module0);
 
   InplaceFinder inplaceFinder(annotations);
-  EXPECT_FALSE(inplaceFinder.Run(module0).ValueOrDie());
+  EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
 
   auto inplace_instructions = annotations.inplace_instructions;
+  EXPECT_THAT(inplace_instructions.size(), 5);
+  std::set<std::string> in_place_ops = {"p0_0", "p0_1", "p0_2", "a", "a2"};
+  for (auto i : inplace_instructions) {
+    EXPECT_TRUE(in_place_ops.count(i->name()));
+  }
+}
 
-  EXPECT_THAT(inplace_instructions.size(), 0);
+TEST_F(HloInplaceDependencyTest, TestGTENotInplace) {
+  std::string hlo = R"(
+HloModule top
+
+ENTRY c1 {
+  p0 = (s32[20], s32[20], s32[20], s32[20]) parameter(0)
+  p0_0 = s32[20] get-tuple-element(p0), index=0
+  c = s32[20] custom-call(p0), custom_call_target="popnn::_", opaque="{\"allocating_indexes\":\"\",\"num_inplace_operands\":0}\n"
+
+  ROOT a = s32[20] add(p0_0, c)
+}
+
+)";
+
+  auto config = GetModuleConfigForTest();
+  config.set_argument_count(4);
+  config.set_resource_input_count(2);
+  config.set_input_mapping({0});
+  config.set_resource_update_to_input_index({0});
+  auto module = ParseHloString(hlo, config);
+  EXPECT_TRUE(module.ok());
+  auto* module0 = module.ValueOrDie().get();
+
+  CompilerAnnotations annotations(module0);
+
+  InplaceFinder inplaceFinder(annotations);
+  EXPECT_TRUE(inplaceFinder.Run(module0).ValueOrDie());
+
+  auto inplace_instructions = annotations.inplace_instructions;
+  EXPECT_THAT(inplace_instructions.size(), 1);
+  std::set<std::string> in_place_ops = {"a"};
+  for (auto i : inplace_instructions) {
+    EXPECT_TRUE(in_place_ops.count(i->name()));
+  }
 }
 
 }  // namespace

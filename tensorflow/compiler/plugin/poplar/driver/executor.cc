@@ -119,6 +119,19 @@ se::host::HostStream* AsPoplarStream(se::Stream* stream) {
   return dynamic_cast<se::host::HostStream*>(stream->implementation());
 }
 
+PoplarExecutor::TensorControl::TensorControl(size_t size_) {
+  size = size_;
+  ref_count = 1;
+  on_device = false;
+  input_handle.clear();
+  output_handle.clear();
+  output_convertor = nullptr;
+  converted_data.clear();
+  data = new char[size_];
+}
+
+PoplarExecutor::TensorControl::~TensorControl() { delete[] data; }
+
 PoplarExecutor::PoplarExecutor()
     : ordinal_(0),
       current_engine_(nullptr),
@@ -129,15 +142,7 @@ PoplarExecutor::PoplarExecutor()
 PoplarExecutor::~PoplarExecutor() {}
 
 void* PoplarExecutor::Allocate(uint64 size) {
-  void* raw_buf = new char[size + sizeof(TensorControl)];
-  TensorControl* allocated = new (raw_buf) TensorControl();
-  allocated->size = size;
-  allocated->ref_count = 1;
-  allocated->on_device = false;
-  allocated->input_handle.clear();
-  allocated->output_handle.clear();
-  allocated->output_convertor = nullptr;
-  allocated->converted_data.clear();
+  TensorControl* allocated = new TensorControl(size);
   {
     std::lock_guard<std::recursive_mutex> g(mutex_);
     allocations_.push_back(allocated);
@@ -171,10 +176,8 @@ void PoplarExecutor::DeferredDeallocation() {
       std::partition(allocations_.begin(), allocations_.end(),
                      [](TensorControl* tc) { return tc->ref_count > 0; });
 
-  std::for_each(new_end, allocations_.end(), [](TensorControl* tc) {
-    tc->~TensorControl();
-    delete[] reinterpret_cast<char*>(tc);
-  });
+  std::for_each(new_end, allocations_.end(),
+                [](TensorControl* tc) { delete tc; });
 
   allocations_.erase(new_end, allocations_.end());
 }
@@ -485,6 +488,10 @@ Status PoplarExecutor::ConfigurePoplarDevice(
       conv_options_.set(opt.option(), opt.value());
     }
 
+    for (const auto& opt : current_config_.pooling_options()) {
+      pooling_options_.set(opt.option(), opt.value());
+    }
+
     report_options_.set("includeVarStorageReport", "true");
     report_options_.set("doLayerWiseBreakdown", "true");
     if (!CompilerReportingTextFormat()) {
@@ -507,6 +514,10 @@ Status PoplarExecutor::ConfigurePoplarDevice(
 
     for (auto opt : conv_options_) {
       VLOG(1) << "Convolution option: " << opt.first << " = " << opt.second;
+    }
+
+    for (auto opt : pooling_options_) {
+      VLOG(1) << "Pooling option: " << opt.first << " = " << opt.second;
     }
 
     for (auto opt : report_options_) {
@@ -761,8 +772,8 @@ se::DeviceMemoryBase PoplarExecutor::ConstantOutputAllocation::GetAllocation(
 }
 
 se::DeviceMemoryBase PoplarExecutor::RemapOutputAllocation::GetAllocation(
-    xla::DeviceMemoryAllocator*, const xla::Shape&, const int64 output_index,
-    int64& flat_tensor_index, const Args& args,
+    xla::DeviceMemoryAllocator* allocator, const xla::Shape&,
+    const int64 output_index, int64& flat_tensor_index, const Args& args,
     const InputOutputAliasingMap::OutputInfo&, const ArgsHandleMap& args_map,
     const int) const {
   const auto& remap_idx = remap_map_[output_index];
@@ -770,9 +781,37 @@ se::DeviceMemoryBase PoplarExecutor::RemapOutputAllocation::GetAllocation(
   if (it == args_map.end()) {
     LOG(FATAL) << "Could not remap an output to input tensor.";
   }
-  TensorControl* tc = it->second.tc;
-  tc->ref_count++;
-  return se::DeviceMemoryBase(tc);
+
+  bool make_a_copy = false;
+
+  auto input_infos = input_output_aliasing_map_.GetEntryInputInfos();
+  auto output_infos = input_output_aliasing_map_.GetEntryOutputInfos();
+  if (input_infos.size() > 0 && output_infos.size() > 0) {
+    int input_index = output_infos[output_index].GetInputIndex();
+    bool is_input_resource = input_infos[input_index].IsResource();
+    bool is_output_resource = output_infos[output_index].IsResource();
+    make_a_copy = is_input_resource != is_output_resource;
+  }
+
+  if (make_a_copy) {
+    TensorControl* orig = it->second.tc;
+    se::DeviceMemoryBase allocated =
+        allocator->Allocate(0, orig->size, false).ConsumeValueOrDie().Forget();
+    TensorControl* tc = reinterpret_cast<TensorControl*>(allocated.opaque());
+
+    if (orig->on_device) {
+      executor_->MoveDeviceToHost();
+    }
+
+    memcpy(tc->data, orig->data, orig->size);
+
+    return se::DeviceMemoryBase(tc, tc->size);
+  } else {
+    // Return a reference
+    TensorControl* tc = it->second.tc;
+    tc->ref_count++;
+    return se::DeviceMemoryBase(tc, tc->size);
+  }
 }
 
 se::DeviceMemoryBase PoplarExecutor::BufferOutputAllocation::GetAllocation(
@@ -864,8 +903,7 @@ se::DeviceMemoryBase PoplarExecutor::GetOutputBuffer(
       executable.GetInputOutputAliasingMap().GetEntryOutputInfos();
   CHECK_EQ(outputs_info.size(), shapes.size());
   for (unsigned int idx = 0; idx < shapes.size(); idx++) {
-    const auto& output_info =
-        input_output_aliasing_map.GetEntryOutputInfos()[idx];
+    const auto& output_info = outputs_info[idx];
     int64 start_flat_tensor_index = 0;
     se::DeviceMemoryBase out =
         HandleOutputBuffer(allocator, allocation_info, shapes[idx], idx,
@@ -1140,9 +1178,10 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
                             ConstantOutputAllocation(executable.LiteralValue()),
                             output_shape, args, input_output_aliasing_map);
       } else if (executable.IsRemapGraph()) {
-        retbuf = GetOutputBuffer(executable, allocator,
-                                 RemapOutputAllocation(executable.RemapMap()),
-                                 output_shape, args, input_output_aliasing_map);
+        RemapOutputAllocation remap(this, executable.RemapMap(),
+                                    input_output_aliasing_map);
+        retbuf = GetOutputBuffer(executable, allocator, remap, output_shape,
+                                 args, input_output_aliasing_map);
       } else {
         LOG(FATAL) << "Cannot construct a NULL graph.";
       }
@@ -1152,11 +1191,11 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
             "Executable must have an HloModule");
       }
 
-      TF_ASSIGN_OR_RETURN(const bool move__device_to_host,
+      TF_ASSIGN_OR_RETURN(const bool move_device_to_host,
                           CheckMoveDeviceToHostRequired(engine_changed));
 
-      if (move__device_to_host) {
-        MoveDeviceToHost();
+      if (move_device_to_host) {
+        TF_RETURN_IF_ERROR(MoveDeviceToHost());
       }
 
       if (engine_changed) {
@@ -1168,8 +1207,6 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
           }
 
           executable.OnEngineLoaded();
-
-          DeferredDeallocation();
           current_engine_ = engine;
 
         } catch (const std::exception& e) {
@@ -1177,9 +1214,12 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
         }
       }
 
-      TF_ASSIGN_OR_RETURN(const bool move__host_to_device,
+      // Deallocate all the marked buffers.
+      DeferredDeallocation();
+
+      TF_ASSIGN_OR_RETURN(const bool move_host_to_device,
                           CheckMoveHostToDeviceRequired(engine_changed));
-      if (move__host_to_device) {
+      if (move_host_to_device) {
         MoveHostToDevice();
       }
 

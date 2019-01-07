@@ -95,7 +95,6 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
 
         ok = ['progIdCopy',
               'host-exchange-local-copy-',
-              'Copy_',
               'cnv3*/convolution.*/Conv_3x3',
               'ba3*/call/addToChannel']
 
@@ -173,7 +172,7 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
               'host-exchange-local-copy-',
               'Copy_*Conv',
               'cnv5*/convolution.*/Conv_1x1',
-              'ba5*/add.*/AddTo']
+              'ba5*/call/addToChannel']
         self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testConvBackpropInput(self):

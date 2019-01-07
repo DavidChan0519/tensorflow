@@ -42,6 +42,7 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/platform_id.h"
 #include "tensorflow/compiler/plugin/poplar/driver/scheduler.h"
+#include "tensorflow/compiler/plugin/poplar/driver/sharding_pass.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/util.h"
 #include "tensorflow/compiler/plugin/poplar/driver/while_loop_condition_simplify.h"
@@ -49,7 +50,6 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/wide_const_finder.h"
 
 #include "tensorflow/compiler/xla/service/algebraic_simplifier.h"
-#include "tensorflow/compiler/xla/service/batchnorm_expander.h"
 #include "tensorflow/compiler/xla/service/computation_placer.h"
 #include "tensorflow/compiler/xla/service/dot_decomposer.h"
 #include "tensorflow/compiler/xla/service/gather_expander.h"
@@ -263,12 +263,11 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
   CompilerResources resources(dev, seed + 1, poplarExecutor->GetRandomGenMode(),
                               poplarExecutor->GetConvolutionOptions(),
+                              poplarExecutor->GetPoolingOptions(),
                               poplarExecutor->DisableGraphConvCaching(),
                               module.get());
 
   resources.main_graph.addCodelets(GetPathToGraphProgFile("tf.gp"));
-  resources.main_graph.addCodelets(GetPathToGraphProgFile("heap_sort.gp"));
-  resources.main_graph.addCodelets(GetPathToGraphProgFile("batch_norm.gp"));
   poplin::addCodelets(resources.main_graph);
   popnn::addCodelets(resources.main_graph);
   popops::addCodelets(resources.main_graph);
@@ -287,7 +286,6 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
   {
     HloPassPipeline pipeline("IPU");
-    pipeline.AddPass<BatchNormExpander>(true, false, true);
     pipeline.AddPass<GatherExpander>();
     pipeline.AddPass<ScatterExpander>();
     pipeline.AddPass<DotDecomposer>();
@@ -309,24 +307,31 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     pipeline.AddPass<WideConstFinder>();
     pipeline.AddPass<CommutativeInstructionReorderOperands>();
     pipeline.AddPass<ConvolutionClassifier>(resources.annotations);
-    pipeline.AddPass<HloDCE>();
-    pipeline.AddPass<WhileLoopConstantSinking>();
-    pipeline.AddPass<HloPassFix<AlgebraicSimplifier>>(
-        false, [](const Shape&, const Shape&) { return false; }, false, false);
-    pipeline.AddPass<HloPassFix<FuseMaxPool>>(resources.annotations);
-    pipeline.AddPass<HloPassFix<FuseOpsLate>>(resources.annotations);
-    pipeline.AddPass<FuseWideConst>(resources.annotations);
+    {
+      auto& pass =
+          pipeline.AddPass<HloPassFix<HloPassPipeline>>("repeated-fusing");
+      pass.AddPass<HloCSE>(true);
+      pass.AddPass<HloDCE>();
+      pass.AddPass<WhileLoopConstantSinking>();
+      pass.AddPass<HloPassFix<AlgebraicSimplifier>>(
+          false, [](const Shape&, const Shape&) { return false; }, false,
+          false);
+      pass.AddPass<HloPassFix<FuseMaxPool>>(resources.annotations);
+      pass.AddPass<HloPassFix<FuseOpsLate>>(resources.annotations);
+      pass.AddPass<FuseWideConst>(resources.annotations);
+      pass.AddPass<HloDCE>();
+      pass.AddPass<WhileLoopConditionSimplify>();
+      pass.AddPass<WhileLoopToRepeatSimplify>();
+    }
     pipeline.AddPass<HloSubcomputationUnification>();
     pipeline.AddPass<HloDCE>();
-    pipeline.AddPass<WhileLoopConditionSimplify>();
-    pipeline.AddPass<WhileLoopToRepeatSimplify>(resources.annotations);
-    pipeline.AddPass<HloDCE>();
     pipeline.AddPass<InplaceFinder>(resources.annotations);
+    pipeline.AddPass<ShardingPass>();
     pipeline.AddPass<ExpressionOutliner>(resources.annotations);
     pipeline.AddPass<HloSubcomputationUnification>();
     pipeline.AddPass<ConvolutionClassifier>(resources.annotations);
     pipeline.AddPass<AllocationFinder>(resources.annotations);
-    pipeline.AddPass<ForwardAllocation>(resources.annotations);
+    pipeline.AddPass<HloPassFix<ForwardAllocation>>(resources.annotations);
     pipeline.AddPass<Scheduler>();
 
     bool ok;
