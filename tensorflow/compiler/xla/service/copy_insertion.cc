@@ -442,7 +442,6 @@ class CopyRemover {
               const HloOrdering& ordering, HloModule* module)
       : module_(module),
         alias_analysis_(alias_analysis),
-        ordering_(ordering),
         buffer_value_tracker_(*module, alias_analysis, ordering) {}
 
   // Try to elide the given copy. The copy is elided if the instruction is not
@@ -523,7 +522,7 @@ class CopyRemover {
         // between copies added around aliased operations (kWhile) guarantees
         // this strict order.
         for (const HloValue* value_a : buffer.values()) {
-          if (ShapeUtil::IsToken(value_a->shape())) {
+          if (value_a->shape().IsToken()) {
             // Token values have no representation and cannot interfere.
             continue;
           }
@@ -540,10 +539,9 @@ class CopyRemover {
         }
 
         std::vector<const HloValue*> values = buffer.values();
-        std::sort(values.begin(), values.end(),
-                  [this](const HloValue* a, const HloValue* b) {
-                    return ordering_.IsDefinedBefore(*a, *b);
-                  });
+        absl::c_sort(values, [this](const HloValue* a, const HloValue* b) {
+          return ordering_.IsDefinedBefore(*a, *b);
+        });
 
         // Create a list containing all of the values in the buffer.
         AddValueList(values, &value_to_node);
@@ -843,12 +841,11 @@ class CopyRemover {
       copy_value_node->next->prev = operand_node;
 
       // Patch up uses. Remove use of copy from operand_node uses.
-      auto it =
-          std::find_if(operand_node->uses.begin(), operand_node->uses.end(),
-                       [copy_value_node](const HloUse* use) {
-                         return use->instruction ==
-                                copy_value_node->value->defining_instruction();
-                       });
+      auto it = absl::c_find_if(
+          operand_node->uses, [copy_value_node](const HloUse* use) {
+            return use->instruction ==
+                   copy_value_node->value->defining_instruction();
+          });
       CHECK(it != operand_node->uses.end());
       operand_node->uses.erase(it);
 
@@ -1003,7 +1000,6 @@ class CopyRemover {
 
   HloModule* module_;
   const HloAliasAnalysis& alias_analysis_;
-  const HloOrdering& ordering_;
 
   // Object tracking the HLO values contained in each HLO buffer.
   BufferValueTracker buffer_value_tracker_;

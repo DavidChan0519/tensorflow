@@ -1,4 +1,4 @@
-/* Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+/* Copyright 2019 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,18 +17,11 @@ limitations under the License.
 #define TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_CUSTOM_OPS_POPLIBS_OPS_H_
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
-
 #include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
-#include "tensorflow/compiler/xla/service/hlo_opcode.h"
-#include "tensorflow/compiler/xla/xla_data.pb.h"
-#include "tensorflow/core/lib/core/status.h"
-#include "tensorflow/core/lib/gtl/array_slice.h"
 #include "tensorflow/stream_executor/lib/statusor.h"
 
-#include "absl/container/flat_hash_map.h"
-
-#include <poplar/exceptions.hpp>
-#include <poputil/exceptions.hpp>
+#include <string>
+#include "absl/types/optional.h"
 
 namespace poplar {
 class Graph;
@@ -43,7 +36,9 @@ namespace poplarplugin {
 typedef StatusOr<poplar::Tensor> (*CustomPoplibOpAllocator)(
     poplar::Graph&, CompilerResources&, const std::string&,
     const HloInstruction*, const int64,
-    const IPUCustomKernelsUtil::AttributeMap&);
+    absl::optional<const HloInstruction*> optional_layout,
+    absl::optional<int64> optional_layout_output_idx,
+    const IPUCustomKernelsUtil::AttributeMap&, const TensorMap&);
 
 typedef StatusOr<poplar::program::Program> (*CustomPoplibOpCreator)(
     poplar::Graph&, CompilerResources&, const HloInstruction*,
@@ -51,29 +46,6 @@ typedef StatusOr<poplar::program::Program> (*CustomPoplibOpCreator)(
 
 using CustomPoplibOpInfo =
     std::pair<CustomPoplibOpAllocator, CustomPoplibOpCreator>;
-// Call map functions
-const absl::flat_hash_map<std::string, CustomPoplibOpInfo>& GetPopnnOpInfoMap();
-const absl::flat_hash_map<std::string, CustomPoplibOpInfo>&
-GetPoplinOpInfoMap();
-const absl::flat_hash_map<std::string, CustomPoplibOpInfo>&
-GetPoprandOpInfoMap();
-
-// Popnn Ops
-StatusOr<poplar::Tensor> AllocateLstmLayerFwdOp(
-    poplar::Graph&, CompilerResources&, const std::string&,
-    const HloInstruction*, const int64,
-    const IPUCustomKernelsUtil::AttributeMap&);
-StatusOr<poplar::Tensor> AllocateLstmLayerBwdOp(
-    poplar::Graph&, CompilerResources&, const std::string&,
-    const HloInstruction*, const int64,
-    const IPUCustomKernelsUtil::AttributeMap&);
-StatusOr<poplar::program::Program> CreateLstmLayerFwdOp(
-    poplar::Graph&, CompilerResources&, const HloInstruction*,
-    const xla::Shape&, TensorMap&, const IPUCustomKernelsUtil::AttributeMap&);
-StatusOr<poplar::program::Program> CreateLstmLayerBwdOp(
-    poplar::Graph&, CompilerResources&, const HloInstruction*,
-    const xla::Shape&, TensorMap&, const IPUCustomKernelsUtil::AttributeMap&);
-
 }  // namespace poplarplugin
 }  // namespace xla
 

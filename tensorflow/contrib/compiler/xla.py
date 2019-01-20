@@ -23,6 +23,7 @@ import contextlib
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
 from tensorflow.compiler.jit.ops import xla_ops
+from tensorflow.compiler.jit.ops import xla_ops_grad  # pylint: disable=unused-import
 from tensorflow.core.framework import attr_value_pb2
 from tensorflow.python.estimator import model_fn as model_fn_lib
 from tensorflow.python.framework import ops
@@ -33,6 +34,7 @@ from tensorflow.python.ops import variable_scope
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import compat
 from tensorflow.python.util import function_utils
+from tensorflow.python.util import nest
 from tensorflow.python.util import tf_decorator
 from tensorflow.python.util import tf_inspect
 
@@ -75,7 +77,12 @@ def compile(computation, inputs=None):  # pylint: disable=redefined-builtin
 
       All `Operation`s returned from `computation` will be executed when
       evaluating any of the returned output tensors.
-    inputs: A list of input tensors or `None` (equivalent to an empty list).
+    inputs: A list of inputs or `None` (equivalent to an empty list). Each input
+      can be a nested structure containing values that are convertible to
+      tensors. Note that passing an N-dimension list of compatible values will
+      result in a N-dimention list of scalar tensors rather than a single Rank-N
+      tensors. If you need different behavior, convert part of inputs to tensors
+      with `tf.convert_to_tensor`.
 
   Returns:
     A list of output tensors.
@@ -179,14 +186,11 @@ class XLACompileContext(control_flow_ops.XLAControlFlowContext):
     if external_control_inputs:
       # Use an identity to pull control inputs as data inputs. Note that we
       # ignore ops which don't have outputs. TODO(phawkins): fix that.
-      with ops.control_dependencies(None):
-        self.Enter()
-        external_control_inputs = [
-            array_ops.identity(x.outputs[0]).op
-            for x in external_control_inputs
-            if x.outputs
-        ]
-        self.Exit()
+      external_control_inputs = [
+          array_ops.identity(x.outputs[0]).op
+          for x in external_control_inputs
+          if x.outputs
+      ]
       # pylint: disable=protected-access
       op._add_control_inputs(external_control_inputs)
       # pylint: enable=protected-access
@@ -262,17 +266,10 @@ def _compile_internal(computation, inputs=None):
   if not isinstance(inputs, collections.Sequence):
     raise TypeError('inputs must be a list')
 
+  # Flatten inputs.
+  flat_inputs = nest.flatten(inputs)
   # Converts inputs to Tensors.
-  inputs = [ops.convert_to_tensor(x) for x in inputs]
-  input_arity = len(inputs)
-
-  arg_error = check_function_argument_count(
-      computation, input_arity, infeed_queue=None)
-  if arg_error is not None:
-    raise TypeError(
-        'Supplied computation cannot be called with the specified inputs. You '
-        'specified %d inputs: %s, but the computation needs %s' %
-        (input_arity, str([i.name for i in inputs]), arg_error))
+  flat_inputs = [ops.convert_to_tensor(x) for x in flat_inputs]
 
   cluster_name = ops.get_default_graph().unique_name('cluster')
   pivot = control_flow_ops.no_op(name=cluster_name + '/pivot')
@@ -282,10 +279,14 @@ def _compile_internal(computation, inputs=None):
 
     # Add identity ops so even unused inputs are 'consumed' by the
     # computation.
-    computation_inputs = [
+    flat_inputs = [
         array_ops.identity(x, name='input_{}'.format(i))
-        for i, x in enumerate(inputs)
+        for i, x in enumerate(flat_inputs)
     ]
+
+    # Re-pack flat_inputs in same structure as 'inputs'.
+    computation_inputs = nest.pack_sequence_as(
+        structure=inputs, flat_sequence=flat_inputs)
 
     # Only resource variables work inside an XLA computation, so turn on
     # resource variables for the computation.

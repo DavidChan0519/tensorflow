@@ -17,11 +17,13 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/compiler/plugin/poplar/driver/visitor_base.h"
+#include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/util.h"
 
 #include "tensorflow/compiler/xla/layout_util.h"
+#include "tensorflow/compiler/xla/service/buffer_assignment.h"
 #include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
@@ -52,8 +54,6 @@ typedef StatusOr<poplar::program::Program> (*CustomCallFn)(
     CompilerResources&, const HloInstruction*, const xla::Shape&, TensorMap&);
 
 static std::map<std::string, CustomCallFn> custom_call_map = {
-    {"const_slice_update", CreateSliceUpdateOp},
-    {"const_slice", CreateSliceOp},
     {"relu", CreateReluOp},
     {"relugrad", CreateReluGradOp},
     {"sigmoid", CreateSigmoidOp},
@@ -181,7 +181,7 @@ Status BaseVisitor::HandleConvolution(HloInstruction* inst) {
   return Unimplemented(inst);
 }
 
-Status BaseVisitor::HandleCrossReplicaSum(HloInstruction* inst) {
+Status BaseVisitor::HandleAllReduce(HloInstruction* inst) {
   return Unimplemented(inst);
 }
 
@@ -274,8 +274,27 @@ Status BaseVisitor::HandleTranspose(HloInstruction* inst) {
 Status BaseVisitor::HandleFusion(HloInstruction* inst) {
   VLOG(1) << "Processing " << inst->name();
   poplar::program::Program prog;
-  TF_ASSIGN_OR_RETURN(
-      prog, CreateFusionOp(resources_, inst, GetOutputShape(inst), tensor_map));
+  HloComputation* comp = inst->fused_instructions_computation();
+
+  // If is is a special fusion-type op
+  if (IsPopOpsFusion(comp)) {
+    VLOG(1) << "Processing " << inst->name()
+            << " as Poplibs fusion: " << comp->name();
+    auto end = comp->name().find('.');
+    std::string name = comp->name().substr(8, end - 8);
+
+    if (custom_call_map.count(name) == 1) {
+      TF_ASSIGN_OR_RETURN(
+          prog, custom_call_map.at(name)(resources_, inst, GetOutputShape(inst),
+                                         tensor_map));
+    } else {
+      return xla::FailedPrecondition("Unrecognized special call op %s: %s",
+                                     inst->name().c_str(), name.c_str());
+    }
+  } else {
+    TF_ASSIGN_OR_RETURN(prog, CreateFusionOp(resources_, inst,
+                                             GetOutputShape(inst), tensor_map));
+  }
   sequence.add(prog);
   return Status::OK();
 };
@@ -284,23 +303,7 @@ Status BaseVisitor::HandleCall(HloInstruction* inst) {
   HloComputation* comp = inst->to_apply();
   VLOG(1) << "Processing " << inst->name() << " : " << comp->name();
 
-  // If is is a special fusion-type op
-  if (IsPopOpsCall(comp)) {
-    auto end = comp->name().find('.');
-    std::string name = comp->name().substr(8, end - 8);
-
-    if (custom_call_map.count(name) == 1) {
-      poplar::program::Program prog;
-      TF_ASSIGN_OR_RETURN(
-          prog, custom_call_map.at(name)(resources_, inst, GetOutputShape(inst),
-                                         tensor_map));
-      sequence.add(prog);
-      return Status::OK();
-    } else {
-      return xla::FailedPrecondition("Unrecognized special call op %s: %s",
-                                     inst->name().c_str(), name.c_str());
-    }
-  } else if (IsRepeatCall(comp)) {
+  if (IsRepeatCall(comp)) {
     TF_ASSIGN_OR_RETURN(
         poplar::program::Program prog,
         CreateRepeatOp(resources_, inst, GetOutputShape(inst), tensor_map));
@@ -412,7 +415,32 @@ Status BaseVisitor::HandleReducePrecision(HloInstruction* inst) {
 }
 
 Status BaseVisitor::HandleInfeed(HloInstruction* inst) {
-  return Unimplemented(inst);
+  HloInfeedInstruction* infeed = Cast<HloInfeedInstruction>(inst);
+  poplar::Graph& graph = GetGraph(resources_, inst);
+
+  resources_.annotations.infeed_instructions.push_back(inst);
+  std::string infeed_config = infeed->infeed_config();
+  if (infeed_config == "enqueue") {
+    // Do nothing, enqueue should only interact with
+    // transfer manager object
+  } else if (infeed_config == "dequeue") {
+    poplar::program::Sequence& seq = sequence;
+
+    poplar::Tensor out;
+
+    const Shape& shape = infeed->infeed_shape();
+    TF_ASSIGN_OR_RETURN(out, AddTensor(graph, std::make_pair(inst, 0), shape,
+                                       resources_, tensor_map));
+
+    auto fifo = graph.addHostToDeviceFIFO(inst->name(), out.elementType(),
+                                          out.numElements());
+
+    seq.add(poplar::program::Copy(fifo, out, false));
+
+    TF_CHECK_OK(AddOutputTensor(tensor_map, inst, 0, out));
+  }
+
+  return Status::OK();
 }
 
 Status BaseVisitor::HandleOutfeed(HloInstruction* inst) {
@@ -456,7 +484,8 @@ Status BaseVisitor::HandleGather(HloInstruction* inst) {
 }
 
 Status BaseVisitor::HandleAfterAll(HloInstruction* inst) {
-  return Unimplemented(inst);
+  // TODO(shauryas) : figure out how to use this for something useful
+  return Status::OK();
 }
 
 Status BaseVisitor::HandleIota(HloInstruction* inst) {
@@ -472,6 +501,14 @@ Status BaseVisitor::HandleAllToAll(HloInstruction* inst) {
 }
 
 Status BaseVisitor::HandleCollectivePermute(HloInstruction* inst) {
+  return Unimplemented(inst);
+}
+
+Status BaseVisitor::HandleGetDimensionSize(HloInstruction* inst) {
+  return Unimplemented(inst);
+}
+
+Status BaseVisitor::HandleAddDependency(HloInstruction* inst) {
   return Unimplemented(inst);
 }
 

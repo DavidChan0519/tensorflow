@@ -113,16 +113,12 @@ class SparseTensor(_TensorLike):
       dense_shape: A 1-D int64 tensor of shape `[ndims]`.
 
     """
-    with ops.name_scope(None, "SparseTensor",
-                        [indices, values, dense_shape]):
+    with ops.name_scope(None, "SparseTensor", [indices, values, dense_shape]):
       indices = ops.convert_to_tensor(
           indices, name="indices", dtype=dtypes.int64)
-      # Always pass as_ref=True because we want to be able to update
-      # values later if it is a VariableOp.
       # TODO(touts): Consider adding mutable_values() when 'values'
       # is a VariableOp and updating users of SparseTensor.
-      values = ops.internal_convert_to_tensor(
-          values, name="values", as_ref=True)
+      values = ops.internal_convert_to_tensor(values, name="values")
       dense_shape = ops.convert_to_tensor(
           dense_shape, name="dense_shape", dtype=dtypes.int64)
     self._indices = indices
@@ -244,11 +240,11 @@ class SparseTensor(_TensorLike):
 
 SparseTensorValue = collections.namedtuple(
     "SparseTensorValue", ["indices", "values", "dense_shape"])
-tf_export("SparseTensorValue")(SparseTensorValue)
+tf_export(v1=["SparseTensorValue"])(SparseTensorValue)
 pywrap_tensorflow.RegisterType("SparseTensorValue", SparseTensorValue)
 
 
-@tf_export("convert_to_tensor_or_sparse_tensor")
+@tf_export(v1=["convert_to_tensor_or_sparse_tensor"])
 def convert_to_tensor_or_sparse_tensor(value, dtype=None, name=None):
   """Converts value to a `SparseTensor` or `Tensor`.
 

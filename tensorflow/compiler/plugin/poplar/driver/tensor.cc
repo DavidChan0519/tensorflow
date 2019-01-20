@@ -16,8 +16,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "absl/strings/str_cat.h"
-
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
@@ -40,9 +38,11 @@ limitations under the License.
 #include "tensorflow/core/util/bcast.h"
 #include "tensorflow/stream_executor/lib/status.h"
 
+#include "absl/strings/str_cat.h"
+
 #include <poplar/Engine.hpp>
 #include <poplar/OptionFlags.hpp>
-#include <popnn/BatchNorm.hpp>
+#include <poplin/Norms.hpp>
 #include <poputil/TileMapping.hpp>
 
 #include <functional>
@@ -366,26 +366,22 @@ StatusOr<poplar::Tensor> AddDynamicSliceTensor(
 
 static StatusOr<poplar::Tensor> AddConvolutionInput(
     poplar::Graph& graph, const std::string& debug_name,
-    const HloInstruction* op_target, const HloInstruction* conv_target,
-    CompilerResources& resources) {
+    const HloInstruction* target, CompilerResources& resources) {
   poplin::ConvParams params;
-  TF_ASSIGN_OR_RETURN(params,
-                      GetConvolutionParameters(op_target, conv_target, 0, 1));
+  TF_ASSIGN_OR_RETURN(params, GetConvolutionParameters(target, 0, 1));
 
   auto name = StrCat(debug_name, "_input");
   poplar::OptionFlags opts;
   poplar::Tensor out = poplin::createInput(graph, params, name, opts,
                                            &resources.convolution_cache);
-  return ShuffleConvolutionInputToTensorflow(conv_target, out);
+  return ShuffleConvolutionInputToTensorflow(target, out);
 }
 
 static StatusOr<poplar::Tensor> AddConvolutionWeights(
     poplar::Graph& graph, const std::string& debug_name,
-    const HloInstruction* op_target, const HloInstruction* conv_target,
-    CompilerResources& resources) {
+    const HloInstruction* target, CompilerResources& resources) {
   poplin::ConvParams params;
-  TF_ASSIGN_OR_RETURN(params,
-                      GetConvolutionParameters(op_target, conv_target, 0, 1));
+  TF_ASSIGN_OR_RETURN(params, GetConvolutionParameters(target, 0, 1));
 
   auto name = StrCat(debug_name, "_weights");
   poplar::OptionFlags opts;
@@ -394,7 +390,7 @@ static StatusOr<poplar::Tensor> AddConvolutionWeights(
 
   out = RemoveGroupsDimensionFromWeights(params, out, false);
 
-  return ShuffleConvolutionWeightsToTensorflow(conv_target, out);
+  return ShuffleConvolutionWeightsToTensorflow(target, out);
 }
 
 static StatusOr<poplar::Tensor> AddConvAddBiasTensor(
@@ -461,12 +457,12 @@ static StatusOr<poplar::Tensor> AddRightMatMul(poplar::Graph& graph,
                                       &resources.dot_cache);
 }
 
-static StatusOr<poplar::Tensor> AddBatchNormScale(poplar::Graph& graph,
-                                                  const std::string& debug_name,
-                                                  const HloInstruction* target,
-                                                  const HloInstruction* layout,
-                                                  int64 layout_output_idx,
-                                                  const TensorMap& tensor_map) {
+StatusOr<poplar::Tensor> AddNormScaleTensor(poplar::Graph& graph,
+                                            const std::string& debug_name,
+                                            const HloInstruction* layout,
+                                            int64 layout_output_idx,
+                                            const unsigned feature_dimension,
+                                            const TensorMap& tensor_map) {
   OutVector outputs = FindInstructionOutputs(tensor_map, layout);
 
   if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
@@ -475,18 +471,18 @@ static StatusOr<poplar::Tensor> AddBatchNormScale(poplar::Graph& graph,
         debug_name);
   }
 
-  const auto* bn = Cast<HloBatchNormInstruction>(target);
-
   poplar::Tensor acts = outputs[layout_output_idx];
-  auto pair = ShuffleBatchNormInputToPoplar(acts, bn->feature_index());
+  auto pair = ShuffleNormInputToPoplar(acts, feature_dimension);
 
-  return popnn::bn::createBatchNormGamma(graph, pair.first);
+  return poplin::createNormGamma(graph, pair.first);
 }
 
-static StatusOr<poplar::Tensor> AddBatchNormOffset(
-    poplar::Graph& graph, const std::string& debug_name,
-    const HloInstruction* target, const HloInstruction* layout,
-    int64 layout_output_idx, const TensorMap& tensor_map) {
+StatusOr<poplar::Tensor> AddNormOffsetTensor(poplar::Graph& graph,
+                                             const std::string& debug_name,
+                                             const HloInstruction* layout,
+                                             int64 layout_output_idx,
+                                             const unsigned feature_dimension,
+                                             const TensorMap& tensor_map) {
   OutVector outputs = FindInstructionOutputs(tensor_map, layout);
 
   if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
@@ -495,12 +491,10 @@ static StatusOr<poplar::Tensor> AddBatchNormOffset(
         debug_name);
   }
 
-  const auto* bn = Cast<HloBatchNormInstruction>(target);
-
   poplar::Tensor acts = outputs[layout_output_idx];
-  auto pair = ShuffleBatchNormInputToPoplar(acts, bn->feature_index());
+  auto pair = ShuffleNormInputToPoplar(acts, feature_dimension);
 
-  return popnn::bn::createBatchNormBeta(graph, pair.first);
+  return poplin::createNormBeta(graph, pair.first);
 }
 
 static StatusOr<poplar::Tensor> AddElementwiseBinary(
@@ -529,8 +523,13 @@ static StatusOr<poplar::Tensor> PathTransform(
     auto& inst = *i;
     switch (inst->opcode()) {
       case HloOpcode::kTranspose: {
-        std::vector<unsigned> permutation(
-            convert_array<std::vector<unsigned>>(inst->dimensions()));
+        auto optional_permutation =
+            convert_array<std::vector<unsigned>>(inst->dimensions());
+        if (!optional_permutation) {
+          return xla::FailedPrecondition(
+              "PathTransform - cannot cast permutation.");
+        }
+        std::vector<unsigned> permutation = *optional_permutation;
         std::vector<unsigned> shuffle(permutation.size());
         for (int d = 0; d < permutation.size(); d++) {
           shuffle[permutation[d]] = d;
@@ -569,158 +568,153 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
     const auto optional_layout = target->second.layout;
     const auto optional_layout_output_idx = target->second.layout_output_idx;
 
-    switch (tgt->opcode()) {
-      case HloOpcode::kBatchNormInference:
-      case HloOpcode::kBatchNormTraining: {
-        switch (target->second.input_index) {
-          case 1: {
-            TF_ASSIGN_OR_RETURN(
-                out,
-                AddBatchNormScale(graph, name, tgt, *optional_layout,
-                                  *optional_layout_output_idx, tensor_map));
-            break;
-          }
-          case 2: {
-            TF_ASSIGN_OR_RETURN(
-                out,
-                AddBatchNormOffset(graph, name, tgt, *optional_layout,
-                                   *optional_layout_output_idx, tensor_map));
-            break;
-          }
-          default:
-            return xla::FailedPrecondition(
-                "invalid operand for tensor allocation on %s",
-                src.first->name().c_str());
-        }
-        break;
-      }
-      case HloOpcode::kConvolution: {
-        switch (target->second.input_index) {
-          case 0: {
-            TF_ASSIGN_OR_RETURN(
-                out, AddConvolutionInput(graph, name, tgt, tgt, resources));
-            break;
-          }
-          case 1: {
-            TF_ASSIGN_OR_RETURN(
-                out, AddConvolutionWeights(graph, name, tgt, tgt, resources));
-            break;
-          }
-          default:
-            return xla::FailedPrecondition(
-                "invalid operand for tensor allocation on %s",
-                src.first->name().c_str());
-        }
-        break;
-      }
-      case HloOpcode::kDot: {
-        switch (target->second.input_index) {
-          case 0: {
-            TF_ASSIGN_OR_RETURN(
-                out, AddLeftMatMul(graph, name, tshape, tgt, resources));
-            break;
-          }
-          case 1: {
-            TF_ASSIGN_OR_RETURN(
-                out, AddRightMatMul(graph, name, tshape, tgt, resources));
-            break;
-          }
-          default:
-            return xla::FailedPrecondition(
-                "invalid operand for tensor allocation on %s",
-                src.first->name().c_str());
-        }
-        break;
-      }
-      case HloOpcode::kDynamicSlice: {
-        if (target->second.input_index == 0) {
-          TF_ASSIGN_OR_RETURN(
-              out, AddDynamicSliceTensor(graph, name, tshape,
-                                         target->second.tgt->shape()));
-        } else {
-          TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
-        }
-        break;
-      }
-      case HloOpcode::kDynamicUpdateSlice: {
-        if (target->second.input_index == 0) {
-          TF_ASSIGN_OR_RETURN(
-              out, AddDynamicSliceTensor(graph, name, tshape,
-                                         target->second.tgt->shape()));
-        } else {
-          TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
-        }
-        break;
-      }
-      case HloOpcode::kCall: {
-        const HloComputation* comp = tgt->to_apply();
-        if (IsPopOpsCall(comp)) {
-          if (IsPopOpsCall(comp, "depthwise_conv")) {
-            const HloInstruction* conv_inst = comp->root_instruction();
-            switch (target->second.input_index) {
-              case 0: {
-                TF_ASSIGN_OR_RETURN(
-                    out, AddConvolutionInput(graph, name, tgt, conv_inst,
-                                             resources));
-                break;
-              }
-              case 1: {
-                TF_ASSIGN_OR_RETURN(
-                    out, AddConvolutionWeights(graph, name, tgt, conv_inst,
-                                               resources));
-                break;
-              }
-              default:
-                return xla::FailedPrecondition(
-                    "invalid operand for tensor allocation on %s",
-                    src.first->name().c_str());
+    if (IsPopOpsElementwiseBinary(tgt) && !IsPopOpsBiasAdd(tgt)) {
+      TF_ASSIGN_OR_RETURN(
+          out, AddElementwiseBinary(graph, name, *optional_layout,
+                                    *optional_layout_output_idx, tensor_map));
+    } else {
+      switch (tgt->opcode()) {
+        case HloOpcode::kBatchNormInference:
+        case HloOpcode::kBatchNormTraining: {
+          const unsigned feature_dimension =
+              Cast<HloBatchNormInstruction>(tgt)->feature_index();
+          switch (target->second.input_index) {
+            case 1: {
+              TF_ASSIGN_OR_RETURN(
+                  out, AddNormScaleTensor(graph, name, *optional_layout,
+                                          *optional_layout_output_idx,
+                                          feature_dimension, tensor_map));
+              break;
             }
-          } else if (IsPopOpsCall(comp, "conv_biasadd")) {
+            case 2: {
+              TF_ASSIGN_OR_RETURN(
+                  out, AddNormOffsetTensor(graph, name, *optional_layout,
+                                           *optional_layout_output_idx,
+                                           feature_dimension, tensor_map));
+              break;
+            }
+            default:
+              return xla::FailedPrecondition(
+                  "invalid operand for tensor allocation on %s",
+                  src.first->name().c_str());
+          }
+          break;
+        }
+        case HloOpcode::kConvolution: {
+          switch (target->second.input_index) {
+            case 0: {
+              TF_ASSIGN_OR_RETURN(
+                  out, AddConvolutionInput(graph, name, tgt, resources));
+              break;
+            }
+            case 1: {
+              TF_ASSIGN_OR_RETURN(
+                  out, AddConvolutionWeights(graph, name, tgt, resources));
+              break;
+            }
+            default:
+              return xla::FailedPrecondition(
+                  "invalid operand for tensor allocation on %s",
+                  src.first->name().c_str());
+          }
+          break;
+        }
+        case HloOpcode::kDot: {
+          switch (target->second.input_index) {
+            case 0: {
+              TF_ASSIGN_OR_RETURN(
+                  out, AddLeftMatMul(graph, name, tshape, tgt, resources));
+              break;
+            }
+            case 1: {
+              TF_ASSIGN_OR_RETURN(
+                  out, AddRightMatMul(graph, name, tshape, tgt, resources));
+              break;
+            }
+            default:
+              return xla::FailedPrecondition(
+                  "invalid operand for tensor allocation on %s",
+                  src.first->name().c_str());
+          }
+          break;
+        }
+        case HloOpcode::kDynamicSlice: {
+          if (target->second.input_index == 0) {
             TF_ASSIGN_OR_RETURN(
-                out,
-                AddConvAddBiasTensor(graph, name, *optional_layout,
-                                     *optional_layout_output_idx, tensor_map));
-          } else if (IsPopOpsCall(comp, "matmul_biasadd")) {
+                out, AddDynamicSliceTensor(graph, name, tshape,
+                                           target->second.tgt->shape()));
+          } else {
+            TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
+          }
+          break;
+        }
+        case HloOpcode::kDynamicUpdateSlice: {
+          if (target->second.input_index == 0) {
             TF_ASSIGN_OR_RETURN(
-                out, AddMatMulAddBiasTensor(graph, name, *optional_layout,
+                out, AddDynamicSliceTensor(graph, name, tshape,
+                                           target->second.tgt->shape()));
+          } else {
+            TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
+          }
+          break;
+        }
+        case HloOpcode::kFusion: {
+          const HloComputation* comp = tgt->fused_instructions_computation();
+          if (IsPopOpsFusion(comp)) {
+            if (IsPopOpsFusion(comp, "depthwise_conv")) {
+              switch (target->second.input_index) {
+                case 0: {
+                  TF_ASSIGN_OR_RETURN(
+                      out, AddConvolutionInput(graph, name, tgt, resources));
+                  break;
+                }
+                case 1: {
+                  TF_ASSIGN_OR_RETURN(
+                      out, AddConvolutionWeights(graph, name, tgt, resources));
+                  break;
+                }
+                default:
+                  return xla::FailedPrecondition(
+                      "invalid operand for tensor allocation on %s",
+                      src.first->name().c_str());
+              }
+            } else if (IsPopOpsFusion(comp, "conv_biasadd")) {
+              TF_ASSIGN_OR_RETURN(
+                  out, AddConvAddBiasTensor(graph, name, *optional_layout,
                                             *optional_layout_output_idx,
                                             tensor_map));
-          } else if (IsPopOpsCall(comp, "scaled_inplace")) {
-            TF_ASSIGN_OR_RETURN(
-                out,
-                AddElementwiseBinary(graph, name, *optional_layout,
-                                     *optional_layout_output_idx, tensor_map));
+            } else if (IsPopOpsFusion(comp, "matmul_biasadd")) {
+              TF_ASSIGN_OR_RETURN(
+                  out, AddMatMulAddBiasTensor(graph, name, *optional_layout,
+                                              *optional_layout_output_idx,
+                                              tensor_map));
+            } else {
+              return xla::FailedPrecondition(
+                  "Unknown poplibs fusion for tensor %s: %s",
+                  src.first->name().c_str(), name.c_str());
+            }
           } else {
-            return xla::FailedPrecondition(
-                "Unknown poplibs fusion for tensor %s: %s",
-                src.first->name().c_str(), name.c_str());
+            TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
           }
-        } else {
-          TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
+          break;
         }
-        break;
-      }
-      case HloOpcode::kCustomCall: {
-        if (IPUCustomKernelsUtil::IsPoplibsOp(tgt)) {
-          TF_ASSIGN_OR_RETURN(
-              out, AllocatePoplibsOpTensor(graph, resources, name, tgt,
-                                           target->second.input_index, shape));
-        } else {
-          LOG(FATAL) << "Unsupported custom call " << tgt->name();
+        case HloOpcode::kCustomCall: {
+          if (IsPoplibsCustomOp(tgt)) {
+            TF_ASSIGN_OR_RETURN(
+                out, AllocatePoplibsOpTensor(
+                         graph, resources, name, tgt,
+                         target->second.input_index, optional_layout,
+                         optional_layout_output_idx, shape, tensor_map));
+          } else {
+            LOG(FATAL) << "Unsupported custom call " << tgt->name();
+          }
+          break;
         }
-        break;
-      }
-      default:
-        if (IsPopOpsElementwiseBinary(tgt)) {
-          TF_ASSIGN_OR_RETURN(
-              out,
-              AddElementwiseBinary(graph, name, *optional_layout,
-                                   *optional_layout_output_idx, tensor_map));
-        } else {
+        default:
           return xla::FailedPrecondition("Unknown tensor target for %s: %s",
                                          src.first->name().c_str(),
                                          tgt->name().c_str());
-        }
+      }
     }
 
     TF_ASSIGN_OR_RETURN(
@@ -747,6 +741,7 @@ static void AddConstantTensor(poplar::Graph& graph, const xla::Literal& literal,
   } else {
     tensor = graph.addConstant(type, dim, data);
   }
+  graph.setTileMapping(tensor, 0);
 
   tensor = ConvertToDeviceLayout(shape, tensor);
 }
@@ -767,6 +762,7 @@ static void AddFp16ConstantTensor(poplar::Graph& graph,
   } else {
     tensor = graph.addConstantHalf(type, dim, (uint16_t*)data);
   }
+  graph.setTileMapping(tensor, 0);
 
   tensor = ConvertToDeviceLayout(shape, tensor);
 }
@@ -792,6 +788,7 @@ static void Add64BitConstantTensor(poplar::Graph& graph,
   } else {
     tensor = graph.addConstant(type, dim, data32);
   }
+  graph.setTileMapping(tensor, 0);
 }
 
 template <typename TYPE>
@@ -1008,8 +1005,13 @@ StatusOr<poplar::Tensor> BroadcastTensor(const poplar::Tensor& in,
     return in;
   }
 
-  tensorflow::BCast::Vec bcast_shape =
+  auto optional_bcast_shape =
       convert_array<tensorflow::BCast::Vec>(out.dimensions());
+  if (!optional_bcast_shape) {
+    return xla::FailedPrecondition(
+        "BroadcastTensor - cannot cast output shape.");
+  }
+  tensorflow::BCast::Vec bcast_shape = *optional_bcast_shape;
 
   tensorflow::BCast::Vec tensor_shape(ShapeUtil::Rank(out), 1);
   if (dimensions.size() > 0) {
@@ -1030,7 +1032,14 @@ StatusOr<poplar::Tensor> BroadcastTensor(const poplar::Tensor& in,
   }
 
   poplar::Tensor o = in;
-  o = in.reshape(convert_array<std::vector<size_t>>(bcast.x_reshape()));
+  auto optional_bcast_x_shape =
+      convert_array<std::vector<size_t>>(bcast.x_reshape());
+  if (!optional_bcast_x_shape) {
+    return xla::FailedPrecondition(
+        "BroadcastTensor - cannot cast broadcast shape.");
+  }
+  std::vector<size_t> bcast_x_shape = *optional_bcast_x_shape;
+  o = in.reshape(bcast_x_shape);
   o = TileTensor(bcast.x_bcast(), o);
   return o.reshape(PoplarShapeFromXlaShape(out));
 }

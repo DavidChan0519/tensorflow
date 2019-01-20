@@ -32,6 +32,8 @@ limitations under the License.
 
 #include "tensorflow/core/lib/strings/stringprintf.h"
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/optional.h"
 #include "google/protobuf/util/message_differencer.h"
 
@@ -104,6 +106,7 @@ namespace poplarplugin {
 static const char* s_cache_env_variable = "TF_POPLAR_ENGINE_CACHE";
 static const char* s_max_compilation_threads_variable =
     "TF_POPLAR_MAX_COMPILATION_THREADS";
+static const char* s_force_ipu_model = "TF_POPLAR_FORCE_IPU_MODEL";
 
 std::string GetInputCopyHandle(int64 parameter, int64 index) {
   return tensorflow::strings::Printf("%lld.%lld", parameter, index);
@@ -117,6 +120,20 @@ std::string GetOutputCopyHandle(int64 output_index, int64 flat_tensor_index) {
 se::host::HostStream* AsPoplarStream(se::Stream* stream) {
   DCHECK(stream != nullptr);
   return dynamic_cast<se::host::HostStream*>(stream->implementation());
+}
+
+cpu::runtime::XfeedManager* GetXfeedManager(int device_ordinal) {
+  static auto* managers =
+      new absl::flat_hash_map<int, cpu::runtime::XfeedManager*>();
+  static absl::Mutex* mutex = new absl::Mutex();
+
+  absl::MutexLock lock(mutex);
+  auto it = managers->find(device_ordinal);
+  if (it == managers->end()) {
+    it = managers->emplace(device_ordinal, new cpu::runtime::XfeedManager())
+             .first;
+  }
+  return it->second;
 }
 
 PoplarExecutor::TensorControl::TensorControl(size_t size_) {
@@ -165,6 +182,29 @@ void PoplarExecutor::Deallocate(se::DeviceMemoryBase* mem) {
       if (tc->ref_count > 0) {
         tc->ref_count--;
       }
+    }
+  }
+}
+
+void PoplarExecutor::ConnectInfeedToStreamCallback(
+    const std::vector<const HloInstruction*>& infeed_instructions) {
+  // Buffer is already placed into xfeed manager by client->TransferToInfeed
+  for (int i = 0; i < infeed_instructions.size(); ++i) {
+    const auto& instr = infeed_instructions[i];
+    if (instr->infeed_config() == "dequeue") {
+      current_engine_->connectStreamToCallback(
+          infeed_instructions[i]->name(), [&](void* dest) {
+            auto* xfeed_manager = GetXfeedManager(ordinal_);
+            auto* xfeed_buffer =
+                xfeed_manager->infeed()->BlockingDequeueBuffer();
+
+            const void* src = xfeed_buffer->data();
+            auto N = xfeed_buffer->length();
+            std::memcpy(dest, src, N);
+
+            xfeed_manager->infeed()->ReleaseCurrentBuffer(
+                xfeed_buffer->length(), xfeed_buffer->data(), Shape{});
+          });
     }
   }
 }
@@ -263,6 +303,11 @@ bool PoplarExecutor::HostCallback(se::Stream* stream,
   return true;
 }
 
+bool PoplarExecutor::HostCallback(se::Stream* stream,
+                                  std::function<Status()> callback) {
+  AsPoplarStream(stream)->EnqueueTask(callback);
+}
+
 bool PoplarExecutor::CreateStreamDependency(se::Stream* dependent,
                                             se::Stream* other) {
   AsPoplarStream(dependent)->EnqueueTask(
@@ -346,7 +391,8 @@ Status PoplarExecutor::ConfigurePoplarDevice(
       bool opened = false;
 
       bool have_ipu_hardware = false;
-      {
+
+      if (getenv(s_force_ipu_model) == nullptr) {
         auto device_list = device_mgr.getDevices();
         for (const auto& d : device_list) {
           if (d.getTarget().getTargetType() == poplar::TargetType::IPU) {
@@ -1023,7 +1069,8 @@ Status PoplarExecutor::MoveDeviceToHost() {
       current_engine_->run(PoplarProgramType::DEVICE_TO_HOST);
     }
 
-    if (current_config_.profiling().enable_io_trace()) {
+    if (current_config_.profiling().enable_ipu_trace_events() &&
+        current_config_.profiling().enable_io_trace()) {
       AddDeviceToHostEventRecord(json_msg);
     }
 
@@ -1079,7 +1126,8 @@ Status PoplarExecutor::MoveHostToDevice() {
 
     current_engine_->run(PoplarProgramType::HOST_TO_DEVICE);
 
-    if (current_config_.profiling().enable_io_trace()) {
+    if (current_config_.profiling().enable_ipu_trace_events() &&
+        current_config_.profiling().enable_io_trace()) {
       AddHostToDeviceEventRecord(json_msg);
     }
 
@@ -1152,6 +1200,8 @@ void PoplarExecutor::AboutToFreeEngine(poplar::Engine* engine) {
   }
 }
 
+const int PoplarExecutor::device_ordinal() const { return ordinal_; }
+
 StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
     perftools::gputools::StreamExecutor* executor,
     xla::poplarplugin::PoplarExecutable& executable,
@@ -1202,7 +1252,8 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
         try {
           engine->load(poplar_device_);
 
-          if (current_config_.profiling().enable_io_trace()) {
+          if (current_config_.profiling().enable_ipu_trace_events() &&
+              current_config_.profiling().enable_io_trace()) {
             AddLoadEngineEventRecord(executable.module().name());
           }
 
@@ -1236,6 +1287,11 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
         ConnectStreamedVariablesHostToDevice();
         ConnectStreamedVariablesDeviceToHost();
 
+        const auto& infeed_instructions = executable.InfeedInstructions();
+        if (!infeed_instructions.empty()) {
+          ConnectInfeedToStreamCallback(infeed_instructions);
+        }
+
         // Run the main engine
         current_engine_->run(PoplarProgramType::MAIN_SEQUENCE);
 
@@ -1248,20 +1304,20 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
       }
 
       try {
-        if (current_config_.profiling().enable_execution_trace() > 0) {
-          auto& opts = GetReportFlags();
-
+        if (current_config_.profiling().enable_ipu_trace_events()) {
           std::stringstream report_stream;
           std::stringstream trace_stream;
-          if (executable.ExecutionCount() == 0) {
-            auto rep = current_engine_->getExecutionReport(opts);
-            if (CompilerReportingTextFormat()) {
-              rep.printSummary(report_stream);
-            } else {
-              rep.serialize(report_stream, poplar::SerializationFormat::JSON);
-            }
+          if (current_config_.profiling().enable_execution_trace() > 0) {
+            if (executable.ExecutionCount() == 0) {
+              auto rep = current_engine_->getExecutionReport(GetReportFlags());
+              if (CompilerReportingTextFormat()) {
+                rep.printSummary(report_stream);
+              } else {
+                rep.serialize(report_stream, poplar::SerializationFormat::JSON);
+              }
 
-            current_engine_->reportIntervals(trace_stream);
+              current_engine_->reportIntervals(trace_stream);
+            }
           }
 
           AddExecuteEventRecord(executable.module().name(), report_stream.str(),

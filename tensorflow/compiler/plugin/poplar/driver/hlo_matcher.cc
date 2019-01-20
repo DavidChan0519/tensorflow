@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "absl/strings/str_cat.h"
 
+#include "tensorflow/compiler/plugin/poplar/driver/backend_config.pb.h"
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_annotations.h"
 #include "tensorflow/compiler/plugin/poplar/driver/hlo_matcher.h"
 #include "tensorflow/compiler/plugin/poplar/driver/matcher_predicates.h"
@@ -53,8 +54,7 @@ HloMatcher::HloMatcher(const std::vector<HloMatcherPattern>& patterns,
 
 // A set of sets of ops which are all associative together
 static std::set<std::set<HloOpcode>> associative_ops_sets = {
-    {HloOpcode::kMultiply},
-    {HloOpcode::kAdd},
+    {HloOpcode::kMultiply}, {HloOpcode::kAdd},
 };
 
 StatusOr<Trace> HloMatcher::FindNextMatchingOp(HloInstruction* user,
@@ -309,7 +309,7 @@ StatusOr<bool> HloMatcher::Run(HloModule* module) {
                                        module->computations().end());
 
     for (auto* comp : comps) {
-      if (!comp->IsFusionComputation() && !IsPopOpsCall(comp)) {
+      if (!comp->IsFusionComputation() && !IsPopOpsFusion(comp)) {
         MatchPatternStart(comp, comp->root_instruction());
       }
     }
@@ -373,12 +373,12 @@ OutlinedInfo HloMatcher::OutlineExpressionFromComputation(
         HloInstruction* old_operand = new_inst->mutable_operand(operand);
         HloInstruction** operand_slot = &(outlined[old_operand]);
         if (*operand_slot == nullptr) {
-          auto op_indecies_it =
+          auto op_indicies_it =
               matched.inst_parameters.find(instruction_to_outline);
-          if (op_indecies_it == matched.inst_parameters.end()) {
+          if (op_indicies_it == matched.inst_parameters.end()) {
             continue;
           }
-          auto parameter_num = op_indecies_it->second[operand];
+          auto parameter_num = op_indicies_it->second[operand];
           if (parameter_num != -1) {
             if (arguments.size() <= parameter_num) {
               arguments.resize(parameter_num + 1);
@@ -420,23 +420,43 @@ OutlinedInfo HloMatcher::OutlineExpressionFromComputation(
   }
 
   // Creates a call to the nested computation.
-  HloComputation* nested_computation =
+  HloComputation* fusion_computation =
       module->AddEmbeddedComputation(builder.Build(FindOrDie(outlined, root)));
 
-  HloInstruction* call = matched.computation->AddInstruction(
-      HloInstruction::CreateCall(root->shape(), arguments, nested_computation));
-
-  auto* old = instructions_to_outline[metadata_index];
-  annotations_.fusion_map[nested_computation] = outlined.at(old);
-
-  call->set_metadata(old->metadata());
-  if (old->has_sharding()) {
-    call->set_sharding(old->sharding());
+  // Ensure that all parameters are a dependency of the root
+  for (auto* param : fusion_computation->parameter_instructions()) {
+    if (param->user_count() == 0) {
+      param->AddControlDependencyTo(fusion_computation->root_instruction());
+    }
   }
 
-  TF_CHECK_OK(root->ReplaceAllUsesWith(call));
+  HloInstruction* fusion =
+      matched.computation->AddInstruction(HloInstruction::CreateFusion(
+          root->shape(), HloInstruction::FusionKind::kCustom, arguments,
+          fusion_computation));
 
-  OutlinedInfo outlined_info = {call, {}};
+  fusion_computation->SetFusionInstruction(fusion);
+
+  auto* old = instructions_to_outline[metadata_index];
+
+  PoplarBackendConfig backend_config;
+  if (old->opcode() == HloOpcode::kConvolution) {
+    auto* cfg = backend_config.mutable_fusion_config();
+    *(cfg->mutable_window()) = old->window();
+    *(cfg->mutable_dimension_numbers()) = old->convolution_dimension_numbers();
+    cfg->set_feature_group_count(old->feature_group_count());
+    cfg->set_batch_group_count(old->batch_group_count());
+  }
+  fusion->set_backend_config(backend_config);
+
+  fusion->set_metadata(old->metadata());
+  if (old->has_sharding()) {
+    fusion->set_sharding(old->sharding());
+  }
+
+  TF_CHECK_OK(root->ReplaceAllUsesWith(fusion));
+
+  OutlinedInfo outlined_info = {fusion, {}};
   // Add the removed instructions
   for (auto inst : instructions_to_outline) {
     if (inst->user_count() == 0) {

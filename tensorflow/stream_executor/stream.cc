@@ -191,8 +191,11 @@ string ToVlogString(dnn::DataType data_type) {
       return "dnn::DataType::kHalf";
     case dnn::DataType::kInt8:
       return "dnn::DataType::kInt8";
+    case dnn::DataType::kInt32:
+      return "dnn::DataType::kInt32";
+    default:
+      return "unknown DataType";
   }
-  return "unknown DataType";
 }
 
 // Used together with PARAM to VLOG calls made to the stream. Intended
@@ -1471,6 +1474,28 @@ Stream &Stream::ThenPoolForward(
     const dnn::BatchDescriptor &output_dimensions,
     DeviceMemory<Eigen::half> *output_data,
     ScratchAllocator *workspace_allocator) {
+  VLOG_CALL(PARAM(pooling_dimensions), PARAM(input_dimensions),
+            PARAM(input_data), PARAM(output_dimensions), PARAM(output_data),
+            PARAM(workspace_allocator));
+
+  if (ok()) {
+    if (dnn::DnnSupport *dnn = parent_->AsDnn()) {
+      CheckError(dnn->DoPoolForward(this, pooling_dimensions, input_dimensions,
+                                    input_data, output_dimensions, output_data,
+                                    workspace_allocator));
+    } else {
+      SetErrorAndLogNoDnnSupport();
+    }
+  }
+  return *this;
+}
+
+Stream &Stream::ThenPoolForward(
+    const dnn::PoolingDescriptor &pooling_dimensions,
+    const dnn::BatchDescriptor &input_dimensions,
+    const DeviceMemory<int8> &input_data,
+    const dnn::BatchDescriptor &output_dimensions,
+    DeviceMemory<int8> *output_data, ScratchAllocator *workspace_allocator) {
   VLOG_CALL(PARAM(pooling_dimensions), PARAM(input_dimensions),
             PARAM(input_data), PARAM(output_dimensions), PARAM(output_data),
             PARAM(workspace_allocator));

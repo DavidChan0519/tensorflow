@@ -21,6 +21,7 @@
 #include <poplar/exceptions.hpp>
 #include <poputil/exceptions.hpp>
 #include "absl/container/inlined_vector.h"
+#include "absl/types/optional.h"
 
 namespace poplar {
 class Graph;
@@ -31,10 +32,16 @@ namespace xla {
 class HloInstruction;
 class HloComputation;
 class Literal;
+class Shape;
 
 namespace poplarplugin {
 
 struct CompilerResources;
+
+enum class NormType {
+  BatchNorm,
+  GroupNorm,
+};
 
 using TensorKey = std::pair<std::string, int64>;
 using TensorMap = std::map<TensorKey, poplar::Tensor>;
@@ -58,13 +65,14 @@ Status SetVertexField(poplar::Graph& graph, const poplar::FieldRef& field,
 
 poplar::Graph& GetGraph(CompilerResources&, const HloInstruction*);
 
+uint64 GetShardingDeviceId(const HloInstruction* inst);
+
 // Convert a poplar/poplibs exception to a Tensorflow error Status
 Status PoplarExceptionToTensorflowStatus(const std::string& prefix,
                                          const std::exception& e);
 
 StatusOr<poplin::ConvParams> GetConvolutionParameters(
-    const HloInstruction* operand_op, const HloInstruction* conv_op,
-    int64 input_index, int64 kernel_index);
+    const HloInstruction* operand_op, int64 input_index, int64 kernel_index);
 
 poplar::Tensor ShuffleConvolutionInputToTensorflow(
     const HloInstruction* inst, const poplar::Tensor& tensor);
@@ -214,15 +222,6 @@ StatusOr<poplar::program::Program> CreateSimpleSelectAndScatter(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output_shape, TensorMap& tensor_map);
 
-StatusOr<poplar::program::Program> CreateSliceUpdateOp(
-    CompilerResources& res, const HloInstruction* inst,
-    const xla::Shape& output_shape, TensorMap& tensor_map);
-
-StatusOr<poplar::program::Program> CreateSliceOp(CompilerResources& res,
-                                                 const HloInstruction* inst,
-                                                 const xla::Shape& output_shape,
-                                                 TensorMap& tensor_map);
-
 StatusOr<poplar::program::Program> CreateDynamicSliceUpdateOp(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output_shape, TensorMap& tensor_map);
@@ -286,11 +285,10 @@ StatusOr<poplar::program::Program> CreatePaddingReduceWindow(
 StatusOr<poplar::program::Program> CreateSort(CompilerResources& res,
                                               const HloInstruction* inst,
                                               TensorMap& tensor_map);
-std::pair<poplar::Tensor, std::vector<std::size_t>>
-ShuffleBatchNormInputToPoplar(const poplar::Tensor& input,
-                              const unsigned feature_dimension);
+std::pair<poplar::Tensor, std::vector<std::size_t>> ShuffleNormInputToPoplar(
+    const poplar::Tensor& input, const unsigned feature_dimension);
 
-poplar::Tensor ShuffleBatchNormOutputToTensorflow(
+poplar::Tensor ShuffleNormOutputToTensorflow(
     const poplar::Tensor& output, const unsigned feature_dimension,
     const std::vector<std::size_t>& non_broadcast_dims);
 
@@ -302,6 +300,30 @@ StatusOr<poplar::program::Program> CreateBatchNormTraining(
 
 StatusOr<poplar::program::Program> CreateBatchNormGrad(
     CompilerResources& res, const HloInstruction* inst, TensorMap& tensor_map);
+
+StatusOr<poplar::program::Program> CreateNormInference(
+    const NormType& norm_type, poplar::Graph& graph, CompilerResources& res,
+    const HloInstruction* inst, const float epsilon,
+    const uint32 feature_dimension, absl::optional<uint32> optional_num_groups,
+    TensorMap& tensor_map);
+
+StatusOr<poplar::program::Program> CreateNormTraining(
+    const NormType& norm_type, poplar::Graph& graph, CompilerResources& res,
+    const HloInstruction* inst, const float epsilon,
+    const uint32 feature_dimension, absl::optional<uint32> optional_num_groups,
+    TensorMap& tensor_map);
+
+StatusOr<poplar::program::Program> CreateNormGrad(
+    const NormType& norm_type, poplar::Graph& graph, CompilerResources& res,
+    const HloInstruction* inst, const float epsilon,
+    const uint32 feature_dimension, absl::optional<uint32> optional_num_groups,
+    TensorMap& tensor_map);
+
+StatusOr<poplar::program::Program> CreateNormStatistics(
+    const NormType& norm_type, poplar::Graph& graph, CompilerResources& res,
+    const HloInstruction* inst, const float epsilon,
+    const uint32 feature_dimension, absl::optional<uint32> optional_num_groups,
+    TensorMap& tensor_map);
 
 /* Optimization tests */
 

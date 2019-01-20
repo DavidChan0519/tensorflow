@@ -1,5 +1,6 @@
 #include "tensorflow/compiler/plugin/poplar/driver/matcher_predicates.h"
 #include "tensorflow/compiler/plugin/poplar/driver/util.h"
+#include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
 
 #include "tensorflow/compiler/xla/service/hlo_pass_interface.h"
 #include "tensorflow/compiler/xla/service/hlo_query.h"
@@ -41,14 +42,6 @@ bool IsConstantHalf(const HloInstruction* inst) {
 
 bool IsConstantOne(const HloInstruction* inst) {
   return IsAllFloatValue(inst, 1.0);
-}
-
-bool IsPoplarConvolution(const HloInstruction* inst) {
-  if (inst->to_apply()->name().substr(0, 17) == "pop_backprop_conv")
-    return true;
-  if (inst->to_apply()->name().substr(0, 15) == "pop_convolution") return true;
-  if (inst->to_apply()->name().substr(0, 14) == "pop_depth_conv") return true;
-  return false;
 }
 
 bool IsExternalPadding(const HloInstruction* inst) {
@@ -114,6 +107,11 @@ bool IsScalar(const HloInstruction* inst) {
 
 bool IsScalarConstant(const HloInstruction* inst) {
   return IsScalar(inst) && inst->IsConstant();
+}
+
+bool IsScalarIntegerConstant(const HloInstruction* inst) {
+  return IsScalar(inst) && inst->IsConstant() &&
+         ShapeUtil::ElementIsIntegral(inst->shape());
 }
 
 bool IsConvFilterTranspose(const HloInstruction* inst) {
@@ -195,14 +193,14 @@ bool IsF16ToF32Convert(const HloInstruction* inst) {
 }
 
 bool IsPopOpsConvolution(const HloInstruction* inst) {
-  if (IsPopOpsCall(inst, "depthwise_conv")) return true;
-  if (IsPopOpsCall(inst, "conv_with_reverse")) return true;
-  if (IsPopOpsCall(inst, "depthwise_filter")) return true;
+  if (IsPopOpsFusion(inst, "depthwise_conv")) return true;
+  if (IsPopOpsFusion(inst, "conv_with_reverse")) return true;
+  if (IsPopOpsFusion(inst, "depthwise_filter")) return true;
   return false;
 }
 
 bool IsPopOpsConvolutionInputGradient(const HloInstruction* inst) {
-  return (IsPopOpsCall(inst, "conv_with_reverse"));
+  return (IsPopOpsFusion(inst, "conv_with_reverse"));
 }
 
 bool IsOpWithWindowNoBaseDilation(const HloInstruction* inst) {
@@ -274,20 +272,25 @@ bool IsBiasAdd(const HloInstruction* inst) {
 }
 
 bool IsPopOpsBiasAdd(const HloInstruction* inst) {
-  return IsPopOpsCall(inst, "matmul_biasadd") ||
-         IsPopOpsCall(inst, "conv_biasadd");
+  return IsPopOpsFusion(inst, "matmul_biasadd") ||
+         IsPopOpsFusion(inst, "conv_biasadd");
 }
 
 bool IsPopOpsElementwise(const HloInstruction* inst) {
-  return IsPopOpsBiasAdd(inst) || IsPopOpsCall(inst, "scaled_inplace") ||
-         inst->IsElementwise();
+  return IsPopOpsBiasAdd(inst) || IsPopOpsFusion(inst, "scaled_inplace") ||
+         inst->IsElementwise() || IsPoplibsCustomOpElementwise(inst);
 }
 
 bool IsPopOpsElementwiseBinary(const HloInstruction* inst) {
   // Scaled inplace is a special case because it has 3 operands but the 3rd one
   // is always constant - we consider it a binary op.
   return (IsPopOpsElementwise(inst) && inst->operand_count() == 2) ||
-         IsPopOpsCall(inst, "scaled_inplace");
+         IsPopOpsFusion(inst, "scaled_inplace");
+}
+
+bool IsNormInferenceOrTraining(const HloInstruction* inst) {
+  return inst->opcode() == HloOpcode::kBatchNormInference ||
+         inst->opcode() == HloOpcode::kBatchNormTraining;
 }
 
 }  // namespace poplarplugin

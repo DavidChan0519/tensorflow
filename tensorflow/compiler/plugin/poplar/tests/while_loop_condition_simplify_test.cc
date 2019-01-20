@@ -26,7 +26,7 @@ namespace {
 using WhileLoopConditionSimplifyTest = HloTestBase;
 
 TEST_F(WhileLoopConditionSimplifyTest, SimplifyDoubleConditionalTie) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape, scalar_shape});
@@ -121,7 +121,7 @@ TEST_F(WhileLoopConditionSimplifyTest, SimplifyDoubleConditionalTie) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, SimplifyDoubleConditionalUneven) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape, scalar_shape});
@@ -202,7 +202,7 @@ TEST_F(WhileLoopConditionSimplifyTest, SimplifyDoubleConditionalUneven) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyNonIntegral) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape, scalar_shape});
@@ -274,7 +274,7 @@ TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyNonIntegral) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyNonUniqueCond) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape});
@@ -333,7 +333,7 @@ TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyNonUniqueCond) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyIncrementNotOne) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape, scalar_shape});
@@ -407,7 +407,7 @@ TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyIncrementNotOne) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyNonConst) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape, scalar_shape});
@@ -479,7 +479,7 @@ TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyNonConst) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, DontSimplifySingleConditional) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape});
@@ -536,7 +536,7 @@ TEST_F(WhileLoopConditionSimplifyTest, DontSimplifySingleConditional) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyTripleConditional) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape =
@@ -624,7 +624,7 @@ TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyTripleConditional) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyAnythingButLTs) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape, scalar_shape});
@@ -696,7 +696,7 @@ TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyAnythingButLTs) {
 }
 
 TEST_F(WhileLoopConditionSimplifyTest, DontSimplifyAnythingButANDs) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
   Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape, scalar_shape});

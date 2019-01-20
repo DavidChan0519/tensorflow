@@ -30,6 +30,7 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/commutative_instruction_reorder_operands.h"
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
 #include "tensorflow/compiler/plugin/poplar/driver/computation_flattener.h"
+#include "tensorflow/compiler/plugin/poplar/driver/constant_slice_folding.h"
 #include "tensorflow/compiler/plugin/poplar/driver/entry_visitor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/executable.h"
 #include "tensorflow/compiler/plugin/poplar/driver/executor.h"
@@ -39,6 +40,9 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/fuse_ops_early.h"
 #include "tensorflow/compiler/plugin/poplar/driver/fuse_ops_late.h"
 #include "tensorflow/compiler/plugin/poplar/driver/fuse_wide_const.h"
+#include "tensorflow/compiler/plugin/poplar/driver/hlo_computation_name_uniquify.h"
+#include "tensorflow/compiler/plugin/poplar/driver/not_supported_gather_expander.h"
+#include "tensorflow/compiler/plugin/poplar/driver/not_supported_scatter_expander.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/platform_id.h"
 #include "tensorflow/compiler/plugin/poplar/driver/scheduler.h"
@@ -52,17 +56,18 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/algebraic_simplifier.h"
 #include "tensorflow/compiler/xla/service/computation_placer.h"
 #include "tensorflow/compiler/xla/service/dot_decomposer.h"
-#include "tensorflow/compiler/xla/service/gather_expander.h"
+#include "tensorflow/compiler/xla/service/dynamic_index_splitter.h"
 #include "tensorflow/compiler/xla/service/hlo_constant_folding.h"
 #include "tensorflow/compiler/xla/service/hlo_cse.h"
 #include "tensorflow/compiler/xla/service/hlo_dce.h"
+#include "tensorflow/compiler/xla/service/hlo_get_dimension_size_rewriter.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_fix.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_pipeline.h"
 #include "tensorflow/compiler/xla/service/hlo_subcomputation_unification.h"
 #include "tensorflow/compiler/xla/service/hlo_tfgraph_builder.h"
 #include "tensorflow/compiler/xla/service/map_inliner.h"
 #include "tensorflow/compiler/xla/service/reshape_mover.h"
-#include "tensorflow/compiler/xla/service/scatter_expander.h"
+#include "tensorflow/compiler/xla/service/sort_simplifier.h"
 #include "tensorflow/compiler/xla/service/tuple_simplifier.h"
 #include "tensorflow/compiler/xla/service/while_loop_constant_sinking.h"
 #include "tensorflow/compiler/xla/service/zero_sized_hlo_elimination.h"
@@ -226,10 +231,11 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   std::unique_ptr<HloProfileIndexMap> profile_index_map;
   std::unique_ptr<HloProfilePrinterData> profile_printer;
   if (module->config().hlo_profiling_enabled()) {
+    const auto& name = module->entry_computation()->name();
     HloCostAnalysis cost_analysis(ShapeSizeBytesFunction());
     profile_index_map = absl::make_unique<HloProfileIndexMap>(*module);
     profile_printer =
-        CreateHloProfilePrinterData(*profile_index_map, cost_analysis);
+        CreateHloProfilePrinterData(*profile_index_map, cost_analysis, name);
   }
 
   std::string filename;
@@ -285,18 +291,29 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   }
 
   {
+    AlgebraicSimplifierOptions simplifier_opts(
+        [](const Shape&, const Shape&) { return false; });
+    simplifier_opts.set_is_layout_sensitive(false);
+    simplifier_opts.set_enable_conv_simplification(false);
+    simplifier_opts.set_enable_dot_strength_reduction(false);
+    simplifier_opts.set_enable_permutation_sort_replacement(false);
+    simplifier_opts.set_enable_window_reduce_to_reduce_replacement(false);
+
     HloPassPipeline pipeline("IPU");
-    pipeline.AddPass<GatherExpander>();
-    pipeline.AddPass<ScatterExpander>();
+    pipeline.AddPass<HloGetDimensionSizeRewriter>();
+    pipeline.AddPass<HloComputationNameUniquify>();
+    pipeline.AddPass<NotSupportedGatherExpander>();
+    pipeline.AddPass<NotSupportedScatterExpander>();
+    pipeline.AddPass<DynamicIndexSplitter>();
     pipeline.AddPass<DotDecomposer>();
+    pipeline.AddPass<HloPassFix<ConstantSliceFolding>>();
     pipeline.AddPass<HloPassFix<FuseOpsEarly>>(resources.annotations);
     pipeline.AddPass<HloCSE>(false);
-    pipeline.AddPass<HloPassFix<AlgebraicSimplifier>>(
-        false, [](const Shape&, const Shape&) { return false; }, false, false);
+    pipeline.AddPass<HloPassFix<AlgebraicSimplifier>>(simplifier_opts);
+    pipeline.AddPass<SortSimplifier>();
     pipeline.AddPass<ReshapeMover>();
     pipeline.AddPass<MapInliner>();
-    pipeline.AddPass<HloPassFix<AlgebraicSimplifier>>(
-        false, [](const Shape&, const Shape&) { return false; }, false, false);
+    pipeline.AddPass<HloPassFix<AlgebraicSimplifier>>(simplifier_opts);
     pipeline.AddPass<ZeroSizedHloElimination>();
     pipeline.AddPass<ComputationFlattener>();
     pipeline.AddPass<TupleSimplifier>(true);
@@ -313,9 +330,8 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       pass.AddPass<HloCSE>(true);
       pass.AddPass<HloDCE>();
       pass.AddPass<WhileLoopConstantSinking>();
-      pass.AddPass<HloPassFix<AlgebraicSimplifier>>(
-          false, [](const Shape&, const Shape&) { return false; }, false,
-          false);
+      pass.AddPass<HloPassFix<AlgebraicSimplifier>>(simplifier_opts);
+      pass.AddPass<SortSimplifier>();
       pass.AddPass<HloPassFix<FuseMaxPool>>(resources.annotations);
       pass.AddPass<HloPassFix<FuseOpsLate>>(resources.annotations);
       pass.AddPass<FuseWideConst>(resources.annotations);
@@ -340,7 +356,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
   HloComputation* entry = module->entry_computation();
 
-  if (poplarExecutor->CompilerReportingEnabled()) {
+  if (poplarExecutor->IpuTraceEventsEnabled()) {
     poplarExecutor->AddCompileBeginEventRecord(
         module->name(), SerializeComputationToGraphDef(*entry));
   }
@@ -423,10 +439,10 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     }
   }
 
-  if (poplarExecutor->CompilerReportingEnabled()) {
+  if (poplarExecutor->IpuTraceEventsEnabled()) {
     std::stringstream stream;
 
-    if (engine != nullptr) {
+    if (poplarExecutor->CompilerReportingEnabled() && engine != nullptr) {
       try {
         auto& opts = poplarExecutor->GetReportFlags();
 
@@ -453,7 +469,8 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       std::move(profile_index_map), std::move(engine),
       std::move(resources.annotations.input_output_aliasing_map),
       is_constant_graph, std::move(constant_output), is_remap_graph,
-      std::move(remaped_output));
+      std::move(remaped_output),
+      std::move(resources.annotations.infeed_instructions));
   executable.reset(poplar_executable);
 
   if (poplarExecutor->HaveExecutableCache()) {
@@ -467,7 +484,8 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 }
 
 Status PoplarCompiler::RunHloPassesOnModuleGroup(
-    HloModuleGroup* module_group, se::StreamExecutor* executor,
+    HloModuleGroup* module_group,
+    absl::Span<se::StreamExecutor* const> executors,
     DeviceMemoryAllocator* device_allocator) {
   return xla::InvalidArgument("Module groups not supported on Poplar");
 }

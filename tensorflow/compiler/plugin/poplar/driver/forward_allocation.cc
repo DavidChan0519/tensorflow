@@ -67,32 +67,58 @@ static bool is_independent(const HloInstruction* inst,
   return true;
 }
 
-// The difference between reduce_to_one and reduce_to_one_with_no_dependencies
-// is that the latter also tries to remove any results of reduction that are
-// dependent on other reduced elements.
+// Returns a vector of independent instructions which we want to use as a
+// target. Note that the order of the targets is in decreasing priority order,
+// where we want to target bias adds first, then layer norms and then
+// elementwise ops.
 template <typename Predicate>
-static absl::optional<HloInstruction*> reduce_to_one_with_no_dependencies(
+static absl::optional<std::vector<HloInstruction*>> find_all_targets(
     const absl::flat_hash_set<HloInstruction*>& values,
     const HloReachabilityMap* reachability_map, Predicate pred) {
-  auto result = reduce(values, pred);
+  auto insts = reduce(values, pred);
   absl::flat_hash_set<HloInstruction*> has_dependency;
   // Check whether this_inst depends on any other instruction from reduction.
-  for (auto this_inst : result) {
-    if (!is_independent(this_inst, result, reachability_map)) {
+  for (auto this_inst : insts) {
+    if (!is_independent(this_inst, insts, reachability_map)) {
       has_dependency.insert(this_inst);
     }
   }
-  // Get the result instructions which have no dependencies.
-  // TODO consider whether it is worth extending this so that if we have few
-  // targets with no dependency between we still allocate it with some layout
-  // and add a control dependency.
-  absl::flat_hash_set<HloInstruction*> result_no_deps;
-  absl::c_set_difference(
-      result, has_dependency,
-      std::inserter(result_no_deps, std::begin(result_no_deps)));
-  return result_no_deps.size() == 1
-             ? absl::optional<HloInstruction*>(*std::begin(result_no_deps))
-             : absl::nullopt;
+  // Get the insts instructions which have no dependencies.
+  for (auto dep : has_dependency) {
+    insts.erase(dep);
+  }
+  // There are no valid targets.
+  if (insts.size() == 0) {
+    return absl::nullopt;
+  }
+
+  auto biases =
+      reduce(insts, [](HloInstruction* inst) { return IsPopOpsBiasAdd(inst); });
+  auto norms = reduce(insts, [](HloInstruction* inst) {
+    return IsNormInferenceOrTraining(inst);
+  });
+
+  // Add the instructions in order.
+  std::vector<HloInstruction*> result;
+  result.insert(std::end(result), std::begin(biases), std::end(biases));
+  result.insert(std::end(result), std::begin(norms), std::end(norms));
+  for (auto inst : insts) {
+    if (biases.count(inst) == 0 && norms.count(inst) == 0) {
+      result.push_back(inst);
+    }
+  }
+
+  return result;
+}
+
+static bool output_and_all_operands_same_type(const HloInstruction* inst) {
+  const PrimitiveType& type = inst->shape().element_type();
+  for (auto* operand : inst->operands()) {
+    if (type != operand->shape().element_type()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // TODO - fix this.  it needs to take into account the indices of the path
@@ -102,12 +128,12 @@ static bool IsPrefixPathOk(const std::vector<HloInstruction*>& path) {
                                      const unsigned) {
     // Element-wise ops are ok.
     if (IsPopOpsElementwise(inst)) {
-      return true;
+      return output_and_all_operands_same_type(inst);
     }
     switch (inst->opcode()) {
       case HloOpcode::kReshape:
       case HloOpcode::kTranspose:
-        return true;
+        return output_and_all_operands_same_type(inst);
       default:
         break;
     }
@@ -122,12 +148,11 @@ static bool IsPrefixPathOk(const std::vector<HloInstruction*>& path) {
 // For valid paths, either returns the GTE index for the last node or 0.
 static absl::optional<int64> IsSuffixPathOk(
     const std::vector<HloInstruction*>& path) {
-  const auto is_node_ok_on_path = [](HloInstruction* inst,
-                                     const unsigned path_idx,
-                                     const unsigned path_size) {
+  const auto is_node_ok_on_path = [](
+      HloInstruction* inst, const unsigned path_idx, const unsigned path_size) {
     // Element-wise ops are ok.
     if (IsPopOpsElementwise(inst)) {
-      return true;
+      return output_and_all_operands_same_type(inst);
     }
     switch (inst->opcode()) {
       case HloOpcode::kGetTupleElement:
@@ -135,7 +160,7 @@ static absl::optional<int64> IsSuffixPathOk(
         return path_idx == (path_size - 1);
       case HloOpcode::kReshape:
       case HloOpcode::kTranspose:
-        return true;
+        return output_and_all_operands_same_type(inst);
       default:
         break;
     }
@@ -158,6 +183,22 @@ static bool IsLayoutSensitiveTarget(const HloInstruction* target) {
     case HloOpcode::kBatchNormInference:
     case HloOpcode::kBatchNormTraining:
       return true;
+    case HloOpcode::kCustomCall: {
+      if (IsPoplibsCustomOp(target)) {
+        auto attribute_map = IPUCustomKernelsUtil::AttributeMap(target);
+        auto statusor =
+            attribute_map.GetAttributeFlatHashMap("layout_dependencies");
+        if (!statusor.ok()) {
+          LOG(FATAL) << "Custom Poplibs op " << target->ToString()
+                     << " is missing \'layout_dependencies\' field.";
+        }
+
+        absl::flat_hash_map<int64, int64> layout_dependencies =
+            statusor.ValueOrDie();
+        return layout_dependencies.size();
+      }
+      break;
+    }
     default:
       break;
   }
@@ -166,7 +207,8 @@ static bool IsLayoutSensitiveTarget(const HloInstruction* target) {
 
 // TODO - this should probably be in a more central location
 static absl::optional<int64> IsLayoutSensitiveOperand(
-    const HloInstruction* target, const HloInstruction* operand) {
+    const HloInstruction* target, const HloInstruction* operand,
+    const HloInstruction* layout_producer) {
   const auto op_idx = target->operand_index(operand);
   if (IsPopOpsElementwiseBinary(target)) {
     return op_idx;
@@ -174,11 +216,35 @@ static absl::optional<int64> IsLayoutSensitiveOperand(
   switch (target->opcode()) {
     case HloOpcode::kBatchNormInference:
     case HloOpcode::kBatchNormTraining:
-      // Only a layout sensitive target on operands index 1 and 2.
-      if (op_idx == 1 || op_idx == 2) {
+      // Only a layout sensitive target on operands index 1 and 2 iff
+      // layout_producer is operand 0.
+      if (target->operand(0) == layout_producer &&
+          (op_idx == 1 || op_idx == 2)) {
         return op_idx;
       }
       return absl::nullopt;
+    case HloOpcode::kCustomCall: {
+      if (IsPoplibsCustomOp(target)) {
+        auto attribute_map = IPUCustomKernelsUtil::AttributeMap(target);
+        auto statusor =
+            attribute_map.GetAttributeFlatHashMap("layout_dependencies");
+        if (!statusor.ok()) {
+          LOG(FATAL) << "Custom Poplibs op " << target->ToString()
+                     << " is missing \'layout_dependencies\' field.";
+        }
+        // A Poplibs Custom op is layout sensative if the layout_producer is at
+        // the right index.
+        absl::flat_hash_map<int64, int64> layout_dependencies =
+            statusor.ValueOrDie();
+        auto itr = layout_dependencies.find(op_idx);
+        if (itr != layout_dependencies.end() &&
+            target->operand(itr->second) == layout_producer) {
+          return op_idx;
+        }
+        return absl::nullopt;
+      }
+      break;
+    }
     default:
       break;
   }
@@ -187,7 +253,7 @@ static absl::optional<int64> IsLayoutSensitiveOperand(
 
 StatusOr<bool> ForwardAllocation::Run(
     HloComputation* comp, std::set<const HloInstruction*>& ops_with_layout) {
-  bool found_targets = false;
+  bool found_target = false;
   const auto is_param_no_layout_pred = [this](HloInstruction* inst) {
     return inst->opcode() == HloOpcode::kParameter &&
            tensor_allocation_map.find(std::make_pair(inst, 0)) ==
@@ -207,7 +273,7 @@ StatusOr<bool> ForwardAllocation::Run(
   const auto layout_producing_ops = g.FindVertices(is_layout_producer);
 
   std::unique_ptr<HloReachabilityMap> reachability_map =
-      comp->ComputeReachability();
+      HloReachabilityMap::Build(comp);
 
   // Get everything that depends upon an op with a special layout
   const auto get_consumers = [is_layout_producer, &g](HloInstruction* inst) {
@@ -239,28 +305,32 @@ StatusOr<bool> ForwardAllocation::Run(
 
   for (const auto& edges : source_consumers) {
     const auto& source = edges.first;
-
     if (!edges.second.empty()) {
       // Target is the op consuming the allocated tensor which is layout
       // sensitive.
       const auto is_valid_target = [&](HloInstruction* a) {
         return alloc_dependencies.contains(a) && IsLayoutSensitiveTarget(a);
       };
-
-      const auto optional_target = reduce_to_one_with_no_dependencies(
+      const auto optional_targets = find_all_targets(
           edges.second, reachability_map.get(), is_valid_target);
-      if (!optional_target) {
+      if (!optional_targets) {
         continue;
       }
-      auto* target = *optional_target;
-      const auto& itr = alloc_dependencies.find(target);
-      if (itr != alloc_dependencies.end() && !itr->second.empty()) {
+      std::vector<HloInstruction*> targets = *optional_targets;
+      for (HloInstruction* target : targets) {
+        // Find layout producers for the target.
         // layout_producer is the op which produces the tensor whose layout is
         // important - it cannot have any allocation dependencies.
-        // TODO we only allow a single layout producer at the moment.
+        const auto& itr = alloc_dependencies.find(target);
+        // Skip if the target has not allocation dependencies or if the target
+        // has no layout producer.
+        if (itr == alloc_dependencies.end() || itr->second.empty()) {
+          continue;
+        }
         const auto is_not_alloc_dependency = [&](HloInstruction* a) {
           return !alloc_dependencies.contains(a);
         };
+        // TODO we only allow a single layout producer at the moment.
         const auto optional_layout_producer =
             reduce_to_one(itr->second, is_not_alloc_dependency);
         if (!optional_layout_producer) {
@@ -271,8 +341,8 @@ StatusOr<bool> ForwardAllocation::Run(
         auto prefix = g.ShortestPath(source, target);
         auto suffix = g.ShortestPath(layout_producer, target);
         // Only some operands are layout sensitive.
-        auto optional_op_idx =
-            IsLayoutSensitiveOperand(target, prefix.rbegin()[1]);
+        auto optional_op_idx = IsLayoutSensitiveOperand(
+            target, prefix.rbegin()[1], layout_producer);
         if (optional_op_idx) {
           const auto op_idx = *optional_op_idx;
           // The paths don't contain the source or target instructions
@@ -290,22 +360,57 @@ StatusOr<bool> ForwardAllocation::Run(
                                                          suffix.end());
               std::vector<const HloInstruction*> cprefix(prefix.begin(),
                                                          prefix.end());
+
+              // Make sure that the layout producer can be executed before the
+              // source - i.e. source is not reachable form the layout producer.
+              if (reachability_map->IsReachable(source, layout_producer)) {
+                continue;
+              }
+              layout_producer->AddControlDependencyTo(source);
+              reachability_map->UpdateReachabilityThroughInstruction(source);
+
+              // Make sure that the target can be executed before all the other
+              // independent targets with the new control dependency.
+              // Keep track of any dependencies we add in case we have to undo
+              // them.
+              std::vector<HloInstruction*> added_dependants;
+              bool dependencies_ok = true;
+              for (auto new_dependent : targets) {
+                if (new_dependent == target) {
+                  continue;
+                }
+                if (!reachability_map->IsReachable(target, new_dependent)) {
+                  target->AddControlDependencyTo(new_dependent);
+                  reachability_map->UpdateReachabilityThroughInstruction(
+                      new_dependent);
+                  added_dependants.push_back(target);
+                } else {
+                  dependencies_ok = false;
+                  break;
+                }
+              }
+              if (!dependencies_ok) {
+                // Remove all the added dependencies
+                layout_producer->RemoveControlDependencyTo(source);
+                reachability_map->UpdateReachabilityThroughInstruction(source);
+                for (auto inst : added_dependants) {
+                  target->RemoveControlDependencyTo(inst);
+                  reachability_map->UpdateReachabilityThroughInstruction(inst);
+                }
+                continue;
+              }
               tensor_allocation_map[src] =
                   TensorTarget(target, op_idx, layout_producer,
                                layout_output_idx, csuffix, cprefix);
-              // Make sure the layout_producer is executed before the source
-              // instruction.
-              layout_producer->AddControlDependencyTo(source);
-              comp->UpdateReachabilityThroughInstruction(
-                  source, reachability_map.get());
-              found_targets = true;
+              found_target = true;
+              break;
             }
           }
         }
       }
     }
   }
-  return found_targets;
+  return found_target;
 }
 
 ForwardAllocation::ForwardAllocation(CompilerAnnotations& annotations)
@@ -313,7 +418,7 @@ ForwardAllocation::ForwardAllocation(CompilerAnnotations& annotations)
       tensor_allocation_map(annotations.tensor_allocation_map) {}
 
 StatusOr<bool> ForwardAllocation::Run(HloModule* module) {
-  bool found_targets = false;
+  bool found_target = false;
 
   // An op with a layout is an op that has been identified by the Allocation
   // Finder to have a layout, a Tensor allocation target or any op that is in
@@ -328,15 +433,15 @@ StatusOr<bool> ForwardAllocation::Run(HloModule* module) {
   }
 
   for (const auto& computation : module->computations()) {
-    if (IsPopOpsCall(computation) || IsRepeatCall(computation)) {
+    if (IsPopOpsFusion(computation) || IsRepeatCall(computation)) {
       continue;
     }
-    TF_ASSIGN_OR_RETURN(bool found_targets_in_computation,
+    TF_ASSIGN_OR_RETURN(bool found_target_in_computation,
                         Run(computation, ops_with_layout));
-    found_targets |= found_targets_in_computation;
+    found_target |= found_target_in_computation;
   }
 
-  return found_targets;
+  return found_target;
 }
 
 }  // namespace poplarplugin

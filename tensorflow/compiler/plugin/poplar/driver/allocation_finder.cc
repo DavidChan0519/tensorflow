@@ -89,8 +89,8 @@ class FindAllocatingInstructions : public DfsHloVisitorWithDefault {
     return Status::OK();
   }
 
-  Status HandleCall(HloInstruction* inst) override {
-    if (IsPopOpsCall(inst, "wide_const")) {
+  Status HandleFusion(HloInstruction* inst) override {
+    if (IsPopOpsFusion(inst, "wide_const")) {
       allocating_instructions.push_back(std::make_pair(inst, 0));
     }
     return Status::OK();
@@ -163,18 +163,7 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
         }
         case HloOpcode::kCall: {
           HloComputation* comp = user->to_apply();
-          if (IsPopOpsCall(comp)) {
-            auto end = comp->name().find('.');
-            std::string name = comp->name().substr(8, end - 8);
-            if (name == "depthwise_conv") {
-              auto t = TensorTarget(user, op_index, path);
-              auto i = tensor_allocation_map.find(src);
-              if (i != tensor_allocation_map.end()) {
-                tensor_allocation_map.erase(src);
-              }
-              tensor_allocation_map.insert(std::make_pair(src, t));
-            }
-          } else if (IsRepeatCall(comp)) {
+          if (IsRepeatCall(comp)) {
             if (op_index == 1) {
               HloComputation* comp = GetRepeatBody(user);
               HloInstruction* param = comp->parameter_instruction(0);
@@ -186,14 +175,30 @@ void AllocationFinder::FindConsumers(const TensorSource& src,
           }
           break;
         }
+        case HloOpcode::kFusion: {
+          HloComputation* comp = user->fused_instructions_computation();
+          if (IsPopOpsFusion(comp)) {
+            auto end = comp->name().find('.');
+            std::string name = comp->name().substr(8, end - 8);
+            if (name == "depthwise_conv") {
+              auto t = TensorTarget(user, op_index, path);
+              auto i = tensor_allocation_map.find(src);
+              if (i != tensor_allocation_map.end()) {
+                tensor_allocation_map.erase(src);
+              }
+              tensor_allocation_map.insert(std::make_pair(src, t));
+            }
+          }
+          break;
+        }
         case HloOpcode::kCustomCall: {
-          if (IPUCustomKernelsUtil::IsPoplibsOp(user)) {
+          if (IsPoplibsCustomOp(user)) {
             // Each custom Poplibs ops is required to have an
             // `allocating_indexes` attribute which tells us which operands are
             // allocating.
             auto attribute_map = IPUCustomKernelsUtil::AttributeMap(user);
-            auto statusor = attribute_map.GetAttributeAsInt64FlatHashSet(
-                "allocating_indexes");
+            auto statusor =
+                attribute_map.GetAttributeFlatHashSet("allocating_indexes");
             if (!statusor.ok()) {
               LOG(FATAL) << "Custom Poplibs op " << user->ToString()
                          << " is missing \'allocating_indexes\' field.";

@@ -35,7 +35,7 @@ TEST_F(FuseWideConstTest, ReplaceWithWideConstant) {
 
   auto computation = builder.Build();
 
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
   hlo_module->AddEntryComputation(std::move(computation));
 
   EXPECT_THAT(hlo_module->computation_count(), 1);
@@ -47,8 +47,9 @@ TEST_F(FuseWideConstTest, ReplaceWithWideConstant) {
   EXPECT_THAT(hlo_module->entry_computation()->instruction_count(), 1);
 
   HloInstruction* inst = hlo_module->entry_computation()->root_instruction();
-  EXPECT_THAT(inst->opcode(), HloOpcode::kCall);
-  EXPECT_THAT(inst->to_apply()->name(), "_pop_op_wide_const");
+  EXPECT_THAT(inst->opcode(), HloOpcode::kFusion);
+  EXPECT_THAT(inst->fused_instructions_computation()->name(),
+              "_pop_op_wide_const");
   EXPECT_TRUE(ShapeUtil::Equal(inst->shape(), vector));
   EXPECT_THAT(inst->operand_count(), 0);
 }

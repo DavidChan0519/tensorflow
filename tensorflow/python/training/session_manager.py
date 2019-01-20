@@ -46,7 +46,7 @@ def _maybe_name(obj):
     return "<no name for %s>" % type(obj)
 
 
-@tf_export("train.SessionManager")
+@tf_export(v1=["train.SessionManager"])
 class SessionManager(object):
   """Training helper that restores from checkpoint and creates session.
 
@@ -189,7 +189,6 @@ class SessionManager(object):
     )
     if initialize_ops:
       sess.run(initialize_ops)
-
     if checkpoint_dir and checkpoint_filename_with_path:
       raise ValueError("Can not provide both checkpoint_dir and "
                        "checkpoint_filename_with_path.")

@@ -305,18 +305,22 @@ class VirtualScheduler {
     return &node_map_;
   }
 
+  void enable_mem_usage_tracking() { track_mem_usage_snapshot_ = true; }
+
  private:
   // Constants.
   const string kAttrInputSrc = "input_source_";
-  const string kAttrSrcDevice = "src_device_";
-  const string kAttrDstDevice = "dst_device_";
+  const string kAttrSrcDevice = "send_device";
+  const string kAttrDstDevice = "recv_device";
+  const string kAttrTensorName = "tensor_name";
   const string kChannelDevice = "Channel";
 
   // Methods called from Init(). Fails if initialize_ is set.
   void MaybeUpdateInputOutput(const NodeDef* node);
   NodeState& GetNodeStateOrCreateIt(const NodeDef* node);
   std::pair<const NodeDef*, const NodeDef*> CreateSendRecv(
-      const NodeDef* from, const NodeDef* to, const string& input_name);
+      const NodeDef* from, const NodeDef* to, const NodeDef* input_node,
+      const string& input_name);
   string DeviceName(const NodeDef* node) const;
   string SanitizedDeviceName(const NodeDef* node) const;
   string ChannelDeviceName(const NodeDef* from, const NodeDef* to) const;
@@ -354,6 +358,7 @@ class VirtualScheduler {
   const GrapplerItem* grappler_item_;  // Not owned.
   bool use_static_shapes_;
   bool initialized_;
+  bool track_mem_usage_snapshot_;
 
   VirtualPlacer placer_;  // owned.
 };

@@ -169,8 +169,7 @@ ENTRY c1 {
   Scheduler scheduler;
   EXPECT_TRUE(scheduler.Run(module0).ValueOrDie());
 
-  std::vector<const HloInstruction*> instruction_order =
-      module0->schedule().sequence(entry).instructions();
+  auto instruction_order = module0->schedule().sequence(entry).instructions();
 
   EXPECT_THAT(instruction_order.size(), 10);
 
@@ -237,8 +236,7 @@ TEST_F(HloInplaceDependencyTest, MultipleUpdateInPlacePeers) {
   Scheduler scheduler;
   EXPECT_TRUE(scheduler.Run(module0).ValueOrDie());
 
-  std::vector<const HloInstruction*> instruction_order =
-      module0->schedule().sequence(entry).instructions();
+  auto instruction_order = module0->schedule().sequence(entry).instructions();
   EXPECT_THAT(instruction_order.size(), 5);
 
   std::map<std::string, unsigned int> order;
@@ -293,8 +291,7 @@ TEST_F(HloInplaceDependencyTest, MultipleInplaceWithInterdependency) {
   Scheduler scheduler;
   EXPECT_TRUE(scheduler.Run(module0).ValueOrDie());
 
-  std::vector<const HloInstruction*> instruction_order =
-      module0->schedule().sequence(entry).instructions();
+  auto instruction_order = module0->schedule().sequence(entry).instructions();
 
   EXPECT_THAT(instruction_order.size(), 5);
 
@@ -351,8 +348,7 @@ TEST_F(HloInplaceDependencyTest, MultipleInplaceWithRightOrder) {
   Scheduler scheduler;
   EXPECT_TRUE(scheduler.Run(module0).ValueOrDie());
 
-  std::vector<const HloInstruction*> instruction_order =
-      module0->schedule().sequence(entry).instructions();
+  auto instruction_order = module0->schedule().sequence(entry).instructions();
 
   EXPECT_THAT(instruction_order.size(), 6);
 
@@ -405,8 +401,7 @@ TEST_F(HloInplaceDependencyTest, InplaceCorrectDependencies) {
   Scheduler scheduler;
   EXPECT_TRUE(scheduler.Run(module0).ValueOrDie());
 
-  std::vector<const HloInstruction*> instruction_order =
-      module0->schedule().sequence(entry).instructions();
+  auto instruction_order = module0->schedule().sequence(entry).instructions();
 
   EXPECT_THAT(instruction_order.size(), 5);
 
@@ -521,8 +516,8 @@ ENTRY c1 {
 
   EXPECT_TRUE(module0->entry_computation()->root_instruction() ==
               *inplace_instructions.begin());
-  EXPECT_TRUE(IsPopOpsCall(module0->entry_computation()->root_instruction(),
-                           "scaled_inplace"));
+  EXPECT_TRUE(IsPopOpsFusion(module0->entry_computation()->root_instruction(),
+                             "scaled_inplace"));
 }
 
 TEST_F(HloInplaceDependencyTest, InplaceInsideWhile) {
@@ -580,7 +575,7 @@ ENTRY c1 {
   p0 = s32[20] parameter(0)
   p1 = s32[20] parameter(1)
 
-  c = s32[20] custom-call(p0, p1), custom_call_target="popnn::_", opaque="{\"allocating_indexes\":\"\",\"num_inplace_operands\":1}\n"
+  c = s32[20] custom-call(p0, p1), custom_call_target="Popops::Sqrt", opaque="{\"allocating_indexes\":[],\"layout_dependencies\":{\"keys\":[],\"values\":[]},\"num_inplace_operands\":1}\n"
 
   ROOT t = (s32[20]) tuple(c)
 }
@@ -617,7 +612,7 @@ ENTRY c1 {
   p0 = s32[20] parameter(0)
   p1 = s32[20] parameter(1)
 
-  c = s32[20] custom-call(p0, p1), custom_call_target="popnn::_", opaque="{\"allocating_indexes\":\"\",\"num_inplace_operands\":0}\n"
+  c = s32[20] custom-call(p0, p1), custom_call_target="Popnn::LstmLayerFwd", opaque="{\"allocating_indexes\":[],\"layout_dependencies\":{\"keys\":[],\"values\":[]},\"num_inplace_operands\":0}\n"
 
   ROOT t = (s32[20]) tuple(c)
 }
@@ -689,7 +684,7 @@ HloModule top
 ENTRY c1 {
   p0 = (s32[20], s32[20], s32[20], s32[20]) parameter(0)
   p0_0 = s32[20] get-tuple-element(p0), index=0
-  c = s32[20] custom-call(p0), custom_call_target="popnn::_", opaque="{\"allocating_indexes\":\"\",\"num_inplace_operands\":0}\n"
+  c = s32[20] custom-call(p0), custom_call_target="Popnn::LstmLayerFwd", opaque="{\"allocating_indexes\":[],\"layout_dependencies\":{\"keys\":[],\"values\":[]},\"num_inplace_operands\":0}\n"
 
   ROOT a = s32[20] add(p0_0, c)
 }

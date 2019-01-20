@@ -190,7 +190,7 @@ def _get_win_cuda_defines(repository_ctx):
       get_env_var(repository_ctx, "TMP", "C:\\Windows\\Temp").replace(
           "\\", "\\\\"),)
 
-  msvc_cl_path = "windows/msvc_wrapper_for_nvcc.bat"
+  msvc_cl_path = _get_python_bin(repository_ctx)
   msvc_ml_path = find_msvc_tool(repository_ctx, vc_path, "ml64.exe").replace(
       "\\", "/")
   msvc_link_path = find_msvc_tool(repository_ctx, vc_path, "link.exe").replace(
@@ -400,7 +400,7 @@ def _cuda_include_path(repository_ctx, cuda_config):
   return "\n".join(inc_entries)
 
 
-def _enable_cuda(repository_ctx):
+def enable_cuda(repository_ctx):
   if "TF_NEED_CUDA" in repository_ctx.os.environ:
     enable_cuda = repository_ctx.os.environ["TF_NEED_CUDA"].strip()
     return enable_cuda == "1"
@@ -1418,6 +1418,7 @@ def _create_local_cuda_repository(repository_ctx):
         flag: "-Wno-invalid-partial-specialization"
     """
     cuda_defines["%{host_compiler_includes}"] = host_compiler_includes
+    cuda_defines["%{extra_no_canonical_prefixes_flags}"] = ""
     _tpl(repository_ctx, "crosstool:BUILD", {
         "%{linker_files}": ":empty",
         "%{win_linker_files}": ":empty"
@@ -1425,7 +1426,6 @@ def _create_local_cuda_repository(repository_ctx):
     repository_ctx.file(
         "crosstool/clang/bin/crosstool_wrapper_driver_is_not_gcc", "")
     repository_ctx.file("crosstool/windows/msvc_wrapper_for_nvcc.py", "")
-    repository_ctx.file("crosstool/windows/msvc_wrapper_for_nvcc.bat", "")
   else:
     cuda_defines[
         "%{host_compiler_path}"] = "clang/bin/crosstool_wrapper_driver_is_not_gcc"
@@ -1439,6 +1439,14 @@ def _create_local_cuda_repository(repository_ctx):
             repository_ctx, cuda_config) +
         "\n  cxx_builtin_include_directory: \"%s\"" % cupti_header_dir +
         "\n  cxx_builtin_include_directory: \"%s\"" % cudnn_header_dir)
+
+    # For gcc, do not canonicalize system header paths; some versions of gcc
+    # pick the shortest possible path for system includes when creating the
+    # .d file - given that includes that are prefixed with "../" multiple
+    # time quickly grow longer than the root of the tree, this can lead to
+    # bazel's header check failing.
+    cuda_defines["%{extra_no_canonical_prefixes_flags}"] = (
+        "flag: \"-fno-canonical-system-headers\"")
     nvcc_path = str(
         repository_ctx.path("%s/bin/nvcc%s" % (
             cuda_config.cuda_toolkit_path,
@@ -1476,13 +1484,6 @@ def _create_local_cuda_repository(repository_ctx):
         repository_ctx,
         "crosstool:windows/msvc_wrapper_for_nvcc.py",
         wrapper_defines,
-    )
-    _tpl(
-        repository_ctx,
-        "crosstool:windows/msvc_wrapper_for_nvcc.bat",
-        {
-            "%{python_binary}": _get_python_bin(repository_ctx),
-        },
     )
 
   _tpl(
@@ -1544,7 +1545,7 @@ def _create_remote_cuda_repository(repository_ctx, remote_config_repo):
 
 def _cuda_autoconf_impl(repository_ctx):
   """Implementation of the cuda_autoconf repository rule."""
-  if not _enable_cuda(repository_ctx):
+  if not enable_cuda(repository_ctx):
     _create_dummy_repository(repository_ctx)
   elif _TF_CUDA_CONFIG_REPO in repository_ctx.os.environ:
     _create_remote_cuda_repository(

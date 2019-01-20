@@ -71,6 +71,24 @@ static const std::vector<HloMatcherPattern> patterns = {
     })
   ),
 
+  // Remove convert to/from F32 before/after average pool
+  HloMatcherPattern(
+      PatternType("reduction_no_convert_with_divide"),
+      PatternMetaTarget(4),
+      PatternInputs({7}),
+      PatternOutputs({0}),
+      Pattern({
+          {HloOpcode::kConvert, NodeOperands({1}), IsF32ToF16Convert},
+          {HloOpcode::kDivide, NodeOperands({4, 2}), IsF32},
+          {HloOpcode::kBroadcast, NodeOperands({3}), IsF32},
+          {HloOpcode::kConstant, NodeOperands({}), IsF32},
+          {HloOpcode::kReduce, NodeOperands({5, 6}), IsF32},
+          {HloOpcode::kConvert, NodeOperands({7}), IsF16ToF32Convert},
+          {HloOpcode::kConstant, NodeOperands({}), IsF32},
+          {HloOpcode::kParameter, NodeOperands({}), IsF16}
+      })
+  ),
+
   // Remove convert to/from F32 before/after reduction window, where initial
   // value is a constant
   HloMatcherPattern(
@@ -118,128 +136,75 @@ static const std::vector<HloMatcherPattern> patterns = {
 CastsElimination::CastsElimination(struct CompilerAnnotations& annotations)
     : HloMatcher(patterns, annotations, false) {}
 
-unsigned CastsElimination::ReplaceReduction(const HloMatcherMatched& match,
-                                            const HloOpcode reduction_type) {
-  auto* convert_out = match.instructions[0];
-  auto* reduction = convert_out->mutable_operand(0);
-  auto* to_reduce_convert = reduction->mutable_operand(0);
-  auto* init_val = reduction->mutable_operand(1);
-  auto* value_in = to_reduce_convert->mutable_operand(0);
+namespace {
 
-  // Create a new reduce_computation
-  // Check the reduction op is elementwise binary and takes in two
-  // parameters only. If that's not the case then we can't convert this
-  // reduction.
-  auto* reduce_computation = reduction->to_apply();
-  auto* reduce_op = reduce_computation->root_instruction();
-  if (!(reduce_op->IsElementwiseBinary() &&
-        reduce_op->operand(0)->opcode() == HloOpcode::kParameter &&
-        reduce_op->operand(1)->opcode() == HloOpcode::kParameter)) {
-    return 0;
-  }
-  // Build the new reduce_computation
-  auto builder = HloComputation::Builder(reduce_computation->name());
-  {
-    auto* in0 = builder.AddInstruction(reduce_op->operand(0)->Clone());
-    in0->mutable_shape()->set_element_type(F16);
-    auto* in1 = builder.AddInstruction(reduce_op->operand(1)->Clone());
-    in1->mutable_shape()->set_element_type(F16);
-    const auto shape_op_fp16 =
-        ShapeUtil::ChangeElementType(reduce_op->shape(), F16);
-    builder.AddInstruction(
-        reduce_op->CloneWithNewOperands(shape_op_fp16, {in0, in1}));
-  }
-  auto* new_reduce_computation =
-      match.computation->parent()->AddEmbeddedComputation(builder.Build());
+HloInstruction* ConvertConstant(HloInstruction* constant,
+                                const PrimitiveType& new_type) {
+  const auto shape = ShapeUtil::ChangeElementType(constant->shape(), new_type);
+  auto literal_new_type = constant->literal().ConvertToShape(shape);
 
-  // Get the initial value
-  HloInstruction* new_init_val;
-  if (init_val->opcode() == HloOpcode::kConstant) {
-    // convert a constant from F32 to F16 and add it to the graph
-    const auto shape_init_val_fp16 =
-        ShapeUtil::ChangeElementType(init_val->shape(), F16);
-    auto literal_f16 = init_val->literal().ConvertToShape(shape_init_val_fp16);
-    // If we can't convert shape then skip this one
-    if (!literal_f16.ok()) {
-      return 0;
-    }
-    new_init_val = match.computation->AddInstruction(
-        HloInstruction::CreateConstant(std::move(literal_f16.ValueOrDie())));
-  } else if (init_val->opcode() == HloOpcode::kConvert) {
-    // init value is an output of a Convert from FP16 to FP32, so use the
-    // argument to convert
-    new_init_val = init_val->mutable_operand(0);
-  } else {
-    LOG(FATAL) << "Unsupported Op for Reduction init value";
-  }
+  auto* new_inst = constant->parent()->AddInstruction(
+      HloInstruction::CreateConstant(std::move(literal_new_type.ValueOrDie())));
 
-  // Create the new reduction
-  const auto shape_reduction_fp16 =
-      ShapeUtil::ChangeElementType(reduction->shape(), F16);
-  // Create the new reduction dependent on the type of reduction
-  HloInstruction* new_reduction;
-  switch (reduction_type) {
-    case HloOpcode::kReduce: {
-      new_reduction =
-          match.computation->AddInstruction(HloInstruction::CreateReduce(
-              shape_reduction_fp16, value_in, new_init_val,
-              reduction->dimensions(), new_reduce_computation));
-      break;
-    }
-    case HloOpcode::kReduceWindow: {
-      new_reduction =
-          match.computation->AddInstruction(HloInstruction::CreateReduceWindow(
-              shape_reduction_fp16, value_in, new_init_val, reduction->window(),
-              new_reduce_computation));
-      break;
-    }
-    default: { LOG(FATAL) << "Unsupported Op for Reduction init value"; }
-  }
-  new_reduction->set_metadata(reduction->metadata());
+  new_inst->set_raw_backend_config_string(
+      constant->raw_backend_config_string());
 
-  // Replace all uses with the new reduction
-  OutlinedInfo outlined_info;
-  outlined_info.removed_or_modified_instructions.push_back(convert_out);
-  TF_CHECK_OK(convert_out->ReplaceAllUsesWith(new_reduction));
-  return MarkReplacedInstructions(outlined_info);
+  new_inst->set_metadata(constant->metadata());
+  if (constant->has_sharding()) {
+    new_inst->set_sharding(constant->sharding());
+  }
+  return new_inst;
 }
+
+}  // namespace
 
 unsigned CastsElimination::ReplaceNodes() {
   unsigned int replacement_count = 0;
-
-  // Handle all the reductions with a casts around them - remove all the casts
-  const std::vector<unsigned> casts_around_reduction_patterns = {0, 1};
-  for (const auto pattern_index : casts_around_reduction_patterns) {
-    for (HloMatcherMatched& match : matches_[pattern_index]) {
+  for (int pattern_idx = 0; pattern_idx < matches_.size(); pattern_idx++) {
+    for (HloMatcherMatched& match : matches_[pattern_idx]) {
       if (match.ok) {
-        replacement_count += ReplaceReduction(match, HloOpcode::kReduce);
-      }
-    }
-  }
+        HloInstruction* pattern_root = match.instructions[0];
+        HloComputation* computation = pattern_root->parent();
+        auto type = pattern_root->shape().element_type();
+        OutlinedInfo outlined_info = {pattern_root, {}};
+        absl::flat_hash_set<HloInstruction*> matched_instructions(
+            match.instructions.begin(), match.instructions.end());
 
-  // Handle all the reductions with a casts around them - remove all the casts
-  const std::vector<unsigned> casts_around_reduction_window_patterns = {2};
-  for (const auto pattern_index : casts_around_reduction_window_patterns) {
-    for (HloMatcherMatched& match : matches_[pattern_index]) {
-      if (match.ok) {
-        replacement_count += ReplaceReduction(match, HloOpcode::kReduceWindow);
-      }
-    }
-  }
+        std::vector<HloInstruction*> new_instructions;
 
-  // Handle all the unused casts
-  const std::vector<unsigned> unused_casts_patterns = {3, 4};
-  for (const auto pattern_index : unused_casts_patterns) {
-    for (HloMatcherMatched& match : matches_[pattern_index]) {
-      if (match.ok) {
-        auto* convert_out = match.instructions[0];
-        auto* convert_in = convert_out->mutable_operand(0);
-        auto* val_in = convert_in->mutable_operand(0);
+        for (HloInstruction* inst : match.instructions) {
+          outlined_info.removed_or_modified_instructions.push_back(inst);
 
-        // Replace all uses with val_in
-        OutlinedInfo outlined_info;
-        outlined_info.removed_or_modified_instructions.push_back(convert_out);
-        TF_CHECK_OK(convert_out->ReplaceAllUsesWith(val_in));
+          HloInstruction* new_inst;
+          if (inst->opcode() == HloOpcode::kConstant) {
+            // For constants - replace it with the new constant.
+            new_inst = ConvertConstant(inst, type);
+          } else {
+            // Otherwise clone and change the desired shape.
+            new_inst = computation->AddInstruction(inst->Clone());
+            new_inst->mutable_shape()->set_element_type(type);
+          }
+          // Replace all all the users of inst with new_inst in this pattern.
+          for (auto user : inst->users()) {
+            // Skip the user if it's not in the pattern.
+            if (matched_instructions.count(user) == 0) {
+              continue;
+            }
+            // Replace all the operands where the instruction is used with the
+            // new instruction.
+            for (int64 operand_num : user->OperandIndices(inst)) {
+              TF_CHECK_OK(user->ReplaceOperandWith(operand_num, new_inst));
+            }
+          }
+          // Update the set
+          matched_instructions.erase(inst);
+          matched_instructions.insert(new_inst);
+          // Keep track of new instructions.
+          new_instructions.push_back(new_inst);
+        }
+        TF_CHECK_OK(pattern_root->ReplaceAllUsesWith(new_instructions[0]));
+        TF_CHECK_OK(
+            computation->RemoveInstructionAndUnusedOperands(pattern_root));
         replacement_count += MarkReplacedInstructions(outlined_info);
       }
     }

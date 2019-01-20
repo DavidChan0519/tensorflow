@@ -18,13 +18,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from tensorflow.python.eager import backprop
 from tensorflow.python.eager import context
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_nn_ops
-from tensorflow.python.ops import gradients_impl
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
 
@@ -314,10 +314,10 @@ def _BiasAddGradGrad(op, received_grad):
 
   if data_format == b"NCHW":
     expanded_shape = array_ops.concat([
-        array_ops.ones_like(shape[:-3]), bias_shape,
-        array_ops.ones_like(shape[-2:])
+        array_ops.ones_like(shape[:1]), bias_shape,
+        array_ops.ones_like(shape[2:])
     ], 0)
-    tile_mults = array_ops.concat([shape[:-3], [1], shape[-2:]], 0)
+    tile_mults = array_ops.concat([shape[:1], [1], shape[2:]], 0)
   else:
     expanded_shape = array_ops.concat(
         [array_ops.ones_like(shape[:-1]), bias_shape], 0)
@@ -948,10 +948,14 @@ def _FusedBatchNormGradGrad(op, *grad):
   grad_grad_x = grad[0]
   grad_grad_scale = grad[1]
   grad_grad_offset = grad[2]
-  grad_x, grad_scale, grad_offset = _BatchNormGrad(
-      grad_y, x, scale, pop_mean, pop_var, epsilon, data_format, is_training)
-  grad_initial = [grad_grad_x, grad_grad_scale, grad_grad_offset]
-  grad_grad_y, grad_x, grad_scale = gradients_impl.gradients(
+  with backprop.GradientTape() as tape:
+    tape.watch(grad_y)
+    tape.watch(x)
+    tape.watch(scale)
+    grad_x, grad_scale, grad_offset = _BatchNormGrad(
+        grad_y, x, scale, pop_mean, pop_var, epsilon, data_format, is_training)
+    grad_initial = [grad_grad_x, grad_grad_scale, grad_grad_offset]
+  grad_grad_y, grad_x, grad_scale = tape.gradient(
       [grad_x, grad_scale, grad_offset], [grad_y, x, scale], grad_initial)
   return grad_grad_y, grad_x, grad_scale, None, None
 

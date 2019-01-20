@@ -14,8 +14,10 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/core/grappler/utils/functions.h"
 
-#include <unordered_map>
-
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/substitute.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/function.pb.h"
@@ -27,7 +29,6 @@ limitations under the License.
 #include "tensorflow/core/framework/versions.pb.h"
 #include "tensorflow/core/grappler/op_types.h"
 #include "tensorflow/core/grappler/utils.h"
-#include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/lib/strings/scanner.h"
 
 namespace tensorflow {
@@ -73,121 +74,7 @@ Status ResolveFunctionBodyNodeAttrPlaceholders(
   return Status::OK();
 }
 
-absl::flat_hash_set<string> ReachableFunctions(
-    const FunctionLibraryDefinition& flib,
-    const protobuf::RepeatedPtrField<NodeDef>& nodes) {
-  // Functions that are reachable from the graph.
-  absl::flat_hash_set<string> reachable_funcs;
-
-  // Functions might be reachable from the nested function calls, so we keep a
-  // queue of functions that we have to check.
-  gtl::InlinedVector<const FunctionDef*, 4> func_queue;
-
-  // Add reachable and not already processed functions to the functions queue.
-  const auto add_to_func_queue = [&](const string& func_name) {
-    const FunctionDef* func = flib.Find(func_name);
-    if (func && reachable_funcs.find(func_name) == reachable_funcs.end()) {
-      func_queue.push_back(func);
-    }
-  };
-
-  // Add all the functions that are reachable from the given node to the queue.
-  const auto process_node = [&](const NodeDef& node) {
-    // Node itself can be a call to the function.
-    add_to_func_queue(node.op());
-
-    // Or node can have an attribute referencing a function.
-    for (const auto& attr : node.attr()) {
-      const auto& attr_value = attr.second;
-
-      // 1. AttrValue.func
-      if (attr_value.has_func()) {
-        add_to_func_queue(attr_value.func().name());
-      }
-
-      // 2. AttrValue.ListValue.func
-      if (attr_value.has_list()) {
-        for (const auto& func : attr_value.list().func()) {
-          add_to_func_queue(func.name());
-        }
-      }
-    }
-  };
-
-  // Add all functions that are directly called from the optimized graph.
-  std::for_each(nodes.begin(), nodes.end(), process_node);
-
-  // Process all reachable functions.
-  while (!func_queue.empty()) {
-    const FunctionDef* func = func_queue.back();
-    func_queue.pop_back();
-
-    const string& func_name = func->signature().name();
-    reachable_funcs.insert(func_name);
-
-    // Find all the functions called from the function body.
-    const auto& func_body = func->node_def();
-    std::for_each(func_body.begin(), func_body.end(), process_node);
-
-    // Check if the function has a registered gradient.
-    const string grad_func_name = flib.FindGradient(func_name);
-    if (!grad_func_name.empty()) add_to_func_queue(grad_func_name);
-  }
-
-  return reachable_funcs;
-}
-
-FunctionLibraryDefinition ReachableFunctionLibraryDefinition(
-    const FunctionLibraryDefinition& flib,
-    const protobuf::RepeatedPtrField<NodeDef>& nodes) {
-  absl::flat_hash_set<string> reachable_funcs = ReachableFunctions(flib, nodes);
-
-  FunctionLibraryDefinition reachable_flib(flib.default_registry(),
-                                           FunctionDefLibrary());
-
-  for (const string& func_name : reachable_funcs) {
-    const FunctionDef* func = flib.Find(func_name);
-    DCHECK_NE(func, nullptr);
-    // That should never fail, because we copy functions from valid flib and use
-    // the same default registry.
-    const Status added = reachable_flib.AddFunctionDef(*func);
-    DCHECK(added.ok());
-
-    const string grad_func_name = flib.FindGradient(func_name);
-    if (!grad_func_name.empty()) {
-      GradientDef grad;
-      grad.set_function_name(func_name);
-      grad.set_gradient_func(grad_func_name);
-      // It can only fail if function already has a gradient function.
-      const Status added_grad = reachable_flib.AddGradientDef(grad);
-      DCHECK(added_grad.ok());
-    }
-  }
-
-  return reachable_flib;
-}
-
 }  // namespace
-
-absl::flat_hash_set<string> ReachableFunctions(
-    const FunctionLibraryDefinition& flib, const GraphDef& graph) {
-  return ReachableFunctions(flib, graph.node());
-}
-
-absl::flat_hash_set<string> ReachableFunctions(
-    const FunctionLibraryDefinition& flib, const FunctionDef& func) {
-  return ReachableFunctions(flib, func.node_def());
-}
-
-FunctionLibraryDefinition ReachableFunctionLibraryDefinition(
-    const FunctionLibraryDefinition& flib, const GraphDef& graph) {
-  return ReachableFunctionLibraryDefinition(flib, graph.node());
-}
-
-FunctionLibraryDefinition ReachableFunctionLibraryDefinition(
-    const FunctionLibraryDefinition& flib, const FunctionDef& func) {
-  return ReachableFunctionLibraryDefinition(flib, func.node_def());
-}
 
 void GrapplerFunctionConnectivity::RegisterInputArgExpansion(
     InputArgExpansion input_arg_expansion) {
@@ -197,7 +84,7 @@ void GrapplerFunctionConnectivity::RegisterInputArgExpansion(
   for (int i = 0; i < placeholders.size(); ++i) {
     const string& placeholder = input_arg_expansion.placeholders[i];
     input_arg_placeholders_.insert(
-        {placeholder, InputArgPlaceholder{input_name, /*position=*/i}});
+        {placeholder, InputArgPlaceholder{input_name, /*input_index=*/i}});
   }
   input_arg_expansions_.insert(
       {std::move(input_name), std::move(input_arg_expansion)});
@@ -296,7 +183,7 @@ Status GrapplerFunctionConnectivity::ExpandFunctionDefInput(
           // If position is not defined expand node output range
           for (int i = output_range.first; i < output_range.second; ++i) {
             graph_def_inputs->push_back(
-                i == 0 ? node_name : strings::StrCat(node_name, ":", i));
+                i == 0 ? node_name : absl::StrCat(node_name, ":", i));
           }
         } else {
           if (position > (output_range.second - output_range.first)) {
@@ -306,7 +193,7 @@ Status GrapplerFunctionConnectivity::ExpandFunctionDefInput(
           }
           int pos = output_range.first + position;
           graph_def_inputs->push_back(
-              pos == 0 ? node_name : strings::StrCat(node_name, ":", pos));
+              pos == 0 ? node_name : absl::StrCat(node_name, ":", pos));
         }
 
         return Status::OK();
@@ -335,39 +222,39 @@ Status GrapplerFunctionConnectivity::ExpandNodeInputs(
 
 Status GrapplerFunctionConnectivity::AsFunctionDefInput(
     const string& graph_def_input, string* func_def_input) const {
-  using gtl::FindOrNull;
-
   if (IsControlInput(graph_def_input)) {
     *func_def_input = graph_def_input;
     return Status::OK();
   }
 
-  int position;
-  string node_name = ParseNodeName(graph_def_input, &position);
-  CHECK_GE(position, 0);
+  const TensorId tensor = ParseTensorName(graph_def_input);
+  DCHECK_GE(tensor.index(), 0);
+
+  const absl::string_view node_name = tensor.node();
+  const int index = tensor.index();
 
   // Check if it's an input arg placeholder
-  if (position == 0) {
-    const InputArgPlaceholder* placeholder =
-        FindOrNull(input_arg_placeholders_, node_name);
-    if (placeholder != nullptr) {
+  if (tensor.index() == 0) {
+    const auto is_input_placeholder = input_arg_placeholders_.find(node_name);
+    if (is_input_placeholder != input_arg_placeholders_.end()) {
+      const InputArgPlaceholder& placeholder = is_input_placeholder->second;
       *func_def_input =
-          strings::StrCat(placeholder->input_name, ":", placeholder->position);
+          absl::StrCat(placeholder.input_name, ":", placeholder.input_index);
       return Status::OK();
     }
   }
 
   // It must be output from one of the function body nodes
-  const tensorflow::NameRangeMap* outputs_range_map =
-      FindOrNull(function_body_outputs_, node_name);
-  if (outputs_range_map != nullptr) {
-    for (const auto& el : *outputs_range_map) {
+  const auto is_body_output = function_body_outputs_.find(tensor.node());
+  if (is_body_output != function_body_outputs_.end()) {
+    const tensorflow::NameRangeMap& outputs_range_map = is_body_output->second;
+
+    for (const auto& el : outputs_range_map) {
       const auto& output_name = el.first;
       const auto& output_range = el.second;
-      if (position >= output_range.first && position < output_range.second) {
-        int pos = position - output_range.first;
-        *func_def_input =
-            strings::StrCat(node_name, ":", output_name, ":", pos);
+      if (index >= output_range.first && index < output_range.second) {
+        int pos = index - output_range.first;
+        *func_def_input = absl::StrCat(node_name, ":", output_name, ":", pos);
         return Status::OK();
       }
     }
@@ -450,12 +337,10 @@ GrapplerFunctionItem::GrapplerFunctionItem(
       fetch.push_back(output_tensor);
     }
   }
-  // Stateful and Send (it's not stateful) nodes must be preserved in the graph.
-  for (const NodeDef& node : graph.node()) {
-    if (IsSend(node)) {
-      keep_ops.push_back(node.name());
-    }
-  }
+
+  // It's unsafe to prune side-effectful ops from the graph instantiated from a
+  // function definition (see inlining in function_optimizer.cc).
+  allowed_optimizations().prune_ops_with_side_effects = false;
 }
 
 const string& GrapplerFunctionItem::description() const { return description_; }
@@ -531,7 +416,7 @@ bool IsParametrized(const FunctionDef& func) {
 
 Status InstantiationTypeParameters(
     const FunctionDef& func, const AttrSlice& func_instantiation_attr,
-    std::unordered_map<string, DataType>* type_parameters) {
+    absl::flat_hash_map<string, DataType>* type_parameters) {
   if (!type_parameters->empty()) {
     return errors::InvalidArgument("Type parameters output map must be empty");
   }
@@ -559,7 +444,7 @@ Status InstantiationTypeParameters(
 
 Status InstantiationBodyParameters(
     const FunctionDef& func, const AttrSlice& func_instantiation_attr,
-    std::unordered_map<string, AttrValue>* body_parameters) {
+    absl::flat_hash_map<string, AttrValue>* body_parameters) {
   if (!body_parameters->empty()) {
     return errors::InvalidArgument("Body parameters output map must be empty");
   }
@@ -617,10 +502,15 @@ Status MakeGrapplerFunctionItem(const FunctionDef& func,
   // Instantiate function body into a statically defined graph def.
   GraphDef function_body;
 
-  // Function body shares the library with the graph that instantiated it. It's
-  // unsafe to prune unreachable functions here, because it might lead to
-  // conflicting specializations.
-  *function_body.mutable_library() = flib.ToProto();
+  // Function body shares the library with the graph that instantiated it. We do
+  // not need a full copy of the function library, just the reachable subset.
+  *function_body.mutable_library() = flib.ReachableDefinitions(func).ToProto();
+
+  VLOG(3) << absl::Substitute(
+      "Deleted $0 unreachable functions from the Grappler function item "
+      "instantiation of $1 (library size = $2)",
+      flib.num_functions() - function_body.library().function_size(),
+      signature.name(), function_body.library().function_size());
 
   // TODO(ezhulenev): support functions with tensor sequence inputs/outputs
 
@@ -658,13 +548,12 @@ Status MakeGrapplerFunctionItem(const FunctionDef& func,
 
     InputArgExpansion input_expansion{/*input_name=*/input.name(),
                                       /*data_type=*/input_data_type,
-                                      /*is_ref*/ input.is_ref(),
+                                      /*is_ref=*/input.is_ref(),
                                       /*placeholders=*/{input.name()}};
     connectivity.RegisterInputArgExpansion(input_expansion);
     inputs.push_back(std::move(input_expansion));
   }
 
-  std::vector<string> keep_nodes;
   // Add all function nodes to the function body
   for (const NodeDef& func_def_node : func.node_def()) {
     NodeDef* new_node = function_body.add_node();
@@ -680,11 +569,6 @@ Status MakeGrapplerFunctionItem(const FunctionDef& func,
     // Register node output range in a function connectivity.
     TF_RETURN_IF_ERROR(RegisterFunctionBodyOutputs(*registration, func_def_node,
                                                    &connectivity));
-
-    // Stateful and Send nodes must be preserved in a function body
-    if (registration->op_def.is_stateful() || IsSend(func_def_node)) {
-      keep_nodes.push_back(func_def_node.name());
-    }
   }
 
   // Rewrite inputs to use GraphDef format
@@ -715,12 +599,14 @@ Status MakeGrapplerFunctionItem(const FunctionDef& func,
     outputs.push_back(std::move(output));
   }
 
+  std::vector<string> keep_ops;
   bool is_stateful = signature.is_stateful();
 
   *item = GrapplerFunctionItem(
-      /*func_name=*/signature.name(), /*description=*/signature.description(),
+      /*func_name=*/signature.name(),
+      /*description=*/signature.description(),
       /*func_attr=*/AttrSlice(&func.attr()), std::move(inputs),
-      std::move(outputs), std::move(keep_nodes), graph_def_version, is_stateful,
+      std::move(outputs), std::move(keep_ops), graph_def_version, is_stateful,
       std::move(function_body));
   return Status::OK();
 }
@@ -748,7 +634,7 @@ Status RegisterGrapplerFunctionConnectivity(
   return Status::OK();
 }
 
-Status ReplaceInputWithConst(const NodeDef& input_const, int input_position,
+Status ReplaceInputWithConst(const NodeDef& input_const, int input_index,
                              GrapplerFunctionItem* item) {
   if (!IsConstant(input_const)) {
     return errors::InvalidArgument("Input node ", input_const.name(),
@@ -760,7 +646,7 @@ Status ReplaceInputWithConst(const NodeDef& input_const, int input_position,
   // Find input arg expansion and input placeholder position in it for the
   // given function input position.
   InputArgExpansion* input_arg_expansion = nullptr;
-  int placeholder_idx = input_position;
+  int placeholder_idx = input_index;
 
   for (InputArgExpansion& input : inputs) {
     if (placeholder_idx < input.placeholders.size()) {
@@ -771,9 +657,8 @@ Status ReplaceInputWithConst(const NodeDef& input_const, int input_position,
   }
 
   if (input_arg_expansion == nullptr) {
-    return errors::InvalidArgument(
-        "Input placeholder not found: input_position=", input_position,
-        " function=", item->id);
+    return errors::InvalidArgument("Input placeholder not found: input_index=",
+                                   input_index, " function=", item->id);
   }
 
   // Delete placeholder from input expansion.
@@ -802,7 +687,7 @@ Status ReplaceInputWithConst(const NodeDef& input_const, int input_position,
   return Status::OK();
 }
 
-Status RemoveUnusedOutputs(const gtl::FlatSet<int>& active_outputs,
+Status RemoveUnusedOutputs(const absl::flat_hash_set<int>& active_outputs,
                            GrapplerFunctionItem* item,
                            std::vector<std::pair<int, int>>* output_mapping) {
   DCHECK(output_mapping->empty());
@@ -816,7 +701,7 @@ Status RemoveUnusedOutputs(const gtl::FlatSet<int>& active_outputs,
     }
   }
 
-  gtl::FlatSet<const OutputArgExpansion*> unused_output_args;
+  absl::flat_hash_set<const OutputArgExpansion*> unused_output_args;
 
   const auto is_unused_output_arg = [&](const OutputArgExpansion& output) {
     return unused_output_args.find(&output) != unused_output_args.end();

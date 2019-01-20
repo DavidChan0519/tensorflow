@@ -140,10 +140,11 @@ TEST_F(AllocationFinderTest, FindSubCompTensorAllocations) {
   Shape input_shape = ShapeUtil::MakeShape(F32, {1, 10, 10, 2});
   Shape weight_shape = ShapeUtil::MakeShape(F32, {3, 3, 2, 1});
 
-  Shape conv_shape = ShapeInference::InferConvolveShape(
-                         input_shape, weight_shape, /*feature_group_count=*/1,
-                         GetConv1Window(), GetConvDimensions())
-                         .ConsumeValueOrDie();
+  Shape conv_shape =
+      ShapeInference::InferConvolveShape(
+          input_shape, weight_shape, /*feature_group_count=*/1,
+          /*batch_group_count*/ 1, GetConv1Window(), GetConvDimensions())
+          .ConsumeValueOrDie();
 
   /* Create convolution sub-computation */
   auto builder_sub = HloComputation::Builder(TestName());
@@ -153,8 +154,9 @@ TEST_F(AllocationFinderTest, FindSubCompTensorAllocations) {
       HloInstruction::CreateParameter(1, weight_shape, "weights"));
 
   auto conv = builder_sub.AddInstruction(HloInstruction::CreateConvolve(
-      conv_shape, op0_sub, op1_sub, /*feature_group_count=*/1, GetConv1Window(),
-      GetConvDimensions(), DefaultPrecisionConfig(2)));
+      conv_shape, op0_sub, op1_sub, /*feature_group_count=*/1,
+      /*batch_group_count*/ 1, GetConv1Window(), GetConvDimensions(),
+      DefaultPrecisionConfig(2)));
 
   auto computation_sub = builder_sub.Build();
 
@@ -177,7 +179,7 @@ TEST_F(AllocationFinderTest, FindSubCompTensorAllocations) {
 
   auto computation_main = builder_main.Build();
 
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
   hlo_module->AddEmbeddedComputation(std::move(computation_sub));
   hlo_module->AddEntryComputation(std::move(computation_main));
 
@@ -219,15 +221,17 @@ TEST_F(AllocationFinderTest, FindMultiCompTensorAllocations1) {
   Shape input_shape = ShapeUtil::MakeShape(F32, {1, 10, 10, 2});
   Shape weight_shape = ShapeUtil::MakeShape(F32, {3, 3, 2, 1});
 
-  Shape conv1_shape = ShapeInference::InferConvolveShape(
-                          input_shape, weight_shape, /*feature_group_count=*/1,
-                          GetConv1Window(), GetConvDimensions())
-                          .ConsumeValueOrDie();
+  Shape conv1_shape =
+      ShapeInference::InferConvolveShape(
+          input_shape, weight_shape, /*feature_group_count=*/1,
+          /*batch_group_count*/ 1, GetConv1Window(), GetConvDimensions())
+          .ConsumeValueOrDie();
 
-  Shape conv2_shape = ShapeInference::InferConvolveShape(
-                          input_shape, weight_shape, /*feature_group_count=*/1,
-                          GetConv2Window(), GetConvDimensions())
-                          .ConsumeValueOrDie();
+  Shape conv2_shape =
+      ShapeInference::InferConvolveShape(
+          input_shape, weight_shape, /*feature_group_count=*/1,
+          /*batch_group_count*/ 1, GetConv2Window(), GetConvDimensions())
+          .ConsumeValueOrDie();
 
   /* Create convolution sub-computation 1 */
   auto builder_sub1 = HloComputation::Builder(TestName());
@@ -238,7 +242,8 @@ TEST_F(AllocationFinderTest, FindMultiCompTensorAllocations1) {
 
   auto conv1 = builder_sub1.AddInstruction(HloInstruction::CreateConvolve(
       conv1_shape, op0_sub1, op1_sub1, /*feature_group_count=*/1,
-      GetConv1Window(), GetConvDimensions(), DefaultPrecisionConfig(2)));
+      /*batch_group_count*/ 1, GetConv1Window(), GetConvDimensions(),
+      DefaultPrecisionConfig(2)));
 
   auto computation_sub1 = builder_sub1.Build();
 
@@ -251,7 +256,8 @@ TEST_F(AllocationFinderTest, FindMultiCompTensorAllocations1) {
 
   auto conv2 = builder_sub2.AddInstruction(HloInstruction::CreateConvolve(
       conv2_shape, op0_sub2, op1_sub2, /*feature_group_count=*/1,
-      GetConv1Window(), GetConvDimensions(), DefaultPrecisionConfig(2)));
+      /*batch_group_count*/ 1, GetConv2Window(), GetConvDimensions(),
+      DefaultPrecisionConfig(2)));
 
   auto computation_sub2 = builder_sub2.Build();
 
@@ -277,7 +283,7 @@ TEST_F(AllocationFinderTest, FindMultiCompTensorAllocations1) {
 
   auto computation_main = builder_main.Build();
 
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
   hlo_module->AddEmbeddedComputation(std::move(computation_sub1));
   hlo_module->AddEmbeddedComputation(std::move(computation_sub2));
   hlo_module->AddEntryComputation(std::move(computation_main));
@@ -336,15 +342,17 @@ TEST_F(AllocationFinderTest, FindMultiCompTensorAllocations2) {
   Shape input_shape = ShapeUtil::MakeShape(F32, {1, 10, 10, 2});
   Shape weight_shape = ShapeUtil::MakeShape(F32, {3, 3, 2, 1});
 
-  Shape conv1_shape = ShapeInference::InferConvolveShape(
-                          input_shape, weight_shape, /*feature_group_count=*/1,
-                          GetConv1Window(), GetConvDimensions())
-                          .ConsumeValueOrDie();
+  Shape conv1_shape =
+      ShapeInference::InferConvolveShape(
+          input_shape, weight_shape, /*feature_group_count=*/1,
+          /*batch_group_count*/ 1, GetConv1Window(), GetConvDimensions())
+          .ConsumeValueOrDie();
 
-  Shape conv2_shape = ShapeInference::InferConvolveShape(
-                          input_shape, weight_shape, /*feature_group_count=*/1,
-                          GetConv2Window(), GetConvDimensions())
-                          .ConsumeValueOrDie();
+  Shape conv2_shape =
+      ShapeInference::InferConvolveShape(
+          input_shape, weight_shape, /*feature_group_count=*/1,
+          /*batch_group_count*/ 1, GetConv2Window(), GetConvDimensions())
+          .ConsumeValueOrDie();
 
   /* Create convolution sub-computation 1 */
   auto builder_sub1 = HloComputation::Builder(TestName());
@@ -355,7 +363,8 @@ TEST_F(AllocationFinderTest, FindMultiCompTensorAllocations2) {
 
   auto conv1 = builder_sub1.AddInstruction(HloInstruction::CreateConvolve(
       conv1_shape, op0_sub1, op1_sub1, /*feature_group_count=*/1,
-      GetConv1Window(), GetConvDimensions(), DefaultPrecisionConfig(2)));
+      /*batch_group_count*/ 1, GetConv1Window(), GetConvDimensions(),
+      DefaultPrecisionConfig(2)));
 
   auto computation_sub1 = builder_sub1.Build();
 
@@ -368,7 +377,8 @@ TEST_F(AllocationFinderTest, FindMultiCompTensorAllocations2) {
 
   auto conv2 = builder_sub2.AddInstruction(HloInstruction::CreateConvolve(
       conv2_shape, op0_sub2, op1_sub2, /*feature_group_count=*/1,
-      GetConv1Window(), GetConvDimensions(), DefaultPrecisionConfig(2)));
+      /*batch_group_count*/ 1, GetConv2Window(), GetConvDimensions(),
+      DefaultPrecisionConfig(2)));
 
   auto computation_sub2 = builder_sub2.Build();
 
@@ -394,7 +404,7 @@ TEST_F(AllocationFinderTest, FindMultiCompTensorAllocations2) {
 
   auto computation_main = builder_main.Build();
 
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
   hlo_module->AddEmbeddedComputation(std::move(computation_sub1));
   hlo_module->AddEmbeddedComputation(std::move(computation_sub2));
   hlo_module->AddEntryComputation(std::move(computation_main));
@@ -457,7 +467,7 @@ HloModule top
 ENTRY c1 {
   p0 = f16[1,16,16,2] parameter(0)
   p1 = f16[1,16,16,2] parameter(1)
-  p2 = f16[1,1,2,4] constant(f16[1,1,2,4]{{{{1,0,0,0},{1,0,0,0}}}})
+  p2 = f16[1,1,2,4] constant({{{{1,0,0,0},{1,0,0,0}}}})
 
   add = f16[1,16,16,2] add(p0, p1)
 
@@ -504,7 +514,7 @@ ENTRY c1 {
 
 // Check it goes through Tuple/Detuple pairs
 TEST_F(AllocationFinderTest, CanTraverseTuples) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape lhs_shape = ShapeUtil::MakeShape(F32, {2});
   Shape rhs_shape = ShapeUtil::MakeShape(F32, {2, 2});
@@ -524,7 +534,7 @@ TEST_F(AllocationFinderTest, CanTraverseTuples) {
       HloInstruction::CreateGetTupleElement(rhs_shape, tuple, 1));
 
   DotDimensionNumbers dot_dnums;
-  dot_dnums.add_lhs_contracting_dimensions(1);
+  dot_dnums.add_lhs_contracting_dimensions(0);
   dot_dnums.add_rhs_contracting_dimensions(0);
   auto dot_inst = b.AddInstruction(HloInstruction::CreateDot(
       lhs_shape, in1, w1, dot_dnums, DefaultPrecisionConfig(2)));
@@ -555,7 +565,7 @@ TEST_F(AllocationFinderTest, CanTraverseTuples) {
 
 // Check it can start from tuple subshapes
 TEST_F(AllocationFinderTest, CanStartOnTuples) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape lhs_shape = ShapeUtil::MakeShape(F32, {2});
   Shape rhs_shape = ShapeUtil::MakeShape(F32, {2, 2});
@@ -571,7 +581,7 @@ TEST_F(AllocationFinderTest, CanStartOnTuples) {
       b.AddInstruction(HloInstruction::CreateGetTupleElement(rhs_shape, in, 1));
 
   DotDimensionNumbers dot_dnums;
-  dot_dnums.add_lhs_contracting_dimensions(1);
+  dot_dnums.add_lhs_contracting_dimensions(0);
   dot_dnums.add_rhs_contracting_dimensions(0);
   auto dot_inst = b.AddInstruction(HloInstruction::CreateDot(
       lhs_shape, in1, w1, dot_dnums, DefaultPrecisionConfig(2)));
@@ -602,7 +612,7 @@ TEST_F(AllocationFinderTest, CanStartOnTuples) {
 
 // Check it goes through while instructions
 TEST_F(AllocationFinderTest, FindWhileTensorAllocations) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape counter_shape = ShapeUtil::MakeShape(S32, {});
   Shape input_shape = ShapeUtil::MakeShape(F32, {2});
@@ -647,7 +657,7 @@ TEST_F(AllocationFinderTest, FindWhileTensorAllocations) {
         HloInstruction::CreateBinary(c->shape(), HloOpcode::kAdd, c, one));
 
     DotDimensionNumbers dot_dnums;
-    dot_dnums.add_lhs_contracting_dimensions(1);
+    dot_dnums.add_lhs_contracting_dimensions(0);
     dot_dnums.add_rhs_contracting_dimensions(0);
     auto new_in = builder_body.AddInstruction(HloInstruction::CreateDot(
         input_shape, in, w, dot_dnums, DefaultPrecisionConfig(2)));
@@ -714,7 +724,7 @@ TEST_F(AllocationFinderTest, FindWhileTensorAllocations) {
 
 // Check it goes through repeat instructions
 TEST_F(AllocationFinderTest, FindRepeatTensorAllocations) {
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
 
   Shape counter_shape = ShapeUtil::MakeShape(S32, {});
   Shape input_shape = ShapeUtil::MakeShape(F32, {2});
@@ -756,8 +766,8 @@ TEST_F(AllocationFinderTest, FindRepeatTensorAllocations) {
         HloInstruction::CreateBinary(c->shape(), HloOpcode::kAdd, c, one));
 
     DotDimensionNumbers dot_dnums;
-    dot_dnums.add_lhs_contracting_dimensions(1);
-    dot_dnums.add_rhs_contracting_dimensions(0);
+    dot_dnums.add_lhs_contracting_dimensions(0);
+    dot_dnums.add_rhs_contracting_dimensions(1);
     auto new_in = builder_body.AddInstruction(HloInstruction::CreateDot(
         input_shape, in, w, dot_dnums, DefaultPrecisionConfig(2)));
 
@@ -888,15 +898,16 @@ TEST_F(AllocationFinderTest, FindDoesntTraceThroughInvalidCalls) {
   Shape half_shape = ShapeUtil::MakeShape(F32, {1, 10, 10, 1});
   Shape weight_shape = ShapeUtil::MakeShape(F32, {3, 3, 2, 1});
 
-  Shape conv_shape = ShapeInference::InferConvolveShape(
-                         input_shape, weight_shape, /*feature_group_count=*/1,
-                         GetConv1Window(), GetConvDimensions())
-                         .ConsumeValueOrDie();
+  Shape conv_shape =
+      ShapeInference::InferConvolveShape(
+          input_shape, weight_shape, /*feature_group_count=*/1,
+          /*batch_group_count*/ 1, GetConv1Window(), GetConvDimensions())
+          .ConsumeValueOrDie();
 
   /* Create sub-computation which contains an unacceptable op */
   auto builder_sub = HloComputation::Builder(TestName());
   HloInstruction* op0_sub = builder_sub.AddInstruction(
-      HloInstruction::CreateParameter(0, input_shape, "input"));
+      HloInstruction::CreateParameter(0, half_shape, "input"));
   HloInstruction* op1_sub = builder_sub.AddInstruction(
       HloInstruction::CreateConstant(Literal::CreateFromShape(half_shape)));
   HloInstruction* op2_sub = builder_sub.AddInstruction(
@@ -913,14 +924,15 @@ TEST_F(AllocationFinderTest, FindDoesntTraceThroughInvalidCalls) {
       HloInstruction::CreateCall(input_shape, {op0}, computation_sub.get()));
   HloInstruction* conv =
       builder_main.AddInstruction(HloInstruction::CreateConvolve(
-          conv_shape, call, op1, /*feature_group_count=*/1, GetConv1Window(),
-          GetConvDimensions(), DefaultPrecisionConfig(2)));
+          conv_shape, call, op1, /*feature_group_count=*/1,
+          /*batch_group_count*/ 1, GetConv1Window(), GetConvDimensions(),
+          DefaultPrecisionConfig(2)));
 
   builder_main.AddInstruction(HloInstruction::CreateTuple({conv}));
 
   auto computation_main = builder_main.Build();
 
-  auto hlo_module = CreateNewModule();
+  auto hlo_module = CreateNewVerifiedModule();
   hlo_module->AddEmbeddedComputation(std::move(computation_sub));
   hlo_module->AddEntryComputation(std::move(computation_main));
 
@@ -953,7 +965,7 @@ ENTRY c1 {
   p2 = f16[4] parameter(2)
 
   conv = f16[1,16,16,4] convolution(p0, p1), window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
-  call = f16[1,16,16,64] call(conv, p2), to_apply=_pop_op_conv_biasadd
+  call = f16[1,16,16,64] fusion(conv, p2), kind=kCustom, calls=_pop_op_conv_biasadd
 
   ROOT t = (f16[1,16,16,4]) tuple(%call)
 }
@@ -1005,6 +1017,75 @@ ENTRY c1 {
   EXPECT_EQ(t.layout_output_idx, 0);
 }
 
+TEST_F(AllocationFinderTest, CustomCallFindTensorAllocation) {
+  std::string hlo = R"(
+HloModule top
+
+ENTRY c1 {
+  %arg2.3 = f32[3,1,5]{2,1,0} parameter(0)
+  %arg1.2 = f32[1,8]{1,0} parameter(1)
+  %arg0.1 = f32[1,8]{1,0} parameter(2)
+  %arg4.5 = f32[13,32]{1,0} parameter(3)
+  %arg3.4 = f32[4,8]{1,0} parameter(4)
+  ROOT cc = (f32[3,1,8]{2,1,0}, f32[1,8]{1,0}, f32[1,8]{1,0}, f32[3,6,1,8]{3,2,1,0}) custom-call(f32[3,1,5]{2,1,0} %arg2.3, f32[1,8]{1,0} %arg1.2, f32[1,8]{1,0} %arg0.1, f32[13,32]{1,0} %arg4.5, f32[4,8]{1,0} %arg3.4), custom_call_target="Popnn::LstmLayerFwd", opaque="{\"allocating_indexes\":[4,2,0,3,1],\"is_training\":false,\"layout_dependencies\":{\"keys\":[],\"values\":[]},\"num_channels\":8,\"num_inplace_operands\":0,\"partials_dtype\":\"DT_FLOAT\"}\n", metadata={op_type="PopnnLstmLayer" op_name="ones"}
+}
+
+)";
+
+  auto module = ParseHloString(hlo, GetModuleConfigForTest());
+  EXPECT_TRUE(module.ok());
+  auto* module0 = module.ValueOrDie().get();
+
+  const auto* lstm = module0->entry_computation()->root_instruction();
+  const auto* ip0 = lstm->operand(0);
+  const auto* ip1 = lstm->operand(1);
+  const auto* ip2 = lstm->operand(2);
+  const auto* ip3 = lstm->operand(3);
+  const auto* ip4 = lstm->operand(4);
+
+  CompilerAnnotations annotations(module0);
+
+  AllocationFinder finder(annotations);
+  EXPECT_TRUE(finder.Run(module0).ValueOrDie());
+
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 5);
+
+  auto t = annotations.tensor_allocation_map.at(std::make_pair(ip0, 0));
+  EXPECT_EQ(t.tgt, lstm);
+  EXPECT_EQ(t.input_index, 0ll);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], ip0);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip1, 0));
+  EXPECT_EQ(t.tgt, lstm);
+  EXPECT_EQ(t.input_index, 1ll);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], ip1);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip2, 0));
+  EXPECT_EQ(t.tgt, lstm);
+  EXPECT_EQ(t.input_index, 2ll);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], ip2);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip3, 0));
+  EXPECT_EQ(t.tgt, lstm);
+  EXPECT_EQ(t.input_index, 3ll);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], ip3);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip4, 0));
+  EXPECT_EQ(t.tgt, lstm);
+  EXPECT_EQ(t.input_index, 4ll);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], ip4);
+}
+
 TEST_F(AllocationFinderTest, BiasAddAndMultiply) {
   std::string hlo = R"(
 HloModule top
@@ -1030,8 +1111,8 @@ ENTRY c1 {
   p3 = f16[4] parameter(3)
 
   conv = f16[1,16,16,4] convolution(p0, p1), window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
-  call = f16[1,16,16,64] call(conv, p2), to_apply=_pop_op_conv_biasadd
-  call.1 = f16[1,16,16,64] call(call, p3), to_apply=_pop_op_conv_biasadd.1
+  call = f16[1,16,16,64] fusion(conv, p2), kind=kCustom, calls=_pop_op_conv_biasadd
+  call.1 = f16[1,16,16,64] fusion(call, p3), kind=kCustom, calls=_pop_op_conv_biasadd.1
 
   ROOT t = (f16[1,16,16,4]) tuple(call.1)
 }
@@ -1115,7 +1196,7 @@ ENTRY c1 {
   p2_r = f16[4] reshape(p2)
 
   conv = f16[1,16,16,4] convolution(p0, p1), window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
-  call = f16[1,16,16,64] call(conv, p2_r), to_apply=_pop_op_conv_biasadd
+  call = f16[1,16,16,64] fusion(conv, p2_r), kind=kCustom, calls=_pop_op_conv_biasadd
 
   ROOT t = (f16[1,16,16,4]) tuple(call)
 }
@@ -1176,8 +1257,8 @@ TEST_F(AllocationFinderTest, MatMulBiasAdd) {
 HloModule top
 
  %_pop_op_matmul_biasadd (arg_0: f32[2,2], arg_1: f32[2]) -> f32[2,2] {
-   %arg_1 = f32[2]{0} parameter(1)
-   %broadcast.12.7.clone = f32[2,2]{1,0} broadcast(f32[2]{0} %arg_1), dimensions={1}
+   %arg_1 = f32[2] parameter(1)
+   %broadcast.12.7.clone = f32[2,2]{1,0} broadcast(%arg_1), dimensions={1}
    %arg_0 = f32[2,2]{1,0} parameter(0)
    ROOT %add.12.8.clone = f32[2,2]{1,0} add(f32[2,2]{1,0} %arg_0, f32[2,2]{1,0} %broadcast.12.7.clone)
  }
@@ -1186,8 +1267,8 @@ HloModule top
    %arg0.12.0 = f32[2,2]{1,0} parameter(0)
    %arg1.12.1 = f32[2,2]{1,0} parameter(1)
    %dot.12.6 = f32[2,2]{1,0} dot(f32[2,2]{1,0} %arg0.12.0, f32[2,2]{1,0} %arg1.12.1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
-   %arg2.12.2 = f32[2]{0} parameter(2), control-predecessors={%dot.12.6}
-   ROOT %call = f32[2,2]{1,0} call(f32[2,2]{1,0} %dot.12.6, f32[2]{0} %arg2.12.2), to_apply=%_pop_op_matmul_biasadd
+   %arg2.12.2 = f32[2] parameter(2), control-predecessors={%dot.12.6}
+   ROOT %call = f32[2,2]{1,0} fusion(f32[2,2]{1,0} %dot.12.6, %arg2.12.2), kind=kCustom, calls=%_pop_op_matmul_biasadd
  }
 
 )";
@@ -1239,24 +1320,84 @@ HloModule top
   EXPECT_EQ(t.backward_path.size(), 0);
 }
 
+TEST_F(AllocationFinderTest,
+       NoTargetBecauseOfDepenencyFromLayoutCreatorToSource) {
+  // arg2.12.2 layout cannot depend on the layout of the dot.12.6, because the
+  // former is a predecessor of the latter.
+  std::string hlo = R"(
+HloModule top
+
+ %_pop_op_matmul_biasadd (arg_0: f32[2,2], arg_1: f32[2]) -> f32[2,2] {
+   %arg_1 = f32[2] parameter(1)
+   %broadcast.12.7.clone = f32[2,2]{1,0} broadcast(%arg_1), dimensions={1}
+   %arg_0 = f32[2,2]{1,0} parameter(0)
+   ROOT %add.12.8.clone = f32[2,2]{1,0} add(f32[2,2]{1,0} %arg_0, f32[2,2]{1,0} %broadcast.12.7.clone)
+ }
+
+ ENTRY %c (arg0.12.0: f32[2,2], arg1.12.1: f32[2,2], arg2.12.2: f32[2]) -> f32[2,2] {
+   %arg0.12.0 = f32[2,2]{1,0} parameter(0)
+   %arg1.12.1 = f32[2,2]{1,0} parameter(1)
+   %arg2.12.2 = f32[2] parameter(2)
+   %dot.12.6 = f32[2,2]{1,0} dot(f32[2,2]{1,0} %arg0.12.0, f32[2,2]{1,0} %arg1.12.1), lhs_contracting_dims={1}, rhs_contracting_dims={0}, control-predecessors={%arg2.12.2}
+   ROOT %call = f32[2,2]{1,0} fusion(f32[2,2]{1,0} %dot.12.6, %arg2.12.2), kind=kCustom, calls=%_pop_op_matmul_biasadd
+ }
+)";
+
+  auto config = GetModuleConfigForTest();
+  config.set_argument_count(2);
+  config.set_resource_input_count(2);
+  config.set_input_mapping({0, 1});
+  config.set_resource_update_to_input_index({0});
+  auto module = ParseHloString(hlo, config);
+  EXPECT_TRUE(module.ok());
+  auto* module0 = module.ValueOrDie().get();
+
+  const auto* root = module0->entry_computation()->root_instruction();
+  const auto* call = root;
+  const auto* dot = call->operand(0);
+  const auto* ip0 = dot->operand(0);
+  const auto* ip1 = dot->operand(1);
+  const auto* ip2 = call->operand(1);
+
+  CompilerAnnotations annotations(module0);
+
+  AllocationFinder finder(annotations);
+  EXPECT_TRUE(finder.Run(module0).ValueOrDie());
+
+  // Will have both of the dot parameters
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 2);
+
+  auto t = annotations.tensor_allocation_map.at(std::make_pair(ip0, 0));
+  EXPECT_EQ(t.tgt, dot);
+  EXPECT_EQ(t.input_index, 0);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip1, 0));
+  EXPECT_EQ(t.tgt, dot);
+  EXPECT_EQ(t.input_index, 1);
+
+  ForwardAllocation fwd_finder(annotations);
+  EXPECT_FALSE(fwd_finder.Run(module0).ValueOrDie());
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 2);
+}
+
 TEST_F(AllocationFinderTest, MatMulBiasAddWithPath) {
   std::string hlo = R"(
 HloModule top
 
  %_pop_op_matmul_biasadd (arg_0: f32[2,2], arg_1: f32[2]) -> f32[2,2] {
-   %arg_1 = f32[2]{0} parameter(1)
-   %broadcast.12.7.clone = f32[2,2]{1,0} broadcast(f32[2]{0} %arg_1), dimensions={1}
-   %arg_0 = f32[2,2]{1,0} parameter(0)
-   ROOT %add.12.8.clone = f32[2,2]{1,0} add(f32[2,2]{1,0} %arg_0, f32[2,2]{1,0} %broadcast.12.7.clone)
+   %arg_1 = f32[2] parameter(1)
+   %broadcast.12.7.clone = f32[2,2] broadcast(%arg_1), dimensions={1}
+   %arg_0 = f32[2,2] parameter(0)
+   ROOT %add.12.8.clone = f32[2,2] add(%arg_0, %broadcast.12.7.clone)
  }
 
  ENTRY %c (arg0.12.0: f32[2,2], arg1.12.1: f32[2,2], arg2.12.2: f32[1,2]) -> f32[2,2] {
-   %arg0.12.0 = f32[2,2]{1,0} parameter(0)
-   %arg1.12.1 = f32[2,2]{1,0} parameter(1)
-   %dot.12.6 = f32[2,2]{1,0} dot(f32[2,2]{1,0} %arg0.12.0, f32[2,2]{1,0} %arg1.12.1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
-   %arg2.12.2 = f32[1,2]{1,0} parameter(2), control-predecessors={%dot.12.6}
-   %p2_r = f16[2]{0} reshape(%arg2.12.2)
-   ROOT %call = f32[2,2]{1,0} call(f32[2,2]{1,0} %dot.12.6, f32[2]{0} %p2_r), to_apply=%_pop_op_matmul_biasadd
+   %arg0.12.0 = f32[2,2] parameter(0)
+   %arg1.12.1 = f32[2,2] parameter(1)
+   %dot.12.6 = f32[2,2] dot(%arg0.12.0, %arg1.12.1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+   %arg2.12.2 = f32[1,2] parameter(2), control-predecessors={%dot.12.6}
+   %p2_r = f32[2] reshape(%arg2.12.2)
+   ROOT %call = f32[2,2] fusion(%dot.12.6, %p2_r), kind=kCustom, calls=%_pop_op_matmul_biasadd
  }
 
 )";
@@ -1315,14 +1456,14 @@ TEST_F(AllocationFinderTest, BatchNormInfParams) {
 HloModule top
 
 ENTRY %top (arg0.36.22: f32[1,4,4,2], arg1.36.23: f32[1,1,2,2], arg2.36.24: f32[2], arg3.36.25: f32[2], arg4.36.26: f32[2], arg5.36.27: f32[2]) -> f32[1,4,4,2] {
- %arg0.36.22 = f32[1,4,4,2]{3,2,1,0} parameter(0)
- %arg1.36.23 = f32[1,1,2,2]{3,2,1,0} parameter(1)
- %convolution.36.29 = f32[1,4,4,2]{3,2,1,0} convolution(f32[1,4,4,2]{3,2,1,0} %arg0.36.22, f32[1,1,2,2]{3,2,1,0} %arg1.36.23), window={size=1x1}, dim_labels=b01f_01io->b01f, metadata={op_type="Conv2D" op_name="vs/conv2d/Conv2D"}
- %arg2.36.24 = f32[2]{0} parameter(2)
- %arg3.36.25 = f32[2]{0} parameter(3)
- %arg4.36.26 = f32[2]{0} parameter(4)
- %arg5.36.27 = f32[2]{0} parameter(5)
- ROOT %batch-norm-inference.36.31 = f32[1,4,4,2]{3,2,1,0} batch-norm-inference(f32[1,4,4,2]{3,2,1,0} %convolution.36.29, f32[2]{0} %arg2.36.24, f32[2]{0} %arg3.36.25, f32[2]{0} %arg4.36.26, f32[2]{0} %arg5.36.27), epsilon=0.001, feature_index=3, metadata={op_type="FusedBatchNorm" op_name="vs/batch_normalization/FusedBatchNorm"}
+ %arg0.36.22 = f32[1,4,4,2] parameter(0)
+ %arg1.36.23 = f32[1,1,2,2] parameter(1)
+ %convolution.36.29 = f32[1,4,4,2] convolution(%arg0.36.22, %arg1.36.23), window={size=1x1}, dim_labels=b01f_01io->b01f
+ %arg2.36.24 = f32[2] parameter(2)
+ %arg3.36.25 = f32[2] parameter(3)
+ %arg4.36.26 = f32[2] parameter(4)
+ %arg5.36.27 = f32[2] parameter(5)
+ ROOT %batch-norm-inference.36.31 = f32[1,4,4,2] batch-norm-inference(%convolution.36.29, %arg2.36.24, %arg3.36.25, %arg4.36.26, %arg5.36.27), epsilon=0.001, feature_index=3
 }
 
 )";
@@ -1388,16 +1529,16 @@ TEST_F(AllocationFinderTest, BatchNormInfParamsWithPath) {
 HloModule top
 
 ENTRY %top (arg0.36.22: f32[1,4,4,2], arg1.36.23: f32[1,1,2,2], arg2.36.24: f32[1,2], arg3.36.25: f32[1,2], arg4.36.26: f32[2], arg5.36.27: f32[2]) -> f32[1,4,4,2] {
- %arg0.36.22 = f32[1,4,4,2]{3,2,1,0} parameter(0)
- %arg1.36.23 = f32[1,1,2,2]{3,2,1,0} parameter(1)
- %convolution.36.29 = f32[1,4,4,2]{3,2,1,0} convolution(f32[1,4,4,2]{3,2,1,0} %arg0.36.22, f32[1,1,2,2]{3,2,1,0} %arg1.36.23), window={size=1x1}, dim_labels=b01f_01io->b01f, metadata={op_type="Conv2D" op_name="vs/conv2d/Conv2D"}
+ %arg0.36.22 = f32[1,4,4,2] parameter(0)
+ %arg1.36.23 = f32[1,1,2,2] parameter(1)
+ %convolution.36.29 = f32[1,4,4,2] convolution(%arg0.36.22, %arg1.36.23), window={size=1x1}, dim_labels=b01f_01io->b01f
  %arg2.36.24 = f32[1,2]{1,0} parameter(2)
- %arg2.36.24_r = f32[2]{0} reshape(%arg2.36.24)
+ %arg2.36.24_r = f32[2] reshape(%arg2.36.24)
  %arg3.36.25 = f32[1,2]{1,0} parameter(3)
- %arg3.36.25_r = f32[2]{0} reshape(%arg3.36.25)
- %arg4.36.26 = f32[2]{0} parameter(4)
- %arg5.36.27 = f32[2]{0} parameter(5)
- ROOT %batch-norm-inference.36.31 = f32[1,4,4,2]{3,2,1,0} batch-norm-inference(f32[1,4,4,2]{3,2,1,0} %convolution.36.29, f32[2]{0} %arg2.36.24_r, f32[2]{0} %arg3.36.25_r, f32[2]{0} %arg4.36.26, f32[2]{0} %arg5.36.27), epsilon=0.001, feature_index=3, metadata={op_type="FusedBatchNorm" op_name="vs/batch_normalization/FusedBatchNorm"}
+ %arg3.36.25_r = f32[2] reshape(%arg3.36.25)
+ %arg4.36.26 = f32[2] parameter(4)
+ %arg5.36.27 = f32[2] parameter(5)
+ ROOT %batch-norm-inference.36.31 = f32[1,4,4,2] batch-norm-inference(%convolution.36.29, %arg2.36.24_r, %arg3.36.25_r, %arg4.36.26, %arg5.36.27), epsilon=0.001, feature_index=3
 }
 
 )";
@@ -1462,6 +1603,85 @@ ENTRY %top (arg0.36.22: f32[1,4,4,2], arg1.36.23: f32[1,1,2,2], arg2.36.24: f32[
   EXPECT_EQ(t.backward_path[0], reshape2);
 }
 
+TEST_F(AllocationFinderTest, BatchNormInfParamsWithPoplibsCustomOpPath) {
+  std::string hlo = R"(
+HloModule top
+
+ENTRY %top (arg0.36.22: f32[1,4,4,2], arg1.36.23: f32[1,1,2,2], arg2.36.24: f32[2], arg3.36.25: f32[1,2], arg4.36.26: f32[2], arg5.36.27: f32[2]) -> f32[1,4,4,2] {
+ %arg0.36.22 = f32[1,4,4,2] parameter(0)
+ %arg1.36.23 = f32[1,1,2,2] parameter(1)
+ %convolution.36.29 = f32[1,4,4,2] convolution(%arg0.36.22, %arg1.36.23), window={size=1x1}, dim_labels=b01f_01io->b01f
+ %arg2.36.24 = f32[2]{1,0} parameter(2)
+ %sqrt = f32[2] custom-call(%arg2.36.24), custom_call_target="Popops::Sqrt", opaque="{\"allocating_indexes\":[],\"layout_dependencies\":{\"keys\":[],\"values\":[]},\"num_inplace_operands\":1}\n"
+ %arg3.36.25 = f32[1,2]{1,0} parameter(3)
+ %arg3.36.25_r = f32[2] reshape(%arg3.36.25)
+ %arg4.36.26 = f32[2] parameter(4)
+ %arg5.36.27 = f32[2] parameter(5)
+ ROOT %batch-norm-inference.36.31 = f32[1,4,4,2] batch-norm-inference(%convolution.36.29, %sqrt, %arg3.36.25_r, %arg4.36.26, %arg5.36.27), epsilon=0.001, feature_index=3
+}
+
+)";
+
+  auto config = GetModuleConfigForTest();
+  config.set_argument_count(6);
+  config.set_resource_input_count(2);
+  config.set_input_mapping({0, 1, 2, 3, 4, 5});
+  config.set_resource_update_to_input_index({0});
+  auto module = ParseHloString(hlo, config);
+  EXPECT_TRUE(module.ok());
+  auto* module0 = module.ValueOrDie().get();
+
+  const auto* root = module0->entry_computation()->root_instruction();
+  const auto* bn = root;
+  const auto* conv = bn->operand(0);
+  const auto* ip0 = conv->operand(0);
+  const auto* ip1 = conv->operand(1);
+  const auto* sqrt = bn->operand(1);
+  const auto* reshape = bn->operand(2);
+  const auto* ip2 = sqrt->operand(0);
+  const auto* ip3 = reshape->operand(0);
+
+  CompilerAnnotations annotations(module0);
+
+  AllocationFinder finder(annotations);
+  EXPECT_TRUE(finder.Run(module0).ValueOrDie());
+
+  // Will have both of the convolution parameters
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 2);
+
+  auto t = annotations.tensor_allocation_map.at(std::make_pair(ip0, 0));
+  EXPECT_EQ(t.tgt, conv);
+  EXPECT_EQ(t.input_index, 0);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip1, 0));
+  EXPECT_EQ(t.tgt, conv);
+  EXPECT_EQ(t.input_index, 1);
+
+  ForwardAllocation fwd_finder(annotations);
+  EXPECT_TRUE(fwd_finder.Run(module0).ValueOrDie());
+
+  // We have added one new entry for the bias add
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 4);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip2, 0));
+  EXPECT_EQ(t.tgt, bn);
+  EXPECT_EQ(t.input_index, 1);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], sqrt);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip3, 0));
+  EXPECT_EQ(t.tgt, bn);
+  EXPECT_EQ(t.input_index, 2);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], reshape);
+}
+
 TEST_F(AllocationFinderTest, BatchNormTrainingParams) {
   std::string hlo = R"(
 HloModule top
@@ -1472,50 +1692,50 @@ HloModule top
 }
 
 %_pop_op_conv_scaled_inplace (arg_0: f32[1,1,2,2], arg_1: f32[1,4,4,2], arg_2: f32[1,4,4,2]) -> f32[1,1,2,2] {
-  %arg_1 = f32[1,4,4,2]{3,2,1,0} parameter(1)
-  %arg_2 = f32[1,4,4,2]{3,2,1,0} parameter(2)
-  %convolution.78.67.clone = f32[1,1,2,2]{3,2,1,0} convolution(f32[1,4,4,2]{3,2,1,0} %arg_1, f32[1,4,4,2]{3,2,1,0} %arg_2), window={size=4x4}, dim_labels=f01b_i01o->01bf, metadata={op_type="Conv2DBackpropFilter" op_name="gradients/vs/conv1/Conv2D_grad/Conv2DBackpropFilter"}
-  %constant.78.28.clone = f32[] constant(0.1), metadata={op_type="Const" op_name="GradientDescent/learning_rate"}
-  %broadcast.78.68.clone = f32[1,1,2,2]{3,2,1,0} broadcast(f32[] %constant.78.28.clone), dimensions={}, metadata={op_type="ResourceApplyGradientDescent" op_name="GradientDescent/update_vs/conv1/kernel/ResourceApplyGradientDescent"}
-  %multiply.78.69.clone = f32[1,1,2,2]{3,2,1,0} multiply(f32[1,1,2,2]{3,2,1,0} %convolution.78.67.clone, f32[1,1,2,2]{3,2,1,0} %broadcast.78.68.clone), metadata={op_type="ResourceApplyGradientDescent" op_name="GradientDescent/update_vs/conv1/kernel/ResourceApplyGradientDescent"}
-  %arg_0 = f32[1,1,2,2]{3,2,1,0} parameter(0)
-  ROOT %subtract.78.70.clone = f32[1,1,2,2]{3,2,1,0} subtract(f32[1,1,2,2]{3,2,1,0} %arg_0, f32[1,1,2,2]{3,2,1,0} %multiply.78.69.clone), metadata={op_type="ResourceApplyGradientDescent" op_name="GradientDescent/update_vs/conv1/kernel/ResourceApplyGradientDescent"}
+  %arg_1 = f32[1,4,4,2] parameter(1)
+  %arg_2 = f32[1,4,4,2] parameter(2)
+  %convolution.78.67.clone = f32[1,1,2,2] convolution(%arg_1, %arg_2), window={size=4x4}, dim_labels=f01b_i01o->01bf
+  %constant.78.28.clone = f32[] constant(0.1)
+  %broadcast.78.68.clone = f32[1,1,2,2] broadcast(f32[] %constant.78.28.clone), dimensions={}
+  %multiply.78.69.clone = f32[1,1,2,2] multiply(%convolution.78.67.clone, %broadcast.78.68.clone)
+  %arg_0 = f32[1,1,2,2] parameter(0)
+  ROOT %subtract.78.70.clone = f32[1,1,2,2] subtract(%arg_0, %multiply.78.69.clone)
 }
 
 %_pop_op_wide_const () -> f32[1,4,4,2] {
-  %constant.78.29.clone = f32[] constant(1), metadata={op_type="Const" op_name="gradients/Sum_grad/Tile"}
-  ROOT %broadcast.2.clone = f32[1,4,4,2]{3,2,1,0} broadcast(f32[] %constant.78.29.clone), dimensions={}
+  %constant.78.29.clone = f32[] constant(1)
+  ROOT %broadcast.2.clone = f32[1,4,4,2] broadcast(f32[] %constant.78.29.clone), dimensions={}
 }
 
 %_pop_op_wide_const.1 () -> f32[2] {
-  %constant.78.28.clone.1 = f32[] constant(0.1), metadata={op_type="Const" op_name="GradientDescent/learning_rate"}
-  ROOT %broadcast.78.64.clone = f32[2]{0} broadcast(f32[] %constant.78.28.clone.1), dimensions={}, metadata={op_type="ResourceApplyGradientDescent" op_name="GradientDescent/update_vs/batch_normalization/gamma/ResourceApplyGradientDescent"}
+  %constant.78.28.clone.1 = f32[] constant(0.1)
+  ROOT %broadcast.78.64.clone = f32[2] broadcast(f32[] %constant.78.28.clone.1), dimensions={}
 }
 
 ENTRY %top (arg0.78.22: f32[1,4,4,2], arg1.78.23: f32[1,1,2,2], arg2.78.24: f32[2], arg3.78.25: f32[2]) -> (f32[], f32[1,1,2,2], f32[2], f32[2]) {
-  %constant.78.43 = f32[] constant(0), metadata={op_type="Sum" op_name="Sum"}
-  %arg0.78.22 = f32[1,4,4,2]{3,2,1,0} parameter(0), metadata={op_name="XLA_Args"}
-  %arg1.78.23 = f32[1,1,2,2]{3,2,1,0} parameter(1), metadata={op_name="XLA_Args"}
-  %convolution.78.33 = f32[1,4,4,2]{3,2,1,0} convolution(f32[1,4,4,2]{3,2,1,0} %arg0.78.22, f32[1,1,2,2]{3,2,1,0} %arg1.78.23), window={size=1x1}, dim_labels=b01f_01io->b01f, metadata={op_type="Conv2D" op_name="vs/conv1/Conv2D"}
-  %arg2.78.24 = f32[2]{0} parameter(2), metadata={op_name="XLA_Args"}
-  %arg3.78.25 = f32[2]{0} parameter(3), metadata={op_name="XLA_Args"}
-  %batch-norm-training.78.35 = (f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) batch-norm-training(f32[1,4,4,2]{3,2,1,0} %convolution.78.33, f32[2]{0} %arg2.78.24, f32[2]{0} %arg3.78.25), epsilon=0.001, feature_index=3, metadata={op_type="FusedBatchNorm" op_name="vs/batch_normalization/FusedBatchNorm"}
-  %get-tuple-element.78.36 = f32[1,4,4,2]{3,2,1,0} get-tuple-element((f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) %batch-norm-training.78.35), index=0, metadata={op_type="FusedBatchNorm" op_name="vs/batch_normalization/FusedBatchNorm"}
-  %reduce.78.49 = f32[] reduce(f32[1,4,4,2]{3,2,1,0} %get-tuple-element.78.36, f32[] %constant.78.43), dimensions={0,1,2,3}, to_apply=%Sum-reduction48, metadata={op_type="Sum" op_name="Sum"}
-  %call.1 = f32[1,4,4,2]{3,2,1,0} call(), to_apply=%_pop_op_wide_const, metadata={op_type="Const" op_name="gradients/Sum_grad/Tile"}
-  %get-tuple-element.78.38 = f32[2]{0} get-tuple-element((f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) %batch-norm-training.78.35), index=1, metadata={op_type="FusedBatchNorm" op_name="vs/batch_normalization/FusedBatchNorm"}
-  %get-tuple-element.78.39 = f32[2]{0} get-tuple-element((f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) %batch-norm-training.78.35), index=2, metadata={op_type="FusedBatchNorm" op_name="vs/batch_normalization/FusedBatchNorm"}
-  %batch-norm-grad.78.54 = (f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) batch-norm-grad(f32[1,4,4,2]{3,2,1,0} %convolution.78.33, f32[2]{0} %arg2.78.24, f32[2]{0} %get-tuple-element.78.38, f32[2]{0} %get-tuple-element.78.39, f32[1,4,4,2]{3,2,1,0} %call.1), epsilon=0.001, feature_index=3, metadata={op_type="FusedBatchNormGrad" op_name="gradients/vs/batch_normalization/FusedBatchNorm_grad/FusedBatchNormGrad"}
-  %get-tuple-element.78.55 = f32[1,4,4,2]{3,2,1,0} get-tuple-element((f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) %batch-norm-grad.78.54), index=0, metadata={op_type="FusedBatchNormGrad" op_name="gradients/vs/batch_normalization/FusedBatchNorm_grad/FusedBatchNormGrad"}
-  %call = f32[1,1,2,2]{3,2,1,0} call(f32[1,1,2,2]{3,2,1,0} %arg1.78.23, f32[1,4,4,2]{3,2,1,0} %arg0.78.22, f32[1,4,4,2]{3,2,1,0} %get-tuple-element.78.55), to_apply=%_pop_op_conv_scaled_inplace, metadata={op_type="Conv2DBackpropFilter" op_name="gradients/vs/conv1/Conv2D_grad/Conv2DBackpropFilter"}
-  %call.2 = f32[2]{0} call(), to_apply=%_pop_op_wide_const.1, metadata={op_type="Const" op_name="GradientDescent/learning_rate"}
-  %get-tuple-element.78.56 = f32[2]{0} get-tuple-element((f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) %batch-norm-grad.78.54), index=1, metadata={op_type="FusedBatchNormGrad" op_name="gradients/vs/batch_normalization/FusedBatchNorm_grad/FusedBatchNormGrad"}
-  %multiply.78.65 = f32[2]{0} multiply(f32[2]{0} %call.2, f32[2]{0} %get-tuple-element.78.56), metadata={op_type="ResourceApplyGradientDescent" op_name="GradientDescent/update_vs/batch_normalization/gamma/ResourceApplyGradientDescent"}
-  %subtract.78.66 = f32[2]{0} subtract(f32[2]{0} %arg2.78.24, f32[2]{0} %multiply.78.65), metadata={op_type="ResourceApplyGradientDescent" op_name="GradientDescent/update_vs/batch_normalization/gamma/ResourceApplyGradientDescent"}
-  %get-tuple-element.78.57 = f32[2]{0} get-tuple-element((f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) %batch-norm-grad.78.54), index=2, metadata={op_type="FusedBatchNormGrad" op_name="gradients/vs/batch_normalization/FusedBatchNorm_grad/FusedBatchNormGrad"}
-  %multiply.78.62 = f32[2]{0} multiply(f32[2]{0} %call.2, f32[2]{0} %get-tuple-element.78.57), metadata={op_type="ResourceApplyGradientDescent" op_name="GradientDescent/update_vs/batch_normalization/beta/ResourceApplyGradientDescent"}
-  %subtract.78.63 = f32[2]{0} subtract(f32[2]{0} %arg3.78.25, f32[2]{0} %multiply.78.62), metadata={op_type="ResourceApplyGradientDescent" op_name="GradientDescent/update_vs/batch_normalization/beta/ResourceApplyGradientDescent"}
-  ROOT %tuple.78.77 = (f32[], f32[1,1,2,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) tuple(f32[] %reduce.78.49, f32[1,1,2,2]{3,2,1,0} %call, f32[2]{0} %subtract.78.66, f32[2]{0} %subtract.78.63), metadata={op_name="XLA_Retvals"}
+  %constant.78.43 = f32[] constant(0)
+  %arg0.78.22 = f32[1,4,4,2] parameter(0)
+  %arg1.78.23 = f32[1,1,2,2] parameter(1)
+  %convolution.78.33 = f32[1,4,4,2] convolution(%arg0.78.22, %arg1.78.23), window={size=1x1}, dim_labels=b01f_01io->b01f
+  %arg2.78.24 = f32[2] parameter(2)
+  %arg3.78.25 = f32[2] parameter(3)
+  %batch-norm-training.78.35 = (f32[1,4,4,2], f32[2], f32[2]) batch-norm-training(%convolution.78.33, %arg2.78.24, %arg3.78.25), epsilon=0.001, feature_index=3
+  %get-tuple-element.78.36 = f32[1,4,4,2] get-tuple-element(%batch-norm-training.78.35), index=0
+  %reduce.78.49 = f32[] reduce(%get-tuple-element.78.36, %constant.78.43), dimensions={0,1,2,3}, to_apply=%Sum-reduction48
+  %call.1 = f32[1,4,4,2] fusion(), kind=kCustom, calls=%_pop_op_wide_const
+  %get-tuple-element.78.38 = f32[2] get-tuple-element((f32[1,4,4,2], f32[2], f32[2]) %batch-norm-training.78.35), index=1
+  %get-tuple-element.78.39 = f32[2] get-tuple-element((f32[1,4,4,2], f32[2], f32[2]) %batch-norm-training.78.35), index=2
+  %batch-norm-grad.78.54 = (f32[1,4,4,2], f32[2], f32[2]) batch-norm-grad(%convolution.78.33, %arg2.78.24, %get-tuple-element.78.38, %get-tuple-element.78.39, %call.1), epsilon=0.001, feature_index=3
+  %get-tuple-element.78.55 = f32[1,4,4,2] get-tuple-element(%batch-norm-grad.78.54), index=0
+  %call = f32[1,1,2,2] fusion(%arg1.78.23, %arg0.78.22, %get-tuple-element.78.55), kind=kCustom, calls=%_pop_op_conv_scaled_inplace
+  %call.2 = f32[2] fusion(), kind=kCustom, calls=%_pop_op_wide_const.1
+  %get-tuple-element.78.56 = f32[2] get-tuple-element((f32[1,4,4,2], f32[2], f32[2]) %batch-norm-grad.78.54), index=1
+  %multiply.78.65 = f32[2] multiply(%call.2, %get-tuple-element.78.56)
+  %subtract.78.66 = f32[2] subtract(%arg2.78.24, %multiply.78.65)
+  %get-tuple-element.78.57 = f32[2] get-tuple-element(%batch-norm-grad.78.54), index=2
+  %multiply.78.62 = f32[2] multiply(%call.2, %get-tuple-element.78.57)
+  %subtract.78.63 = f32[2] subtract(%arg3.78.25, %multiply.78.62)
+  ROOT %tuple.78.77 = (f32[], f32[1,1,2,2], f32[2], f32[2]) tuple(%reduce.78.49, %call, %subtract.78.66, %subtract.78.63)
 }
 
 )";
@@ -1538,7 +1758,7 @@ ENTRY %top (arg0.78.22: f32[1,4,4,2], arg1.78.23: f32[1,1,2,2], arg2.78.24: f32[
   const auto* conv_grad_call =
       arg0->users()[0]->opcode() == HloOpcode::kConvolution ? arg0->users()[1]
                                                             : arg0->users()[0];
-  const auto* conv_grad_comp = conv_grad_call->to_apply();
+  const auto* conv_grad_comp = conv_grad_call->fused_instructions_computation();
   const auto* conv_grad_ip0 = conv_grad_comp->parameter_instruction(1);
   const auto* conv_grad_ip1 = conv_grad_comp->parameter_instruction(2);
   const auto* conv_grad = conv_grad_ip1->users()[0];
@@ -1577,7 +1797,7 @@ ENTRY %top (arg0.78.22: f32[1,4,4,2], arg1.78.23: f32[1,1,2,2], arg2.78.24: f32[
   EXPECT_TRUE(fwd_finder.Run(module0).ValueOrDie());
 
   // We have added one new entry for the bias add
-  EXPECT_EQ(annotations.tensor_allocation_map.size(), 6);
+  ASSERT_EQ(annotations.tensor_allocation_map.size(), 6);
 
   t = annotations.tensor_allocation_map.at(std::make_pair(bn_ip1, 0));
   EXPECT_EQ(t.tgt, bn_tr);
@@ -1691,8 +1911,10 @@ ENTRY %top (arg0.36.22: f32[1,4,4,2], arg1.36.23: f32[1,1,2,2], arg2.36.24: f32[
   EXPECT_EQ(t.backward_path[0], reshape2);
 }
 
-TEST_F(AllocationFinderTest, ForwardAllocationMultipleUsesMultipleTargets) {
-  // In this test we check that %arg2.36.24 can't have a layout.
+TEST_F(AllocationFinderTest,
+       ForwardAllocationMultipleUsesMultipleTargetsSamePriority) {
+  // In this test we check that %arg2.36.24 and %arg3.36.25 get a layout even
+  // though they have multiple targets.
   std::string hlo = R"(
 HloModule top
 %Sum-reduction48 (x.48.45: f32[2], y.48.46: f32[2]) -> f32[2] {
@@ -1731,9 +1953,13 @@ ENTRY %top (arg0.36.22: f32[1,4,4,2], arg1.36.23: f32[1,1,2,2], arg2.36.24: f32[
   const auto* root = module0->entry_computation()->root_instruction();
   const auto* bn1 = root->operand(0);
   const auto* bn2 = root->operand(1);
-  const auto* conv = bn2->operand(0);
+  const auto* conv = bn1->operand(0);
   const auto* ip0 = conv->operand(0);
   const auto* ip1 = conv->operand(1);
+  const auto* reshape1 = bn1->operand(1);
+  const auto* reshape2 = bn1->operand(2);
+  const auto* ip2 = reshape1->operand(0);
+  const auto* ip3 = reshape2->operand(0);
 
   CompilerAnnotations annotations(module0);
 
@@ -1751,14 +1977,139 @@ ENTRY %top (arg0.36.22: f32[1,4,4,2], arg1.36.23: f32[1,1,2,2], arg2.36.24: f32[
   EXPECT_EQ(t.tgt, conv);
   EXPECT_EQ(t.input_index, 1);
 
-  unsigned count = 0;
+  unsigned num_succesful_runs = 0;
   ForwardAllocation fwd_finder(annotations);
   while (fwd_finder.Run(module0).ValueOrDie()) {
-    count++;
+    num_succesful_runs++;
   }
 
-  // Expect no forward allocations were made.
-  EXPECT_TRUE(count == 0);
+  // Depending on the order we either expect this to be executed successfully 1
+  // or 2 times.
+  EXPECT_TRUE(num_succesful_runs == 1 || num_succesful_runs == 2);
+
+  // We have added two new entires for the layer norms.
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 4);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip2, 0));
+  auto target_bn = t.tgt == bn1 ? bn1 : bn2;
+  // It was allocated for one of the batch norms.
+  EXPECT_EQ(t.tgt, target_bn);
+  EXPECT_EQ(t.input_index, 1);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], reshape1);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip3, 0));
+  // It was allocated for same batch norm due to control dependencies.
+  EXPECT_EQ(t.tgt, target_bn);
+  EXPECT_EQ(t.input_index, 2);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], reshape2);
+}
+
+TEST_F(AllocationFinderTest,
+       ForwardAllocationMultipleUsesMultipleTargetsDifferentPriority) {
+  // In this test we check that %arg2.36.24 and %arg3.36.25 get a layout even
+  // though they have multiple targets - layer norms have higher priority than
+  // elementwise ops.
+  std::string hlo = R"(
+HloModule top
+%Sum-reduction48 (x.48.45: f32[2], y.48.46: f32[2]) -> f32[2] {
+  %x.48.45 = f32[2]{0} parameter(0)
+  %y.48.46 = f32[2]{0} parameter(1)
+  ROOT %add.48.47 = f32[2]{0} add(f32[2]{0} %x.48.45, f32[2]{0} %y.48.46)
+}
+
+ENTRY %top (arg0.36.22: f32[1,4,4,2], arg1.36.23: f32[1,1,2,2], arg2.36.24: f32[1,2], arg3.36.25: f32[1,2], arg4.36.26: f32[2], arg5.36.27: f32[2]) -> (f32[1,4,4,2], f32[1,2]) {
+ %arg0.36.22 = f32[1,4,4,2]{3,2,1,0} parameter(0)
+ %arg1.36.23 = f32[1,1,2,2]{3,2,1,0} parameter(1)
+ %convolution.36.29 = f32[1,4,4,2]{3,2,1,0} convolution(f32[1,4,4,2]{3,2,1,0} %arg0.36.22, f32[1,1,2,2]{3,2,1,0} %arg1.36.23), window={size=1x1}, dim_labels=b01f_01io->b01f, metadata={op_type="Conv2D" op_name="vs/conv2d/Conv2D"}
+ %arg2.36.24 = f32[1,2]{1,0} parameter(2)
+ %arg2.36.24_r = f32[2]{0} reshape(%arg2.36.24)
+ %arg3.36.25 = f32[1,2]{1,0} parameter(3)
+ %arg3.36.25_r = f32[2]{0} reshape(%arg3.36.25)
+ %arg4.36.26 = f32[2]{0} parameter(4)
+ %arg5.36.27 = f32[2]{0} parameter(5)
+ %batch-norm-inference.36.31 = f32[1,4,4,2]{3,2,1,0} batch-norm-inference(f32[1,4,4,2]{3,2,1,0} %convolution.36.29, f32[2]{0} %arg2.36.24_r, f32[2]{0} %arg3.36.25_r, f32[2]{0} %arg4.36.26, f32[2]{0} %arg5.36.27), epsilon=0.001, feature_index=3, metadata={op_type="FusedBatchNorm" op_name="vs/batch_normalization/FusedBatchNorm"}
+ %add = f32[1,2]{1,0} add(f32[2]{0} %arg2.36.24_r, f32[2]{0} %arg3.36.25_r)
+ ROOT %tuple = (f32[1,4,4,2]{3,2,1,0}, f32[1,2]{1,0}) tuple(f32[1,4,4,2]{3,2,1,0} %batch-norm-inference.36.31, f32[1,2]{1,0} %add)
+}
+
+)";
+
+  auto config = GetModuleConfigForTest();
+  config.set_argument_count(6);
+  config.set_resource_input_count(2);
+  config.set_input_mapping({0, 1, 2, 3, 4, 5});
+  config.set_resource_update_to_input_index({0});
+  auto module = ParseHloString(hlo, config);
+  EXPECT_TRUE(module.ok());
+  auto* module0 = module.ValueOrDie().get();
+
+  const auto* root = module0->entry_computation()->root_instruction();
+  const auto* bn = root->operand(0);
+  const auto* add = root->operand(1);
+  const auto* conv = bn->operand(0);
+  const auto* ip0 = conv->operand(0);
+  const auto* ip1 = conv->operand(1);
+  const auto* reshape1 = bn->operand(1);
+  const auto* reshape2 = bn->operand(2);
+  const auto* ip2 = reshape1->operand(0);
+  const auto* ip3 = reshape2->operand(0);
+
+  CompilerAnnotations annotations(module0);
+
+  AllocationFinder finder(annotations);
+  EXPECT_TRUE(finder.Run(module0).ValueOrDie());
+
+  // Will have both of the convolution parameters
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 2);
+
+  auto t = annotations.tensor_allocation_map.at(std::make_pair(ip0, 0));
+  EXPECT_EQ(t.tgt, conv);
+  EXPECT_EQ(t.input_index, 0);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip1, 0));
+  EXPECT_EQ(t.tgt, conv);
+  EXPECT_EQ(t.input_index, 1);
+
+  unsigned num_succesful_runs = 0;
+  ForwardAllocation fwd_finder(annotations);
+  while (fwd_finder.Run(module0).ValueOrDie()) {
+    num_succesful_runs++;
+  }
+
+  // Depending on the order we either expect this to be executed successfully 1
+  // or 2 times.
+  EXPECT_TRUE(num_succesful_runs == 1 || num_succesful_runs == 2);
+
+  // We have added two new entires for the layer norms.
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 4);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip2, 0));
+  // Layer norm has priority over elementwise ops.
+  EXPECT_EQ(t.tgt, bn);
+  EXPECT_EQ(t.input_index, 1);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], reshape1);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip3, 0));
+  // Layer norm has priority over elementwise ops.
+  EXPECT_EQ(t.tgt, bn);
+  EXPECT_EQ(t.input_index, 2);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], reshape2);
 }
 
 TEST_F(AllocationFinderTest, ForwardAllocationElementwiseGetsALayout) {
@@ -1780,7 +2131,7 @@ ENTRY c1 {
   p2_r = f16[4] reshape(p2)
 
   conv = f16[1,16,16,4] convolution(p0, p1), window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
-  call = f16[1,16,16,64] call(conv, p2_r), to_apply=_pop_op_conv_biasadd
+  call = f16[1,16,16,64] fusion(conv, p2_r), kind=kCustom, calls=_pop_op_conv_biasadd
   p3 = f16[1,16,16,64] parameter(3)
   ROOT add = f16[1,16,16,64] add(p3, call)
 }
@@ -1851,6 +2202,89 @@ ENTRY c1 {
   EXPECT_EQ(t.forward_path.size(), 1);
   EXPECT_EQ(t.forward_path[0], call);
   EXPECT_EQ(t.backward_path.size(), 0);
+}
+
+TEST_F(AllocationFinderTest, ForwardAllocationDontLookThroughCasts) {
+  // Check the layout is not forwarded to the element wise op argument as it's
+  // casted.
+  std::string hlo = R"(
+HloModule top
+
+_pop_op_conv_biasadd {
+  %arg_0 = f16[1,16,16,4] parameter(0)
+  %arg_1 = f16[4] parameter(1)
+  bcast = f16[1,16,16,4] broadcast(arg_1), dimensions={3}
+  ROOT %add = f16[1,16,16,4] add(arg_0, bcast)
+}
+
+ENTRY c1 {
+  p0 = f16[1,16,16,2] parameter(0)
+  p1 = f16[3,3,2,4] parameter(1)
+  p2 = f16[2,2] parameter(2)
+  p2_r = f16[4] reshape(p2)
+
+  conv = f16[1,16,16,4] convolution(p0, p1), window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
+  call = f16[1,16,16,64] fusion(conv, p2_r), kind=kCustom, calls=_pop_op_conv_biasadd
+  p3 = f32[1,16,16,64] parameter(3)
+  p3.c = f16[1,16,16,64] convert(p3)
+  ROOT add = f16[1,16,16,64] add(p3.c, call)
+}
+)";
+
+  auto config = GetModuleConfigForTest();
+  config.set_argument_count(3);
+  config.set_resource_input_count(3);
+  config.set_input_mapping({0, 1, 2, 3});
+  config.set_resource_update_to_input_index({0});
+  auto module = ParseHloString(hlo, config);
+  EXPECT_TRUE(module.ok());
+  auto* module0 = module.ValueOrDie().get();
+
+  const auto* root = module0->entry_computation()->root_instruction();
+  const auto* add = root;
+  const auto* call = add->operand(1);
+  const auto* conv = call->operand(0);
+  const auto* ip2_r = call->operand(1);
+  const auto* ip2 = ip2_r->operand(0);
+  const auto* ip1 = conv->operand(1);
+  const auto* ip0 = conv->operand(0);
+
+  CompilerAnnotations annotations(module0);
+
+  AllocationFinder finder(annotations);
+  EXPECT_TRUE(finder.Run(module0).ValueOrDie());
+
+  // Will have both of the convolution parameters
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 2);
+
+  auto t = annotations.tensor_allocation_map.at(std::make_pair(ip0, 0));
+  EXPECT_EQ(t.tgt, conv);
+  EXPECT_EQ(t.input_index, 0);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip1, 0));
+  EXPECT_EQ(t.tgt, conv);
+  EXPECT_EQ(t.input_index, 1);
+
+  ForwardAllocation fwd_finder(annotations);
+  unsigned num_succesful_runs = 0;
+  while (fwd_finder.Run(module0).ValueOrDie()) {
+    num_succesful_runs++;
+  }
+
+  // We expect this to be executed successfully 1 time.
+  EXPECT_TRUE(num_succesful_runs == 1);
+
+  // We have added one new entry for the bias add
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 3);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip2, 0));
+  EXPECT_EQ(t.tgt, call);
+  EXPECT_EQ(t.input_index, 1);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 1);
+  EXPECT_EQ(t.backward_path[0], ip2_r);
 }
 
 TEST_F(AllocationFinderTest, ForwardAllocationElementwiseGetsALayoutWithGTE) {
@@ -1942,6 +2376,80 @@ ENTRY %top (arg0.78.22: f32[1,4,4,2], arg1: f32[1,1,2,2], arg2: f32[2], arg3: f3
   EXPECT_EQ(t.layout_output_idx, 2);
   EXPECT_EQ(t.forward_path.size(), 1);
   EXPECT_EQ(t.forward_path[0], gte);
+  EXPECT_EQ(t.backward_path.size(), 0);
+}
+
+TEST_F(AllocationFinderTest, ForwardAllocationCustomPoplibsOp) {
+  // Check that the layout gets forwarded to a custom op.
+  std::string hlo = R"(
+HloModule top
+ENTRY %top (arg0.78.22: f32[1,4,4,2], arg1: f32[1,1,2,2], arg2: f32[2], arg3: f32[2], arg3: f32[2]) -> (f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) {
+  %arg0 = f32[1,4,4,2]{3,2,1,0} parameter(0)
+  %arg1 = f32[1,1,2,2]{3,2,1,0} parameter(1)
+  %convolution = f32[1,4,4,2]{3,2,1,0} convolution(f32[1,4,4,2]{3,2,1,0} %arg0, f32[1,1,2,2]{3,2,1,0} %arg1), window={size=1x1}, dim_labels=b01f_01io->b01f
+  %arg2 = f32[2]{0} parameter(2)
+  %arg3 = f32[2]{0} parameter(3)
+  ROOT %cc = (f32[1,4,4,2]{3,2,1,0}, f32[2]{0}, f32[2]{0}) custom-call(f32[1,4,4,2]{3,2,1,0} %convolution, f32[2]{0} %arg2, f32[2]{0} %arg3), custom_call_target="Popnn::GroupNormInference", opaque="{\"allocating_indexes\":[],\"layout_dependencies\":{\"keys\":[1,2],\"values\":[0,0]},\"epsilon\":0.001,\"feature_index\":3,\"num_inplace_operands\":0}\n"
+}
+
+)";
+
+  auto config = GetModuleConfigForTest();
+  auto module = ParseHloString(hlo, config);
+  EXPECT_TRUE(module.ok());
+  auto* module0 = module.ValueOrDie().get();
+
+  const auto* root = module0->entry_computation()->root_instruction();
+  const auto* custom_op = root;
+  const auto* conv = custom_op->operand(0);
+  const auto* ip2 = custom_op->operand(1);
+  const auto* ip3 = custom_op->operand(2);
+  const auto* ip1 = conv->operand(1);
+  const auto* ip0 = conv->operand(0);
+
+  CompilerAnnotations annotations(module0);
+
+  AllocationFinder finder(annotations);
+  EXPECT_TRUE(finder.Run(module0).ValueOrDie());
+
+  // Will have both of the convolution parameters
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 2);
+
+  auto t = annotations.tensor_allocation_map.at(std::make_pair(ip0, 0));
+  EXPECT_EQ(t.tgt, conv);
+  EXPECT_EQ(t.input_index, 0);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip1, 0));
+  EXPECT_EQ(t.tgt, conv);
+  EXPECT_EQ(t.input_index, 1);
+
+  ForwardAllocation fwd_finder(annotations);
+  unsigned num_succesful_runs = 0;
+  while (fwd_finder.Run(module0).ValueOrDie()) {
+    num_succesful_runs++;
+  }
+
+  // Depending on the order we either expect this to be executed successfully 1
+  // or 2 times.
+  EXPECT_TRUE(num_succesful_runs == 1 || num_succesful_runs == 2);
+
+  // We have added one new entry for the bias add
+  EXPECT_EQ(annotations.tensor_allocation_map.size(), 4);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip2, 0));
+  EXPECT_EQ(t.tgt, custom_op);
+  EXPECT_EQ(t.input_index, 1);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
+  EXPECT_EQ(t.backward_path.size(), 0);
+
+  t = annotations.tensor_allocation_map.at(std::make_pair(ip3, 0));
+  EXPECT_EQ(t.tgt, custom_op);
+  EXPECT_EQ(t.input_index, 2);
+  EXPECT_EQ(t.layout, conv);
+  EXPECT_EQ(t.layout_output_idx, 0);
+  EXPECT_EQ(t.forward_path.size(), 0);
   EXPECT_EQ(t.backward_path.size(), 0);
 }
 

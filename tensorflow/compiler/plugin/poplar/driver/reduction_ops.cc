@@ -109,23 +109,24 @@ bool IsPoplibsPool(const HloInstruction* inst,
   return (reduction_count <= 2);
 }
 
-static Literal GetIdentityConstantLiteral(const HloInstruction* root) {
+static Literal GetIdentityConstantLiteral(const HloInstruction* root,
+                                          const HloInstruction* reduce) {
   switch (root->opcode()) {
     case HloOpcode::kAdd:
     case HloOpcode::kAnd:
     default:
-      return LiteralUtil::Zero(root->shape().element_type());
+      return LiteralUtil::Zero(reduce->shape().element_type());
     case HloOpcode::kMultiply:
     case HloOpcode::kOr:
-      return LiteralUtil::One(root->shape().element_type());
+      return LiteralUtil::One(reduce->shape().element_type());
     case HloOpcode::kMaximum:
     case HloOpcode::kGe:
     case HloOpcode::kGt:
-      return LiteralUtil::MinValue(root->shape().element_type());
+      return LiteralUtil::MinValue(reduce->shape().element_type());
     case HloOpcode::kMinimum:
     case HloOpcode::kLe:
     case HloOpcode::kLt:
-      return LiteralUtil::MaxValue(root->shape().element_type());
+      return LiteralUtil::MaxValue(reduce->shape().element_type());
   }
 }
 
@@ -240,11 +241,22 @@ static std::vector<unsigned int> GetShuffleOutputDimensionsForPoplar(
   return shuffle_out;
 }
 
+static poplar::Type getReductionType(const popnn::PoolingType& pooling_type,
+                                     const poplar::Type& input_type) {
+  switch (pooling_type) {
+    case popnn::PoolingType::AVG:
+    case popnn::PoolingType::SUM:
+      return (input_type == poplar::HALF) ? poplar::FLOAT : input_type;
+    case popnn::PoolingType::MAX:
+      return input_type;
+  }
+}
+
 static popnn::pooling::PoolParams GetPoplibsPoolParams(
     const popnn::PoolingType& pooling_type, const Window& window,
     const std::vector<std::size_t>& input_shape,
     const std::set<unsigned int>& reduction_dims,
-    const poplar::Type& data_type) {
+    const poplar::Type& input_data_type) {
   // TODO assume here that batch dimension and the channel dimension order
   // doesn't actually matter - it's just the non field dimensions.
   const auto batch_size = input_shape.front();
@@ -264,6 +276,8 @@ static popnn::pooling::PoolParams GetPoplibsPoolParams(
     padding_lower.push_back((int)d.padding_low());
     padding_upper.push_back((int)d.padding_high());
   }
+
+  auto data_type = getReductionType(pooling_type, input_data_type);
 
   return {pooling_type, input_field_shape, kernel_shape,
           stride,       padding_lower,     padding_upper,
@@ -301,7 +315,7 @@ StatusOr<poplar::program::Program> CreateSimpleReduction(
                                         seq, GetDebugName(inst));
 
     // Apply initial value
-    Literal identity_literal = GetIdentityConstantLiteral(root);
+    Literal identity_literal = GetIdentityConstantLiteral(root, inst);
     auto* init_inst = inst->operand(1);
     if (!(init_inst->IsConstant() &&
           init_inst->literal() == identity_literal)) {
@@ -411,7 +425,7 @@ StatusOr<poplar::program::Program> CreateSimpleWindowReduction(
     seq.add(poplar::program::Execute(cs));
 
     // Apply initial value
-    Literal identity_literal = GetIdentityConstantLiteral(root);
+    Literal identity_literal = GetIdentityConstantLiteral(root, inst);
     auto* init_inst = inst->operand(1);
     if (!(init_inst->IsConstant() &&
           init_inst->literal() == identity_literal)) {
@@ -451,25 +465,44 @@ StatusOr<poplar::program::Program> CreatePoplibsWindowReduction(
     const HloInstruction* pooling_inst;
 
     popnn::PoolingType reduction_type;
-
-    // Find the type of the reduction
-    if (inst->opcode() == HloOpcode::kCall) {
-      if (IsPopOpsCall(inst, "avg_pool")) {
-        reduction_type = popnn::PoolingType::AVG;
-        pooling_inst = inst->to_apply()->root_instruction()->operand(0);
-      } else if (IsPopOpsCall(inst, "max_pool")) {
-        reduction_type = popnn::PoolingType::MAX;
-        pooling_inst = inst->to_apply()->root_instruction();
-      } else {
-        return xla::FailedPrecondition("Unknown outlined op");
+    switch (inst->opcode()) {
+      case HloOpcode::kFusion: {
+        if (IsPopOpsFusion(inst, "avg_pool")) {
+          reduction_type = popnn::PoolingType::AVG;
+          pooling_inst = inst->fused_instructions_computation()
+                             ->root_instruction()
+                             ->operand(0);
+        } else if (IsPopOpsFusion(inst, "max_pool")) {
+          reduction_type = popnn::PoolingType::MAX;
+          pooling_inst =
+              inst->fused_instructions_computation()->root_instruction();
+        } else {
+          return xla::FailedPrecondition("Unknown outlined fusion.");
+        }
+        break;
       }
-    } else if (inst->to_apply()->root_instruction()->opcode() ==
-               HloOpcode::kMaximum) {
-      reduction_type = popnn::PoolingType::MAX;
-      pooling_inst = inst;
-    } else {
-      reduction_type = popnn::PoolingType::SUM;
-      pooling_inst = inst;
+      case HloOpcode::kReduceWindow: {
+        pooling_inst = inst;
+        switch (inst->to_apply()->root_instruction()->opcode()) {
+          case HloOpcode::kMaximum: {
+            reduction_type = popnn::PoolingType::MAX;
+            break;
+          }
+          case HloOpcode::kAdd: {
+            reduction_type = popnn::PoolingType::SUM;
+            break;
+          }
+          default: {
+            return xla::FailedPrecondition("Unsupported window reduction %s.",
+                                           inst->name());
+          }
+        }
+        break;
+      }
+      default: {
+        return xla::FailedPrecondition("Unsupported window reduction %s.",
+                                       inst->name());
+      }
     }
 
     // Find the input tensors
@@ -516,7 +549,7 @@ StatusOr<poplar::program::Program> CreatePoplibsWindowReduction(
     HloInstruction* root(pooling_inst->to_apply()->root_instruction());
 
     // What is the default base case for the op, MAX: -largest, SUM: 0, etc.
-    Literal identity_literal = GetIdentityConstantLiteral(root);
+    Literal identity_literal = GetIdentityConstantLiteral(root, inst);
     auto* init_inst = pooling_inst->operand(1);
 
     // Apply the base case if necessary
@@ -595,7 +628,7 @@ StatusOr<poplar::program::Program> CreateSimpleSelectAndScatter(
   LayoutUtil::ClearLayout(&partial_shape);
   partial_shape.mutable_layout()->set_format(DENSE);
 
-  Literal identity_literal = GetIdentityConstantLiteral(scatter_root);
+  Literal identity_literal = GetIdentityConstantLiteral(scatter_root, inst);
 
   poplar::Tensor identity_val;
   TF_ASSIGN_OR_RETURN(
@@ -732,7 +765,8 @@ StatusOr<poplar::program::Program> CreateBwdMaxPool(
   TF_ASSIGN_OR_RETURN(fwd_max_pool_output,
                       FindInstructionInput(tensor_map, res, inst, 2, seq));
 
-  HloInstruction* reduce_window = inst->to_apply()->root_instruction();
+  HloInstruction* reduce_window =
+      inst->fused_instructions_computation()->root_instruction();
   const Window& window(reduce_window->window());
   if (window.dimensions().size() != 4) {
     return xla::FailedPrecondition("Poplar pooling only supports 2D pooling");
@@ -768,7 +802,8 @@ StatusOr<poplar::program::Program> CreatePaddingReduceWindow(
 
   poplar::Graph& graph = GetGraph(res, inst);
 
-  const HloInstruction* root = inst->to_apply()->root_instruction();
+  const HloInstruction* root =
+      inst->fused_instructions_computation()->root_instruction();
   const Window& window(root->window());
   poplar::Tensor out;
   TF_ASSIGN_OR_RETURN(out, FindInstructionInput(tensor_map, res, inst, 0, seq));
