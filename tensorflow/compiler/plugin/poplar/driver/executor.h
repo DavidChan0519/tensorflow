@@ -25,6 +25,7 @@ limitations under the License.
 #include "tensorflow/stream_executor/host/host_stream.h"
 #include "tensorflow/stream_executor/host/host_timer.h"
 
+#include "tensorflow/compiler/plugin/poplar/driver/compiler_annotations.h"
 #include "tensorflow/compiler/plugin/poplar/driver/input_output_aliasing_map.h"
 #include "tensorflow/compiler/plugin/poplar/driver/trace.pb.h"
 
@@ -50,6 +51,7 @@ limitations under the License.
 #include <mutex>
 
 #include <poplar/Device.hpp>
+#include <poplar/DeviceManager.hpp>
 #include <poplar/Engine.hpp>
 #include <poplar/OptionFlags.hpp>
 #include <poplar/Tensor.hpp>
@@ -72,7 +74,7 @@ enum PoplarProgramType {
 
 class PoplarExecutable;
 
-std::string GetInfeedCopyHandle(int64 parameter, int64 index);
+std::string GetInfeedCopyHandle(const std::string& name, int64 shape_index);
 std::string GetInputCopyHandle(int64 parameter, int64 index);
 std::string GetOutputCopyHandle(int64 output_index, int64 flat_tensor_index);
 
@@ -318,6 +320,8 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   const int device_ordinal() const;
 
+  static poplar::DeviceManager& GetDeviceManager();
+
  private:
   struct TensorControl {
     size_t size = 0;
@@ -471,8 +475,7 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   // Connect buffers provided by infeed transfer manager to Poplar
   // HostToDevice FIFO
-  void ConnectInfeedToStreamCallback(
-      const std::vector<const HloInstruction*>& infeed_instructions);
+  void ConnectInfeedToStreamCallback(const InfeedMap& infeed_map);
 
   void DeferredDeallocation();
 

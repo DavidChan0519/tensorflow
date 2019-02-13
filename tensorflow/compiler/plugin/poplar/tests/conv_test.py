@@ -94,6 +94,7 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
         cs_list = tu.get_compute_sets_from_report(s)
 
         ok = ['progIdCopy',
+              'Copy_*actsRearranged',
               'host-exchange-local-copy-',
               'cnv3*/convolution.*/Conv_3x3',
               'ba3*/fusion/addToChannel']
@@ -169,8 +170,8 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
         cs_list = tu.get_compute_sets_from_report(s)
 
         ok = ['progIdCopy',
+              'Copy_*actsRearranged',
               'host-exchange-local-copy-',
-              'Copy_*Conv',
               'cnv5*/convolution.*/Conv_1x1',
               'ba5*/fusion/addToChannel']
         self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
@@ -205,7 +206,8 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
       ok = ['progIdCopy',
             'host-exchange-local-copy-',
             'Copy_',
-            'Conv2DBackpropInput/fusion*/Conv_2x2']
+            'Conv2DBackpropInput/fusion*/Conv_2x2',
+            'Conv2DBackpropInput/fusion*/WeightTranspose']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
 
@@ -279,7 +281,6 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
 
       ok = ['progIdCopy',
             'host-exchange-local-copy-',
-            'Copy_',
             'depthwise/convolution.*/Conv_1x1',
             'add/fusion*/addToChannel']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
@@ -427,7 +428,6 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
 
       ok = ['progIdCopy',
             'host-exchange-local-copy-',
-            'Copy_',
             'DepthwiseConv2dNativeBackpropFilter/fusion*/Conv_6x6']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 

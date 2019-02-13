@@ -117,6 +117,11 @@ std::string GetOutputCopyHandle(int64 output_index, int64 flat_tensor_index) {
                                      flat_tensor_index);
 }
 
+std::string GetInfeedCopyHandle(const std::string& name, int64 shape_index) {
+  return tensorflow::strings::Printf("infeed_%s.%lld", name.c_str(),
+                                     shape_index);
+}
+
 se::host::HostStream* AsPoplarStream(se::Stream* stream) {
   DCHECK(stream != nullptr);
   return dynamic_cast<se::host::HostStream*>(stream->implementation());
@@ -187,13 +192,14 @@ void PoplarExecutor::Deallocate(se::DeviceMemoryBase* mem) {
 }
 
 void PoplarExecutor::ConnectInfeedToStreamCallback(
-    const std::vector<const HloInstruction*>& infeed_instructions) {
+    const InfeedMap& infeed_map) {
   // Buffer is already placed into xfeed manager by client->TransferToInfeed
-  for (int i = 0; i < infeed_instructions.size(); ++i) {
-    const auto& instr = infeed_instructions[i];
-    if (instr->infeed_config() == "dequeue") {
+  for (const auto& infeed : infeed_map) {
+    const auto& instr = infeed.first;
+    const auto& shapes = infeed.second;
+    for (int j = 0; j < shapes.size(); ++j) {
       current_engine_->connectStreamToCallback(
-          infeed_instructions[i]->name(), [&](void* dest) {
+          GetInfeedCopyHandle(instr->name(), j), [&](void* dest) {
             auto* xfeed_manager = GetXfeedManager(ordinal_);
             auto* xfeed_buffer =
                 xfeed_manager->infeed()->BlockingDequeueBuffer();
@@ -306,6 +312,7 @@ bool PoplarExecutor::HostCallback(se::Stream* stream,
 bool PoplarExecutor::HostCallback(se::Stream* stream,
                                   std::function<Status()> callback) {
   AsPoplarStream(stream)->EnqueueTask(callback);
+  return true;
 }
 
 bool PoplarExecutor::CreateStreamDependency(se::Stream* dependent,
@@ -375,9 +382,6 @@ Status PoplarExecutor::ConfigurePoplarDevice(
   if (!DeviceConfigurationsEqual(cfg, current_config_) || !device_open_) {
     current_config_ = cfg;
     try {
-      static poplar::DeviceManager device_mgr =
-          poplar::DeviceManager::getDeviceManager();
-
       if (device_open_) {
         VLOG(1) << "Detaching ordinal " << ordinal_
                 << " from poplar device: type " << GetDeviceTargetName();
@@ -393,7 +397,7 @@ Status PoplarExecutor::ConfigurePoplarDevice(
       bool have_ipu_hardware = false;
 
       if (getenv(s_force_ipu_model) == nullptr) {
-        auto device_list = device_mgr.getDevices();
+        auto device_list = GetDeviceManager().getDevices();
         for (const auto& d : device_list) {
           if (d.getTarget().getTargetType() == poplar::TargetType::IPU) {
             have_ipu_hardware = true;
@@ -404,7 +408,7 @@ Status PoplarExecutor::ConfigurePoplarDevice(
 
       if (have_ipu_hardware) {
         // Hardware devices
-        auto device_list = device_mgr.getDevices();
+        auto device_list = GetDeviceManager().getDevices();
 
         if (current_config_.device_config_size() == 0) {
           // Default case - 1 single TF device with one single IPU
@@ -703,7 +707,7 @@ void PoplarExecutor::FlattenedDeviceMemoryList(
     InputPairList& list, const xla::Shape& shape, void* base,
     const InputOutputAliasingMap::InputInfo& input_info) {
   TensorControl* tc = static_cast<TensorControl*>(base);
-  if (xla::ShapeUtil::IsTuple(shape)) {
+  if (shape.IsTuple()) {
     void** ptrs = reinterpret_cast<void**>(tc->data);
     for (unsigned int t = 0; t < xla::ShapeUtil::TupleElementCount(shape);
          t++) {
@@ -747,7 +751,7 @@ void PoplarExecutor::FlattenedOutputDeviceMemoryList(
     OutputPairList& list, const xla::Shape& shape, void* base,
     const InputOutputAliasingMap::OutputInfo& output_info) {
   TensorControl* tc = static_cast<TensorControl*>(base);
-  if (xla::ShapeUtil::IsTuple(shape)) {
+  if (shape.IsTuple()) {
     void** ptrs = reinterpret_cast<void**>(tc->data);
     for (unsigned int t = 0; t < xla::ShapeUtil::TupleElementCount(shape);
          t++) {
@@ -770,7 +774,7 @@ void PoplarExecutor::UpdateOutputsHandleMap(
   std::vector<void*> outputs;
   std::vector<xla::Shape> shapes;
 
-  if (ShapeUtil::IsTuple(shape)) {
+  if (shape.IsTuple()) {
     TensorControl* tc = static_cast<TensorControl*>(retbuf.opaque());
     void** ptrs = reinterpret_cast<void**>(tc->data);
     for (int64 i = 0; i < ShapeUtil::TupleElementCount(shape); i++) {
@@ -899,7 +903,7 @@ se::DeviceMemoryBase PoplarExecutor::HandleOutputBuffer(
     const PoplarExecutor::OutputAllocation& allocation_info,
     const xla::Shape& shape, const int64 output_index, int64& flat_tensor_index,
     const Args& args, const InputOutputAliasingMap::OutputInfo& output_info) {
-  if (!ShapeUtil::IsTuple(shape)) {
+  if (!shape.IsTuple()) {
     se::DeviceMemoryBase buf = allocation_info.GetAllocation(
         allocator, shape, output_index, flat_tensor_index, args, output_info,
         args_map_, ordinal_);
@@ -930,11 +934,11 @@ se::DeviceMemoryBase PoplarExecutor::GetOutputBuffer(
     const InputOutputAliasingMap& input_output_aliasing_map) {
   // Get all output shapes
   std::vector<xla::Shape> shapes;
-  const int64 size = ShapeUtil::IsTuple(shape)
+  const int64 size = shape.IsTuple()
                          ? xla::ShapeUtil::ByteSizeOf(shape, sizeof(void*))
                          : xla::ShapeUtil::ByteSizeOf(shape);
 
-  if (ShapeUtil::IsTuple(shape)) {
+  if (shape.IsTuple()) {
     for (int64 i = 0; i < ShapeUtil::TupleElementCount(shape); i++) {
       shapes.push_back(ShapeUtil::GetTupleElementShape(shape, i));
     }
@@ -956,7 +960,7 @@ se::DeviceMemoryBase PoplarExecutor::GetOutputBuffer(
                            start_flat_tensor_index, args, output_info);
     ptrs.push_back(out.opaque());
   }
-  if (ShapeUtil::IsTuple(shape)) {
+  if (shape.IsTuple()) {
     se::DeviceMemoryBase allocated =
         allocator->Allocate(0, size, false).ConsumeValueOrDie().Forget();
     TensorControl* tc = reinterpret_cast<TensorControl*>(allocated.opaque());
@@ -1201,6 +1205,12 @@ void PoplarExecutor::AboutToFreeEngine(poplar::Engine* engine) {
 }
 
 const int PoplarExecutor::device_ordinal() const { return ordinal_; }
+
+poplar::DeviceManager& PoplarExecutor::GetDeviceManager() {
+  static poplar::DeviceManager device_mgr =
+      poplar::DeviceManager::createDeviceManager();
+  return device_mgr;
+}
 
 StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
     perftools::gputools::StreamExecutor* executor,
