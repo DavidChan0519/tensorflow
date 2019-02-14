@@ -29,7 +29,14 @@ namespace poplarplugin {
 static bool HaveSharding(HloComputation* comp) {
   for (auto* inst : comp->instructions()) {
     if (inst->has_sharding()) {
-      return true;
+      auto sharding = inst->sharding();
+      if (IsSupportedSharding(sharding)) {
+        return true;
+      }
+      LOG(INFO) << "Instruction " << inst->name()
+                << " has unsupported sharding " << sharding.ToString()
+                << " which will be ignored.";
+      inst->clear_sharding();
     }
   }
   return false;
@@ -51,7 +58,7 @@ static bool HaveSharding(HloModule* module) {
 
 StatusOr<bool> ShardingPass::Run(HloModule* module) {
   if (!HaveSharding(module)) {
-    return true;
+    return false;
   }
 
   for (auto* comp : module->computations()) {
@@ -67,11 +74,13 @@ StatusOr<bool> ShardingPass::Run(HloModule* module) {
     bool done = false;
     while (!done) {
       done = true;
+      bool made_progress = false;
       for (auto* inst : comp->MakeInstructionPostOrder()) {
         if (!inst->has_sharding()) {
           for (auto* u : inst->users()) {
             if (u->has_sharding()) {
               inst->set_sharding(u->sharding());
+              made_progress = true;
               break;
             }
           }
@@ -80,6 +89,7 @@ StatusOr<bool> ShardingPass::Run(HloModule* module) {
           for (auto* u : inst->operands()) {
             if (u->has_sharding()) {
               inst->set_sharding(u->sharding());
+              made_progress = true;
               break;
             }
           }
@@ -87,6 +97,11 @@ StatusOr<bool> ShardingPass::Run(HloModule* module) {
         if (!inst->has_sharding()) {
           done = false;
         }
+      }
+      if (!done && !made_progress) {
+        return xla::FailedPrecondition(
+            "Could not apply sharding information to the %s computation.",
+            comp->name().c_str());
       }
     }
   }
@@ -153,15 +168,21 @@ StatusOr<bool> ShardingPass::Run(HloModule* module) {
       for (auto ipu : ipu_nums) {
         added = true;
         auto range = ipu_map.equal_range(ipu);
-        auto copy_inst = comp->AddInstruction(HloInstruction::CreateCustomCall(
-            inst->shape(), {inst}, "inter_ipu_copy", ""));
-        copy_inst->set_sharding(HloSharding::AssignDevice(ipu));
+        HloInstruction* inst_on_ipu;
+        if (inst->opcode() == HloOpcode::kConstant ||
+            IsPopOpsFusion(inst, "wide_const")) {
+          inst_on_ipu = comp->AddInstruction(inst->Clone());
+        } else {
+          inst_on_ipu = comp->AddInstruction(HloInstruction::CreateCustomCall(
+              inst->shape(), {inst}, "inter_ipu_copy", ""));
+        }
+        inst_on_ipu->set_device_sharding(ipu);
 
         for (auto user = range.first; user != range.second; ++user) {
           auto* u = user->second;
           for (int operand = 0; operand < u->operand_count(); operand++) {
             if (u->operand(operand) == inst) {
-              u->ReplaceOperandWith(operand, copy_inst);
+              u->ReplaceOperandWith(operand, inst_on_ipu);
             }
           }
         }

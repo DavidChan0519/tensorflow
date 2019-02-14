@@ -5,6 +5,7 @@ package(default_visibility = ["//visibility:public"])
 load("//tensorflow/compiler/xla/tests:build_defs.bzl", "xla_test")
 load("@local_config_poplar//poplar:build_defs.bzl", "poplar_lib_directory")
 load("@local_config_poplar//poplar:build_defs.bzl", "poplibs_lib_directory")
+load("@local_config_poplar//poplar:build_defs.bzl", "tf_poplar_build_tag")
 load("//tensorflow:tensorflow.bzl", "tf_cc_test")
 load("//tensorflow:tensorflow.bzl", "tf_gen_op_wrapper_py")
 load("//tensorflow:tensorflow.bzl", "tf_custom_op_py_library")
@@ -81,6 +82,7 @@ cc_library(
         "driver/matcher_predicates.cc",
         "driver/not_supported_gather_expander.cc",
         "driver/not_supported_scatter_expander.cc",
+        "driver/root_token_replacer.cc",
         "driver/scheduler.cc",
         "driver/sharding_pass.cc",
         "driver/single_hlo_matcher.cc",
@@ -116,6 +118,7 @@ cc_library(
         "driver/meta_graph.h",
         "driver/not_supported_gather_expander.h",
         "driver/not_supported_scatter_expander.h",
+        "driver/root_token_replacer.h",
         "driver/scheduler.h",
         "driver/sharding_pass.h",
         "driver/single_hlo_matcher.h",
@@ -213,6 +216,9 @@ cc_library(
         "driver/custom_ops/popnn_ops.h",
         "driver/custom_ops/popops_ops.h",
         "driver/custom_ops/poprand_ops.h",
+    ],
+    copts = [
+        "-DTF_POPLAR_BUILD_TAG=" + tf_poplar_build_tag(),
     ],
     deps = [
         ":common",
@@ -595,23 +601,6 @@ tf_cc_test(
     ],
 )
 
-tf_cc_test(
-    name = "ipu_infeed_test",
-    srcs = ["tests/ipu_infeed_test.cc"],
-    size = "small",
-    extra_copts = [
-        "-fexceptions",
-    ],
-    deps = [
-        ":poplar_lib",
-        ":test_utils",
-        "//tensorflow/compiler/xla/service:hlo_matchers",
-        "//tensorflow/compiler/xla/tests:hlo_test_base",
-        "//tensorflow/compiler/xla/tests:client_library_test_base",
-        "//tensorflow/compiler/xla/client/lib:arithmetic",
-    ],
-)
-
 xla_test(
     name = "fused_batch_norm_test",
     srcs = ["tests/fused_batch_norm_test.cc"],
@@ -697,6 +686,17 @@ tf_cc_test(
 tf_cc_test(
     name = "not_supported_scatter_expander_test",
     srcs = ["tests/not_supported_scatter_expander_test.cc"],
+    deps = [
+        ":optimizers",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+    ],
+)
+
+tf_cc_test(
+    name = "root_token_replacer_test",
+    srcs = ["tests/root_token_replacer_test.cc"],
+    size = "small",
     deps = [
         ":optimizers",
         "//tensorflow/compiler/xla/service:hlo_matchers",
@@ -1141,25 +1141,6 @@ py_test(
     srcs_version = "PY2AND3",
 )
 
-py_test(
-    name = "datastream_test",
-    size = "medium",
-    srcs = ["tests/datastream_test.py"],
-    deps = [
-        ":ipu_ops_py",
-        ":pop_datastream_ops_py",
-        "//tensorflow/compiler/xla/python:xla_client",
-        "//tensorflow/compiler/tests:xla_test",
-        "//tensorflow/python:array_ops",
-        "//tensorflow/python:framework",
-        "//tensorflow/python:layers",
-        "//tensorflow/python:math_ops",
-        "//tensorflow/python:platform",
-        "//tensorflow/python/ops/poplar:poplar",
-    ],
-    srcs_version = "PY2AND3",
-)
-
 test_suite(
     name = "all_tests",
     tests = [
@@ -1210,9 +1191,8 @@ test_suite(
         "popops_custom_ops_test",
         "not_supported_gather_expander_test",
         "not_supported_scatter_expander_test",
-        "ipu_infeed_test",
         "group_norm_test",
-        "datastream_test"
+        "root_token_replacer_test"
     ],
 )
 

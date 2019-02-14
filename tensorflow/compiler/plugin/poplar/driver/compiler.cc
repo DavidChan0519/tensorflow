@@ -45,6 +45,7 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/not_supported_scatter_expander.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/platform_id.h"
+#include "tensorflow/compiler/plugin/poplar/driver/root_token_replacer.h"
 #include "tensorflow/compiler/plugin/poplar/driver/scheduler.h"
 #include "tensorflow/compiler/plugin/poplar/driver/sharding_pass.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
@@ -156,6 +157,19 @@ bool GetConstantOutput(const HloInstruction* root, const Shape& layout,
       result.emplace_back(std::move(sub_result));
     }
     return true;
+  }
+  return false;
+}
+
+bool AnyComputationHasSideEffects(const HloModule* module) {
+  for (const auto& comp : module->computations()) {
+    if (IsRepeatCall(comp) || IsPopOpsFusion(comp)) {
+      continue;
+    }
+
+    if (comp->HasSideEffect()) {
+      return true;
+    }
   }
   return false;
 }
@@ -296,7 +310,6 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     simplifier_opts.set_is_layout_sensitive(false);
     simplifier_opts.set_enable_conv_simplification(false);
     simplifier_opts.set_enable_dot_strength_reduction(false);
-    simplifier_opts.set_enable_permutation_sort_replacement(false);
     simplifier_opts.set_enable_window_reduce_to_reduce_replacement(false);
 
     HloPassPipeline pipeline("IPU");
@@ -311,6 +324,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     pipeline.AddPass<HloCSE>(false);
     pipeline.AddPass<HloPassFix<AlgebraicSimplifier>>(simplifier_opts);
     pipeline.AddPass<SortSimplifier>();
+    pipeline.AddPass<RootTokenReplacer>();
     pipeline.AddPass<ReshapeMover>();
     pipeline.AddPass<MapInliner>();
     pipeline.AddPass<HloPassFix<AlgebraicSimplifier>>(simplifier_opts);
@@ -343,6 +357,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     pipeline.AddPass<HloDCE>();
     pipeline.AddPass<InplaceFinder>(resources.annotations);
     pipeline.AddPass<ShardingPass>();
+    pipeline.AddPass<HloDCE>();
     pipeline.AddPass<ExpressionOutliner>(resources.annotations);
     pipeline.AddPass<HloSubcomputationUnification>();
     pipeline.AddPass<ConvolutionClassifier>(resources.annotations);
@@ -378,8 +393,13 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
                        poplarExecutor->AlwaysRearrangeCopiesOnTheHost());
 
   std::vector<std::vector<Literal>> constant_output;
-  const auto is_constant_graph = GetConstantOutput(
+  const bool is_constant_output = GetConstantOutput(
       entry->root_instruction(), comp_layout->shape(), constant_output);
+
+  const bool any_computation_has_side_effects =
+      AnyComputationHasSideEffects(module.get());
+  const auto is_constant_graph =
+      is_constant_output && !any_computation_has_side_effects;
 
   std::string map_json;
   std::vector<uint64> remaped_output;
@@ -409,9 +429,12 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       resources.main_graph.outputVertexGraph(stream, progs);
     }
 
-    is_remap_graph = AreAllOutputsParameters(
+    const bool all_outputs_are_parameters = AreAllOutputsParameters(
         entry->root_instruction(), visitor.GetNonStandardParameterLayout(),
         remaped_output);
+
+    is_remap_graph =
+        all_outputs_are_parameters && !any_computation_has_side_effects;
     if (is_remap_graph) {
       VLOG(1) << "Skip engine compilation - all outputs are inputs";
     } else {
@@ -469,7 +492,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       std::move(profile_index_map), std::move(engine),
       std::move(resources.annotations.input_output_aliasing_map),
       is_constant_graph, std::move(constant_output), is_remap_graph,
-      std::move(remaped_output), std::move(resources.annotations.infeed_map));
+      std::move(remaped_output), std::move(resources.annotations.infeed_infos));
   executable.reset(poplar_executable);
 
   if (poplarExecutor->HaveExecutableCache()) {

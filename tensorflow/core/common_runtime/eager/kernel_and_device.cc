@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "tensorflow/core/common_runtime/eager/kernel_and_device.h"
 
+#include "absl/strings/match.h"
 #include "tensorflow/core/common_runtime/device_factory.h"
 #include "tensorflow/core/common_runtime/eager/attr_builder.h"
 #include "tensorflow/core/common_runtime/process_function_library_runtime.h"
@@ -95,10 +96,24 @@ Status KernelAndDeviceFunc::Init(const NodeDef& ndef,
           "Failed to parse config_proto attribute as tensorflow::ConfigProto "
           "proto.");
     }
-    options.optimize_graph_fn =
-        std::bind(grappler::OptimizeGraph, std::placeholders::_1,
-                  std::placeholders::_2, std::placeholders::_3,
-                  std::placeholders::_4, config_proto, std::placeholders::_5);
+    grappler::GrapplerItem::OptimizationOptions optimization_options;
+
+    // Tensorflow 2.0 in eager mode with automatic control dependencies will
+    // prune all nodes that are not in the transitive fanin of the fetch nodes.
+    // However because the function will be executed via FunctionLibraryRuntime,
+    // and current function implementation does not prune stateful and dataset
+    // ops, we rely on Grappler to do the correct graph pruning.
+    optimization_options.allow_pruning_stateful_and_dataset_ops = true;
+
+    // All the nested function calls will be executed and optimized via
+    // PartitionedCallOp, there is no need to optimize functions now.
+    optimization_options.optimize_function_library = false;
+
+    options.optimize_graph_fn = std::bind(
+        grappler::OptimizeGraph, std::placeholders::_1, std::placeholders::_2,
+        std::placeholders::_3, std::placeholders::_4, config_proto,
+        function_def->signature().name(), optimization_options,
+        std::placeholders::_5);
   }
 #endif
   options.graph_collector = graph_collector;

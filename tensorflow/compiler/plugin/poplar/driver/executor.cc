@@ -28,6 +28,8 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/util.h"
 
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
+#include "tensorflow/compiler/xla/service/hlo_instructions.h"
+#include "tensorflow/compiler/xla/service/transfer_manager.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 
 #include "tensorflow/core/lib/strings/stringprintf.h"
@@ -44,6 +46,10 @@ limitations under the License.
 #include <poplar/DeviceManager.hpp>
 #include <poplar/IPUModel.hpp>
 #include <poplar/Tensor.hpp>
+
+// Pre-processor convert token to string
+#define QUOTE(str) #str
+#define TOSTRING(str) QUOTE(str)
 
 /*
  * TensorControl is a structure that maintains state about the location
@@ -122,7 +128,7 @@ std::string GetInfeedCopyHandle(const std::string& name, int64 shape_index) {
                                      shape_index);
 }
 
-se::host::HostStream* AsPoplarStream(se::Stream* stream) {
+se::host::HostStream* PoplarExecutor::AsPoplarStream(se::Stream* stream) {
   DCHECK(stream != nullptr);
   return dynamic_cast<se::host::HostStream*>(stream->implementation());
 }
@@ -191,25 +197,53 @@ void PoplarExecutor::Deallocate(se::DeviceMemoryBase* mem) {
   }
 }
 
-void PoplarExecutor::ConnectInfeedToStreamCallback(
-    const InfeedMap& infeed_map) {
-  // Buffer is already placed into xfeed manager by client->TransferToInfeed
-  for (const auto& infeed : infeed_map) {
-    const auto& instr = infeed.first;
-    const auto& shapes = infeed.second;
-    for (int j = 0; j < shapes.size(); ++j) {
+void PoplarExecutor::ConnectInfeedsToStreamCallback(
+    const InfeedInfos& infeed_infos) {
+  // Don't connect any streams if using synthetic data
+  if (UseSyntheticData()) {
+    return;
+  }
+
+  for (const auto& infeed_info : infeed_infos) {
+    const HloInfeedInstruction* inst = infeed_info;
+
+    auto itr = infeed_dataset_iterators.find(inst->infeed_config());
+    if (itr == infeed_dataset_iterators.end()) {
+      LOG(FATAL)
+          << "Trying to access a dataset iterator which has not been created."
+          << " Did you initialize the infeed_queue?";
+    }
+    auto* infeed_dataset_iterator = itr->second.get();
+    for (int j = 0; j < infeed_dataset_iterator->shapes.size(); ++j) {
       current_engine_->connectStreamToCallback(
-          GetInfeedCopyHandle(instr->name(), j), [&](void* dest) {
-            auto* xfeed_manager = GetXfeedManager(ordinal_);
-            auto* xfeed_buffer =
-                xfeed_manager->infeed()->BlockingDequeueBuffer();
-
-            const void* src = xfeed_buffer->data();
-            auto N = xfeed_buffer->length();
-            std::memcpy(dest, src, N);
-
-            xfeed_manager->infeed()->ReleaseCurrentBuffer(
-                xfeed_buffer->length(), xfeed_buffer->data(), Shape{});
+          GetInfeedCopyHandle(inst->name(), j),
+          [j, &infeed_dataset_iterator](void* dest) {
+            std::lock_guard<std::recursive_mutex> g(
+                infeed_dataset_iterator->mutex);
+            // We make an assumption that every sub tensor from the infeed is
+            // dequeued every iteration. If all tensors have been used, then get
+            // the next set of tensors.
+            if (absl::c_all_of(infeed_dataset_iterator->used,
+                               [](bool v) { return v; })) {
+              bool end_of_sequence;
+              std::vector<tensorflow::Tensor> outputs;
+              TF_CHECK_OK(infeed_dataset_iterator->iterator->GetNext(
+                  infeed_dataset_iterator->iterator_ctx.get(), &outputs,
+                  &end_of_sequence));
+              infeed_dataset_iterator->tensors = outputs;
+              if (end_of_sequence) {
+                LOG(INFO) << "The dataset iterator has reached the end of the "
+                             "dataset.";
+              }
+              absl::c_fill(infeed_dataset_iterator->used, false);
+            }
+            // Consume the tensor and copy it into the destination.
+            infeed_dataset_iterator->used[j] = true;
+            auto tensor = infeed_dataset_iterator->tensors[j];
+            const auto tensor_data_ptr = tensor.tensor_data().data();
+            std::memcpy(
+                dest, tensor_data_ptr,
+                ShapeUtil::ByteSizeOf(infeed_dataset_iterator->shapes[j]));
           });
     }
   }
@@ -335,20 +369,24 @@ bool PoplarExecutor::StopTimer(se::Stream* stream, se::Timer* timer) {
 
 Status PoplarExecutor::BlockHostUntilDone(se::Stream* stream) {
   AsPoplarStream(stream)->BlockUntilDone();
+  std::lock_guard<std::recursive_mutex> g(mutex_);
   return Status::OK();
 }
 
 bool PoplarExecutor::SynchronizeAllActivity() {
-  // TODO actually ensure that all execution has finished
+  std::lock_guard<std::recursive_mutex> g(mutex_);
   return true;
 }
 
 se::DeviceDescription* PoplarExecutor::PopulateDeviceDescription() const {
   se::internal::DeviceDescriptionBuilder builder;
 
+  std::string tf_poplar_build_tag = TOSTRING(TF_POPLAR_BUILD_TAG);
+
   builder.set_name("Poplar");
-  const auto version =
-      poplar::versionString() + " (" + poplar::packageHash() + ")";
+  const auto version = poplar::versionString() +
+                       " (Poplar package: " + poplar::packageHash() +
+                       ") (Tensorflow package: " + tf_poplar_build_tag + ")";
   builder.set_platform_version(version);
 
   auto built = builder.Build();
@@ -1212,10 +1250,20 @@ poplar::DeviceManager& PoplarExecutor::GetDeviceManager() {
   return device_mgr;
 }
 
+void PoplarExecutor::CreateInfeedDatasetIterator(
+    const std::string& id,
+    std::unique_ptr<tensorflow::data::IteratorBase> iterator,
+    std::unique_ptr<tensorflow::data::IteratorContext> iterator_ctx,
+    const std::vector<xla::Shape>& shapes) {
+  infeed_dataset_iterators[id] = absl::make_unique<InfeedDatasetIterator>(
+      std::move(iterator), std::move(iterator_ctx), shapes);
+}
+
 StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
     perftools::gputools::StreamExecutor* executor,
     xla::poplarplugin::PoplarExecutable& executable,
     xla::DeviceMemoryAllocator* allocator, const Args& args) {
+  std::lock_guard<std::recursive_mutex> g(mutex_);
   const auto& input_output_aliasing_map =
       executable.GetInputOutputAliasingMap();
   const auto& output_shape = executable.result_shape();
@@ -1224,118 +1272,115 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
   perftools::gputools::DeviceMemoryBase retbuf;
 
   bool engine_changed(current_engine_ != engine);
-  {
-    std::lock_guard<std::recursive_mutex> g(mutex_);
 
-    UpdateArgsHandleMap(args, executable);
+  UpdateArgsHandleMap(args, executable);
 
-    if (engine == NULL) {
-      // An empty engine is either a graph that just passes its inputs through
-      // to its outputs, or a graph which returns a constant.
-      if (executable.IsConstantGraph()) {
-        retbuf =
-            GetOutputBuffer(executable, allocator,
-                            ConstantOutputAllocation(executable.LiteralValue()),
-                            output_shape, args, input_output_aliasing_map);
-      } else if (executable.IsRemapGraph()) {
-        RemapOutputAllocation remap(this, executable.RemapMap(),
-                                    input_output_aliasing_map);
-        retbuf = GetOutputBuffer(executable, allocator, remap, output_shape,
-                                 args, input_output_aliasing_map);
-      } else {
-        LOG(FATAL) << "Cannot construct a NULL graph.";
-      }
+  if (engine == NULL) {
+    // An empty engine is either a graph that just passes its inputs through
+    // to its outputs, or a graph which returns a constant.
+    if (executable.IsConstantGraph()) {
+      retbuf =
+          GetOutputBuffer(executable, allocator,
+                          ConstantOutputAllocation(executable.LiteralValue()),
+                          output_shape, args, input_output_aliasing_map);
+    } else if (executable.IsRemapGraph()) {
+      RemapOutputAllocation remap(this, executable.RemapMap(),
+                                  input_output_aliasing_map);
+      retbuf = GetOutputBuffer(executable, allocator, remap, output_shape, args,
+                               input_output_aliasing_map);
     } else {
-      if (!executable.has_module()) {
-        return tensorflow::errors::InvalidArgument(
-            "Executable must have an HloModule");
-      }
+      LOG(FATAL) << "Cannot construct a NULL graph.";
+    }
+  } else {
+    if (!executable.has_module()) {
+      return tensorflow::errors::InvalidArgument(
+          "Executable must have an HloModule");
+    }
 
-      TF_ASSIGN_OR_RETURN(const bool move_device_to_host,
-                          CheckMoveDeviceToHostRequired(engine_changed));
+    TF_ASSIGN_OR_RETURN(const bool move_device_to_host,
+                        CheckMoveDeviceToHostRequired(engine_changed));
 
-      if (move_device_to_host) {
-        TF_RETURN_IF_ERROR(MoveDeviceToHost());
-      }
+    if (move_device_to_host) {
+      TF_RETURN_IF_ERROR(MoveDeviceToHost());
+    }
 
-      if (engine_changed) {
-        try {
-          engine->load(poplar_device_);
-
-          if (current_config_.profiling().enable_ipu_trace_events() &&
-              current_config_.profiling().enable_io_trace()) {
-            AddLoadEngineEventRecord(executable.module().name());
-          }
-
-          executable.OnEngineLoaded();
-          current_engine_ = engine;
-
-        } catch (const std::exception& e) {
-          return PoplarExceptionToTensorflowStatus("[Load engine ]", e);
-        }
-      }
-
-      // Deallocate all the marked buffers.
-      DeferredDeallocation();
-
-      TF_ASSIGN_OR_RETURN(const bool move_host_to_device,
-                          CheckMoveHostToDeviceRequired(engine_changed));
-      if (move_host_to_device) {
-        MoveHostToDevice();
-      }
-
-      retbuf = GetOutputBuffer(executable, allocator, BufferOutputAllocation(),
-                               output_shape, args, input_output_aliasing_map);
-
-      UpdateOutputsHandleMap(executable, output_shape, retbuf);
-
-      VLOG(1) << "Executing on poplar stream ordinal " << ordinal_
-              << " of type " << GetDeviceTargetName();
-
+    if (engine_changed) {
       try {
-        // Connect the streams to and from the device
-        ConnectStreamedVariablesHostToDevice();
-        ConnectStreamedVariablesDeviceToHost();
+        engine->load(poplar_device_);
 
-        const auto& infeed_instructions = executable.InfeedInstructions();
-        if (!infeed_instructions.empty()) {
-          ConnectInfeedToStreamCallback(infeed_instructions);
+        if (current_config_.profiling().enable_ipu_trace_events() &&
+            current_config_.profiling().enable_io_trace()) {
+          AddLoadEngineEventRecord(executable.module().name());
         }
 
-        // Run the main engine
-        current_engine_->run(PoplarProgramType::MAIN_SEQUENCE);
-
-        // We need to call post process to make sure all the data is in the
-        // right format on the host
-        PostProcessStreamedVariablesDeviceToHost();
+        executable.OnEngineLoaded();
+        current_engine_ = engine;
 
       } catch (const std::exception& e) {
-        return PoplarExceptionToTensorflowStatus("[Execute engine] ", e);
+        return PoplarExceptionToTensorflowStatus("[Load engine ]", e);
+      }
+    }
+
+    // Deallocate all the marked buffers.
+    DeferredDeallocation();
+
+    TF_ASSIGN_OR_RETURN(const bool move_host_to_device,
+                        CheckMoveHostToDeviceRequired(engine_changed));
+    if (move_host_to_device) {
+      MoveHostToDevice();
+    }
+
+    retbuf = GetOutputBuffer(executable, allocator, BufferOutputAllocation(),
+                             output_shape, args, input_output_aliasing_map);
+
+    UpdateOutputsHandleMap(executable, output_shape, retbuf);
+
+    VLOG(1) << "Executing on poplar stream ordinal " << ordinal_ << " of type "
+            << GetDeviceTargetName();
+
+    try {
+      // Connect the streams to and from the device
+      ConnectStreamedVariablesHostToDevice();
+      ConnectStreamedVariablesDeviceToHost();
+
+      const auto& infeed_infos = executable.GetInfeedInfos();
+      if (!infeed_infos.empty()) {
+        ConnectInfeedsToStreamCallback(infeed_infos);
       }
 
-      try {
-        if (current_config_.profiling().enable_ipu_trace_events()) {
-          std::stringstream report_stream;
-          std::stringstream trace_stream;
-          if (current_config_.profiling().enable_execution_trace() > 0) {
-            if (executable.ExecutionCount() == 0) {
-              auto rep = current_engine_->getExecutionReport(GetReportFlags());
-              if (CompilerReportingTextFormat()) {
-                rep.printSummary(report_stream);
-              } else {
-                rep.serialize(report_stream, poplar::SerializationFormat::JSON);
-              }
+      // Run the main engine
+      current_engine_->run(PoplarProgramType::MAIN_SEQUENCE);
 
-              current_engine_->reportIntervals(trace_stream);
+      // We need to call post process to make sure all the data is in the
+      // right format on the host
+      PostProcessStreamedVariablesDeviceToHost();
+
+    } catch (const std::exception& e) {
+      return PoplarExceptionToTensorflowStatus("[Execute engine] ", e);
+    }
+
+    try {
+      if (current_config_.profiling().enable_ipu_trace_events()) {
+        std::stringstream report_stream;
+        std::stringstream trace_stream;
+        if (current_config_.profiling().enable_execution_trace() > 0) {
+          if (executable.ExecutionCount() == 0) {
+            auto rep = current_engine_->getExecutionReport(GetReportFlags());
+            if (CompilerReportingTextFormat()) {
+              rep.printSummary(report_stream);
+            } else {
+              rep.serialize(report_stream, poplar::SerializationFormat::JSON);
             }
-          }
 
-          AddExecuteEventRecord(executable.module().name(), report_stream.str(),
-                                trace_stream.str());
+            current_engine_->reportIntervals(trace_stream);
+          }
         }
-      } catch (const std::exception& e) {
-        return PoplarExceptionToTensorflowStatus("[Execute engine] ", e);
+
+        AddExecuteEventRecord(executable.module().name(), report_stream.str(),
+                              trace_stream.str());
       }
+    } catch (const std::exception& e) {
+      return PoplarExceptionToTensorflowStatus("[Execute engine] ", e);
     }
   }
 
