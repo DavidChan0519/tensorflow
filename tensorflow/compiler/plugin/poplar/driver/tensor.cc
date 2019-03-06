@@ -19,11 +19,11 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
-#include "tensorflow/compiler/plugin/poplar/driver/conversions.h"
-#include "tensorflow/compiler/plugin/poplar/driver/custom_ops/custom_ops.h"
-#include "tensorflow/compiler/plugin/poplar/driver/matcher_predicates.h"
-#include "tensorflow/compiler/plugin/poplar/driver/ops.h"
-#include "tensorflow/compiler/plugin/poplar/driver/util.h"
+#include "tensorflow/compiler/plugin/poplar/driver/ops/custom_ops/custom_ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/conversions.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/matcher_predicates.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
 
 #include "tensorflow/compiler/xla/layout_util.h"
@@ -67,10 +67,16 @@ bool InstructionSharded(const HloInstruction* a) {
   return false;
 }
 
-TensorVector GetAllTensorsInMap(const TensorMap& map,
-                                const HloInstruction* inst) {
-  auto lower = std::make_pair(inst->name(), 0);
-  auto upper = std::make_pair(inst->name(), std::numeric_limits<int64>::max());
+TensorVector GetTensorsInMap(
+    const TensorMap& map, const HloInstruction* inst,
+    absl::optional<int64> opt_tensors_start = absl::nullopt,
+    absl::optional<int64> opt_tensors_end = absl::nullopt) {
+  int64 lower_tensor_idx = opt_tensors_start ? *opt_tensors_start : 0;
+  int64 upper_tensor_idx =
+      opt_tensors_end ? *opt_tensors_end : std::numeric_limits<int64>::max();
+
+  auto lower = std::make_pair(inst->name(), lower_tensor_idx);
+  auto upper = std::make_pair(inst->name(), upper_tensor_idx - 1);
   TensorVector outputs;
   for (auto it = map.lower_bound(lower); it != map.upper_bound(upper); it++) {
     outputs.push_back(*it);
@@ -83,14 +89,13 @@ ArgVector GetTensorsMaybeExpand(
     poplar::program::Sequence& seq, const bool expand_constants,
     absl::optional<int64> opt_tensors_start = absl::nullopt,
     absl::optional<int64> opt_tensors_end = absl::nullopt) {
-  TensorVector tensor_vector = GetAllTensorsInMap(map, inst);
-  int64 tensors_start = opt_tensors_start ? *opt_tensors_start : 0;
-  int64 tensors_end = opt_tensors_end ? *opt_tensors_end : tensor_vector.size();
+  TensorVector tensor_vector =
+      GetTensorsInMap(map, inst, opt_tensors_start, opt_tensors_end);
   auto& graph = GetGraph(res, inst);
   ArgVector outputs;
-  for (int64 i = tensors_start; i < tensors_end; i++) {
-    const auto key = tensor_vector[i].first;
-    poplar::Tensor tensor = tensor_vector[i].second;
+  for (auto pair : tensor_vector) {
+    const auto key = pair.first;
+    poplar::Tensor tensor = pair.second;
     // Check if we need to expand the constant tensor.
     if (tensor.containsConstant() && expand_constants) {
       const auto& mapping = graph.getTileMapping(tensor);
@@ -290,6 +295,85 @@ static StatusOr<std::size_t> FindSeqDim(const xla::Shape& shape_xla,
       "Cannot compute slice sequence dimension");
 }
 
+static StatusOr<poplar::Tensor> PathTransform(
+    poplar::Graph& graph, poplar::Tensor in,
+    const std::vector<const HloInstruction*>& path) {
+  // Now apply any transformations required by the path from the source to
+  // the target
+
+  for (auto i = path.rbegin(); i != path.rend(); ++i) {
+    auto& inst = *i;
+    switch (inst->opcode()) {
+      case HloOpcode::kTranspose: {
+        auto optional_permutation =
+            convert_array<std::vector<unsigned>>(inst->dimensions());
+        if (!optional_permutation) {
+          return xla::FailedPrecondition(
+              "PathTransform - cannot cast permutation.");
+        }
+        std::vector<unsigned> permutation = *optional_permutation;
+        std::vector<unsigned> shuffle(permutation.size());
+        for (int d = 0; d < permutation.size(); d++) {
+          shuffle[permutation[d]] = d;
+        }
+        in = in.dimShuffle(shuffle);
+        break;
+      }
+      case HloOpcode::kReshape: {
+        std::vector<size_t> dims(
+            PoplarShapeFromXlaShape(inst->operand(0)->shape()));
+        in = in.reshape(dims);
+        break;
+      }
+      default: {
+        // All other instructions in the path do not modify the shape
+        break;
+      }
+    }
+  }
+
+  return in;
+}
+
+static StatusOr<poplar::Tensor> ReversePathTransform(
+    poplar::Graph& graph, poplar::Tensor in,
+    const std::vector<const HloInstruction*>& path) {
+  // Now apply any transformations required by the path from the source to
+  // the target
+
+  for (auto i = path.rbegin(); i != path.rend(); ++i) {
+    auto& inst = *i;
+    switch (inst->opcode()) {
+      case HloOpcode::kTranspose: {
+        auto optional_permutation =
+            convert_array<std::vector<unsigned>>(inst->dimensions());
+        if (!optional_permutation) {
+          return xla::FailedPrecondition(
+              "PathTransform - cannot cast permutation.");
+        }
+        std::vector<unsigned> permutation = *optional_permutation;
+        std::vector<unsigned> shuffle(permutation.size());
+        for (int d = 0; d < permutation.size(); d++) {
+          shuffle[d] = permutation[d];
+        }
+        in = in.dimShuffle(shuffle);
+        break;
+      }
+      case HloOpcode::kReshape: {
+        std::vector<size_t> dims(PoplarShapeFromXlaShape(inst->shape()));
+        in = in.reshape(dims);
+        break;
+      }
+      default: {
+        // All other instructions in the path do not modify the shape
+        break;
+      }
+    }
+  }
+
+  return in;
+}
+
 StatusOr<poplar::Tensor> AddDynamicSliceTensor(
     poplar::Graph& graph, const std::string& debug_name,
     const xla::Shape& shape_xla, const xla::Shape& slice_shape_xla) {
@@ -397,6 +481,7 @@ static StatusOr<poplar::Tensor> AddConvolutionWeights(
 static StatusOr<poplar::Tensor> AddConvAddBiasTensor(
     poplar::Graph& graph, const std::string& debug_name,
     const HloInstruction* layout, int64 layout_output_idx,
+    std::vector<const HloInstruction*> forward_path,
     const TensorMap& tensor_map) {
   OutVector outputs = FindInstructionOutputs(tensor_map, layout);
 
@@ -408,6 +493,7 @@ static StatusOr<poplar::Tensor> AddConvAddBiasTensor(
   poplar::Tensor acts = outputs[layout_output_idx];
 
   acts = ShuffleConvolutionOutputToPoplar(layout, acts);
+  TF_ASSIGN_OR_RETURN(acts, ReversePathTransform(graph, acts, forward_path));
 
   return poplin::createBiases(graph, acts, debug_name);
 }
@@ -415,6 +501,7 @@ static StatusOr<poplar::Tensor> AddConvAddBiasTensor(
 static StatusOr<poplar::Tensor> AddMatMulAddBiasTensor(
     poplar::Graph& graph, const std::string& debug_name,
     const HloInstruction* layout, int64 layout_output_idx,
+    std::vector<const HloInstruction*> forward_path,
     const TensorMap& tensor_map) {
   OutVector outputs = FindInstructionOutputs(tensor_map, layout);
 
@@ -424,6 +511,7 @@ static StatusOr<poplar::Tensor> AddMatMulAddBiasTensor(
   }
 
   poplar::Tensor acts = outputs[layout_output_idx];
+  TF_ASSIGN_OR_RETURN(acts, ReversePathTransform(graph, acts, forward_path));
 
   return poplin::createBiases(graph, acts, debug_name);
 }
@@ -458,12 +546,12 @@ static StatusOr<poplar::Tensor> AddRightMatMul(poplar::Graph& graph,
                                       &resources.dot_cache);
 }
 
-StatusOr<poplar::Tensor> AddNormScaleTensor(poplar::Graph& graph,
-                                            const std::string& debug_name,
-                                            const HloInstruction* layout,
-                                            int64 layout_output_idx,
-                                            const unsigned feature_dimension,
-                                            const TensorMap& tensor_map) {
+StatusOr<poplar::Tensor> AddNormScaleTensor(
+    poplar::Graph& graph, const std::string& debug_name,
+    const HloInstruction* layout, int64 layout_output_idx,
+    const unsigned feature_dimension,
+    std::vector<const HloInstruction*> forward_path,
+    const TensorMap& tensor_map) {
   OutVector outputs = FindInstructionOutputs(tensor_map, layout);
 
   if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
@@ -475,15 +563,18 @@ StatusOr<poplar::Tensor> AddNormScaleTensor(poplar::Graph& graph,
   poplar::Tensor acts = outputs[layout_output_idx];
   auto pair = ShuffleNormInputToPoplar(acts, feature_dimension);
 
-  return poplin::createNormGamma(graph, pair.first);
+  TF_ASSIGN_OR_RETURN(acts,
+                      ReversePathTransform(graph, pair.first, forward_path));
+
+  return poplin::createNormGamma(graph, acts);
 }
 
-StatusOr<poplar::Tensor> AddNormOffsetTensor(poplar::Graph& graph,
-                                             const std::string& debug_name,
-                                             const HloInstruction* layout,
-                                             int64 layout_output_idx,
-                                             const unsigned feature_dimension,
-                                             const TensorMap& tensor_map) {
+StatusOr<poplar::Tensor> AddNormOffsetTensor(
+    poplar::Graph& graph, const std::string& debug_name,
+    const HloInstruction* layout, int64 layout_output_idx,
+    const unsigned feature_dimension,
+    std::vector<const HloInstruction*> forward_path,
+    const TensorMap& tensor_map) {
   OutVector outputs = FindInstructionOutputs(tensor_map, layout);
 
   if (layout_output_idx < 0 || outputs.size() <= layout_output_idx) {
@@ -495,12 +586,16 @@ StatusOr<poplar::Tensor> AddNormOffsetTensor(poplar::Graph& graph,
   poplar::Tensor acts = outputs[layout_output_idx];
   auto pair = ShuffleNormInputToPoplar(acts, feature_dimension);
 
-  return poplin::createNormBeta(graph, pair.first);
+  TF_ASSIGN_OR_RETURN(acts,
+                      ReversePathTransform(graph, pair.first, forward_path));
+
+  return poplin::createNormBeta(graph, acts);
 }
 
 static StatusOr<poplar::Tensor> AddElementwiseBinary(
     poplar::Graph& graph, const std::string& debug_name,
     const HloInstruction* layout, int64 layout_output_idx,
+    std::vector<const HloInstruction*> forward_path,
     const TensorMap& tensor_map) {
   OutVector outputs = FindInstructionOutputs(tensor_map, layout);
 
@@ -511,47 +606,17 @@ static StatusOr<poplar::Tensor> AddElementwiseBinary(
   }
 
   poplar::Tensor other_side = outputs[layout_output_idx];
+
+  TF_ASSIGN_OR_RETURN(other_side,
+                      ReversePathTransform(graph, other_side, forward_path));
+
   return graph.clone(other_side, debug_name);
 }
 
-static StatusOr<poplar::Tensor> PathTransform(
-    poplar::Graph& graph, poplar::Tensor in,
-    const std::vector<const HloInstruction*>& path) {
-  // Now apply any transformations required by the path from the source to
-  // the target
-
-  for (auto i = path.rbegin(); i != path.rend(); ++i) {
-    auto& inst = *i;
-    switch (inst->opcode()) {
-      case HloOpcode::kTranspose: {
-        auto optional_permutation =
-            convert_array<std::vector<unsigned>>(inst->dimensions());
-        if (!optional_permutation) {
-          return xla::FailedPrecondition(
-              "PathTransform - cannot cast permutation.");
-        }
-        std::vector<unsigned> permutation = *optional_permutation;
-        std::vector<unsigned> shuffle(permutation.size());
-        for (int d = 0; d < permutation.size(); d++) {
-          shuffle[permutation[d]] = d;
-        }
-        in = in.dimShuffle(shuffle);
-        break;
-      }
-      case HloOpcode::kReshape: {
-        std::vector<size_t> dims(
-            PoplarShapeFromXlaShape(inst->operand(0)->shape()));
-        in = in.reshape(dims);
-        break;
-      }
-      default: {
-        // All other instructions in the path do not modify the shape
-        break;
-      }
-    }
-  }
-
-  return in;
+bool HasTensorAllocationTarget(const TensorSource& src,
+                               const CompilerResources& resources) {
+  auto& tensor_allocation_map = resources.annotations.tensor_allocation_map;
+  return tensor_allocation_map.find(src) != tensor_allocation_map.end();
 }
 
 StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
@@ -568,11 +633,13 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
     auto tshape = tgt->operand(target->second.input_index)->shape();
     const auto optional_layout = target->second.layout;
     const auto optional_layout_output_idx = target->second.layout_output_idx;
+    const auto forward_path = target->second.forward_path;
 
     if (IsPopOpsElementwiseBinary(tgt) && !IsPopOpsBiasAdd(tgt)) {
       TF_ASSIGN_OR_RETURN(
           out, AddElementwiseBinary(graph, name, *optional_layout,
-                                    *optional_layout_output_idx, tensor_map));
+                                    *optional_layout_output_idx, forward_path,
+                                    tensor_map));
     } else {
       switch (tgt->opcode()) {
         case HloOpcode::kBatchNormInference:
@@ -584,14 +651,16 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
               TF_ASSIGN_OR_RETURN(
                   out, AddNormScaleTensor(graph, name, *optional_layout,
                                           *optional_layout_output_idx,
-                                          feature_dimension, tensor_map));
+                                          feature_dimension, forward_path,
+                                          tensor_map));
               break;
             }
             case 2: {
               TF_ASSIGN_OR_RETURN(
                   out, AddNormOffsetTensor(graph, name, *optional_layout,
                                            *optional_layout_output_idx,
-                                           feature_dimension, tensor_map));
+                                           feature_dimension, forward_path,
+                                           tensor_map));
               break;
             }
             default:
@@ -683,12 +752,12 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
               TF_ASSIGN_OR_RETURN(
                   out, AddConvAddBiasTensor(graph, name, *optional_layout,
                                             *optional_layout_output_idx,
-                                            tensor_map));
+                                            forward_path, tensor_map));
             } else if (IsPopOpsFusion(comp, "matmul_biasadd")) {
               TF_ASSIGN_OR_RETURN(
                   out, AddMatMulAddBiasTensor(graph, name, *optional_layout,
                                               *optional_layout_output_idx,
-                                              tensor_map));
+                                              forward_path, tensor_map));
             } else {
               return xla::FailedPrecondition(
                   "Unknown poplibs fusion for tensor %s: %s",
@@ -701,11 +770,9 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
         }
         case HloOpcode::kCustomCall: {
           if (IsPoplibsCustomOp(tgt)) {
-            TF_ASSIGN_OR_RETURN(
-                out, AllocatePoplibsOpTensor(
-                         graph, resources, name, tgt,
-                         target->second.input_index, optional_layout,
-                         optional_layout_output_idx, shape, tensor_map));
+            TF_ASSIGN_OR_RETURN(out, AllocatePoplibsOpTensor(
+                                         graph, resources, name, target->second,
+                                         shape, tensor_map));
           } else {
             LOG(FATAL) << "Unsupported custom call " << tgt->name();
           }
@@ -1088,6 +1155,16 @@ ArgVector FindTupleInInstructionInput(TensorMap& map, CompilerResources& res,
   return inputs;
 }
 
+ArgVector FindInstructionInputsInRange(TensorMap& map, CompilerResources& res,
+                                       const HloInstruction* inst, int64 input,
+                                       std::pair<int64, int64> range,
+                                       poplar::program::Sequence& seq,
+                                       const bool expand_constants) {
+  const HloInstruction* operand = inst->operand(input);
+  return GetTensorsMaybeExpand(map, res, operand, seq, expand_constants,
+                               range.first, range.second);
+}
+
 StatusOr<poplar::Tensor> FindInstructionInput(
     TensorMap& map, CompilerResources& res, const HloInstruction* inst,
     int64 input, poplar::program::Sequence& seq, const bool expand_constants) {
@@ -1113,7 +1190,7 @@ ArgVector FindInstructionInputs(TensorMap& map, CompilerResources& res,
 
 OutVector FindInstructionOutputs(const TensorMap& map,
                                  const HloInstruction* inst) {
-  TensorVector tensor_vector = GetAllTensorsInMap(map, inst);
+  TensorVector tensor_vector = GetTensorsInMap(map, inst);
   OutVector outputs;
   std::transform(tensor_vector.begin(), tensor_vector.end(),
                  std::back_inserter(outputs),

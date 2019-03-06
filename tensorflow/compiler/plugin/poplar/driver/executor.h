@@ -26,7 +26,7 @@ limitations under the License.
 #include "tensorflow/stream_executor/host/host_timer.h"
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_annotations.h"
-#include "tensorflow/compiler/plugin/poplar/driver/input_output_aliasing_map.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/input_output_aliasing_map.h"
 #include "tensorflow/compiler/plugin/poplar/driver/trace.pb.h"
 
 #include "tensorflow/compiler/xla/literal.h"
@@ -76,6 +76,7 @@ enum PoplarProgramType {
 class PoplarExecutable;
 
 std::string GetInfeedCopyHandle(const std::string& name, int64 shape_index);
+std::string GetOutfeedCopyHandle(const std::string& name, int64 shape_index);
 std::string GetInputCopyHandle(int64 parameter, int64 index);
 std::string GetOutputCopyHandle(int64 output_index, int64 flat_tensor_index);
 
@@ -272,14 +273,22 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   }
 
   bool AlwaysRearrangeCopiesOnTheHost() const {
-    return current_config_.always_rearrange_copies_on_the_host();
+    return current_config_.speed_size_config()
+        .always_rearrange_copies_on_the_host();
   }
 
   bool DisableGraphConvCaching() const {
-    return current_config_.disable_graph_convolution_caching();
+    return current_config_.speed_size_config()
+        .disable_graph_convolution_caching();
   }
 
-  bool ShardingEnabled() const;
+  bool NonLinearityRecomputaionEnabled() const {
+    // Re-computation of non linearities is enabled by default unless the user
+    // has specifically told us not to do it.
+    return current_config_.speed_size_config().has_recompute_non_linearities()
+               ? current_config_.speed_size_config().recompute_non_linearities()
+               : true;
+  }
 
   poplar::OptionFlags GetConvolutionOptions() const { return conv_options_; }
 
@@ -300,8 +309,7 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   void AddLoadEngineEventRecord(const std::string& module_name);
 
   void AddExecuteEventRecord(const std::string& module_name,
-                             const std::string& report,
-                             const std::string& trace);
+                             const std::string& report);
 
   Status GetCompilerEvents(std::list<tensorflow::IpuTraceEvent>& out);
 
@@ -328,6 +336,9 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
       const std::string&, std::unique_ptr<tensorflow::data::IteratorBase>,
       std::unique_ptr<tensorflow::data::IteratorContext>,
       const std::vector<xla::Shape>&);
+
+  void setFlagIfNotPresent(poplar::OptionFlags& opts, const std::string& key,
+                           const std::string& value);
 
  private:
   struct TensorControl {
@@ -483,6 +494,11 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   // Connect buffers provided by infeed transfer manager to Poplar
   // HostToDevice FIFO
   void ConnectInfeedsToStreamCallback(const InfeedInfos& infeed_infos);
+
+  // Connect buffers provided by transfer manager to Poplar
+  // deviceToHostFIFO()
+  void ConnectOutfeedToStreamCallback(se::StreamExecutor* executor,
+                                      const OutfeedInfos& outfeed_infos);
 
   void DeferredDeallocation();
 

@@ -25,34 +25,34 @@ limitations under the License.
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler.h"
 
-#include "tensorflow/compiler/plugin/poplar/driver/allocation_finder.h"
-#include "tensorflow/compiler/plugin/poplar/driver/casts_elimination.h"
-#include "tensorflow/compiler/plugin/poplar/driver/commutative_instruction_reorder_operands.h"
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
-#include "tensorflow/compiler/plugin/poplar/driver/computation_flattener.h"
-#include "tensorflow/compiler/plugin/poplar/driver/constant_slice_folding.h"
-#include "tensorflow/compiler/plugin/poplar/driver/entry_visitor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/executable.h"
 #include "tensorflow/compiler/plugin/poplar/driver/executor.h"
-#include "tensorflow/compiler/plugin/poplar/driver/expression_outliner.h"
-#include "tensorflow/compiler/plugin/poplar/driver/forward_allocation.h"
-#include "tensorflow/compiler/plugin/poplar/driver/fuse_max_pool.h"
-#include "tensorflow/compiler/plugin/poplar/driver/fuse_ops_early.h"
-#include "tensorflow/compiler/plugin/poplar/driver/fuse_ops_late.h"
-#include "tensorflow/compiler/plugin/poplar/driver/fuse_wide_const.h"
-#include "tensorflow/compiler/plugin/poplar/driver/hlo_computation_name_uniquify.h"
-#include "tensorflow/compiler/plugin/poplar/driver/not_supported_gather_expander.h"
-#include "tensorflow/compiler/plugin/poplar/driver/not_supported_scatter_expander.h"
-#include "tensorflow/compiler/plugin/poplar/driver/ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/allocation_finder.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/casts_elimination.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/commutative_instruction_reorder_operands.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/computation_flattener.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/constant_slice_folding.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/expression_outliner.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/forward_allocation.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_max_pool.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_ops_early.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_ops_late.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_wide_const.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/hlo_computation_name_uniquify.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/non_linearity_recomputation.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/not_supported_gather_expander.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/not_supported_scatter_expander.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/root_token_replacer.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/sharding_pass.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/while_loop_condition_simplify.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/while_loop_to_repeat_simplify.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/wide_const_finder.h"
 #include "tensorflow/compiler/plugin/poplar/driver/platform_id.h"
-#include "tensorflow/compiler/plugin/poplar/driver/root_token_replacer.h"
-#include "tensorflow/compiler/plugin/poplar/driver/scheduler.h"
-#include "tensorflow/compiler/plugin/poplar/driver/sharding_pass.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
-#include "tensorflow/compiler/plugin/poplar/driver/util.h"
-#include "tensorflow/compiler/plugin/poplar/driver/while_loop_condition_simplify.h"
-#include "tensorflow/compiler/plugin/poplar/driver/while_loop_to_repeat_simplify.h"
-#include "tensorflow/compiler/plugin/poplar/driver/wide_const_finder.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
+#include "tensorflow/compiler/plugin/poplar/driver/visitors/entry_visitor.h"
 
 #include "tensorflow/compiler/xla/service/algebraic_simplifier.h"
 #include "tensorflow/compiler/xla/service/computation_placer.h"
@@ -62,6 +62,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/hlo_cse.h"
 #include "tensorflow/compiler/xla/service/hlo_dce.h"
 #include "tensorflow/compiler/xla/service/hlo_get_dimension_size_rewriter.h"
+#include "tensorflow/compiler/xla/service/hlo_memory_scheduler.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_fix.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_pipeline.h"
 #include "tensorflow/compiler/xla/service/hlo_subcomputation_unification.h"
@@ -72,6 +73,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/tuple_simplifier.h"
 #include "tensorflow/compiler/xla/service/while_loop_constant_sinking.h"
 #include "tensorflow/compiler/xla/service/zero_sized_hlo_elimination.h"
+#include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 
 #include "tensorflow/stream_executor/lib/initialize.h"
@@ -163,7 +165,7 @@ bool GetConstantOutput(const HloInstruction* root, const Shape& layout,
 
 bool AnyComputationHasSideEffects(const HloModule* module) {
   for (const auto& comp : module->computations()) {
-    if (IsRepeatCall(comp) || IsPopOpsFusion(comp)) {
+    if (IsPopOpsFusion(comp)) {
       continue;
     }
 
@@ -172,6 +174,20 @@ bool AnyComputationHasSideEffects(const HloModule* module) {
     }
   }
   return false;
+}
+
+bool ShardingEnabled(const HloModule* module) {
+  std::vector<HloComputation*> comps = module->MakeNonfusionComputations();
+  for (const auto* c : comps) {
+    for (const auto* inst : c->instructions()) {
+      if (inst->has_sharding()) {
+        auto sharding = inst->sharding();
+        if (IsSupportedSharding(sharding)) {
+          return true;
+        }
+      }
+    }
+  }
 }
 
 bool AreAllOutputsParameters(
@@ -293,7 +309,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   popops::addCodelets(resources.main_graph);
   poprand::addCodelets(resources.main_graph);
 
-  if (poplarExecutor->ShardingEnabled()) {
+  if (ShardingEnabled(module.get())) {
     auto numIPUs = resources.main_graph.getTarget().getNumIPUs();
     auto tilesPerIPU = resources.main_graph.getTarget().getTilesPerIPU();
     for (unsigned ipu = 0; ipu < numIPUs; ++ipu) {
@@ -354,6 +370,8 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       pass.AddPass<WhileLoopToRepeatSimplify>();
     }
     pipeline.AddPass<HloSubcomputationUnification>();
+    pipeline.AddPass<NonLinearityRecomputaion>(
+        poplarExecutor->NonLinearityRecomputaionEnabled());
     pipeline.AddPass<HloDCE>();
     pipeline.AddPass<InplaceFinder>(resources.annotations);
     pipeline.AddPass<ShardingPass>();
@@ -363,7 +381,11 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     pipeline.AddPass<ConvolutionClassifier>(resources.annotations);
     pipeline.AddPass<AllocationFinder>(resources.annotations);
     pipeline.AddPass<HloPassFix<ForwardAllocation>>(resources.annotations);
-    pipeline.AddPass<Scheduler>();
+    pipeline.AddPass<HloMemoryScheduler>(
+        [](const BufferValue& buffer) {
+          return ShapeUtil::ByteSizeOf(buffer.shape(), 1);
+        },
+        DefaultMemoryScheduler);
 
     bool ok;
     TF_ASSIGN_OR_RETURN(ok, pipeline.Run(module.get()));
@@ -467,13 +489,13 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
     if (poplarExecutor->CompilerReportingEnabled() && engine != nullptr) {
       try {
-        auto& opts = poplarExecutor->GetReportFlags();
-
-        auto rep = engine->getGraphReport(opts);
+        auto rep = engine->getGraphProfile();
         if (poplarExecutor->CompilerReportingTextFormat()) {
-          rep.printSummary(stream);
+          auto opts = poplarExecutor->GetReportFlags();
+          poplarExecutor->setFlagIfNotPresent(opts, "showVarStorage", "true");
+          poplar::printGraphSummary(stream, rep, opts);
         } else {
-          rep.serialize(stream, poplar::SerializationFormat::JSON);
+          poplar::serializeToJSON(stream, rep);
         }
       } catch (const std::exception& e) {
         return PoplarExceptionToTensorflowStatus("[Compiler report] ", e);
@@ -492,7 +514,9 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       std::move(profile_index_map), std::move(engine),
       std::move(resources.annotations.input_output_aliasing_map),
       is_constant_graph, std::move(constant_output), is_remap_graph,
-      std::move(remaped_output), std::move(resources.annotations.infeed_infos));
+      std::move(remaped_output), std::move(resources.annotations.infeed_infos),
+      std::move(resources.annotations.outfeed_infos));
+
   executable.reset(poplar_executable);
 
   if (poplarExecutor->HaveExecutableCache()) {

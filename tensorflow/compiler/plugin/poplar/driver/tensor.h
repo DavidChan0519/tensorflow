@@ -1,8 +1,8 @@
 #ifndef TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_TENSOR_H_
 #define TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_TENSOR_H_
 
-#include "tensorflow/compiler/plugin/poplar/driver/allocation_finder.h"
-#include "tensorflow/compiler/plugin/poplar/driver/ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/allocation_finder.h"
 
 #include "tensorflow/compiler/xla/literal_util.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
@@ -51,19 +51,24 @@ StatusOr<poplar::Tensor> AddPlainTensor(poplar::Graph& graph,
                                         const std::string& debug_name,
                                         const xla::Shape& shape);
 
-StatusOr<poplar::Tensor> AddNormScaleTensor(poplar::Graph& graph,
-                                            const std::string& debug_name,
-                                            const HloInstruction* layout,
-                                            int64 layout_output_idx,
-                                            const unsigned feature_dimension,
-                                            const TensorMap& tensor_map);
+StatusOr<poplar::Tensor> AddNormScaleTensor(
+    poplar::Graph& graph, const std::string& debug_name,
+    const HloInstruction* layout, int64 layout_output_idx,
+    const unsigned feature_dimension,
+    std::vector<const HloInstruction*> forward_path,
+    const TensorMap& tensor_map);
 
-StatusOr<poplar::Tensor> AddNormOffsetTensor(poplar::Graph& graph,
-                                             const std::string& debug_name,
-                                             const HloInstruction* layout,
-                                             int64 layout_output_idx,
-                                             const unsigned feature_dimension,
-                                             const TensorMap& tensor_map);
+StatusOr<poplar::Tensor> AddNormOffsetTensor(
+    poplar::Graph& graph, const std::string& debug_name,
+    const HloInstruction* layout, int64 layout_output_idx,
+    const unsigned feature_dimension,
+    std::vector<const HloInstruction*> forward_path,
+    const TensorMap& tensor_map);
+
+// Returns true if the given tensor source has a special layout allocation
+// target.
+bool HasTensorAllocationTarget(const TensorSource& src,
+                               const CompilerResources& resources);
 
 StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
                                    const TensorSource& src,
@@ -125,6 +130,15 @@ ArgVector FindTupleInInstructionInput(TensorMap& map, CompilerResources& res,
                                       const HloInstruction* inst, int64 input,
                                       int64 n, poplar::program::Sequence& seq,
                                       const bool expand_constants = true);
+
+/* This returns a vector of all poplar tensors which are outputs of the inst
+ * operand index `input` in range [range.first, range.second).
+ */
+ArgVector FindInstructionInputsInRange(TensorMap& map, CompilerResources& res,
+                                       const HloInstruction* inst, int64 input,
+                                       std::pair<int64, int64> range,
+                                       poplar::program::Sequence& seq,
+                                       const bool expand_constants = true);
 
 /* This returns the single poplar tensor which is the non-tuple input to the
  * input to the instruction
