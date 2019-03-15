@@ -61,18 +61,14 @@ static std::map<std::string, CustomCallFn> custom_call_map = {
     {"sigmoidgrad", CreateSigmoidGradOp},
     {"conv_biasadd", CreateConvBiasAddOp},
     {"matmul_biasadd", CreateMatMulBiasAddOp},
-    {"trunc_norm", TruncatedNormal},
     {"norm_scale_add", RandomNormalScale},
     {"uniform_scale_add", RandomUniformScale},
-    {"avg_pool", CreatePoplibsWindowReduction},
     {"wide_const", CreateWideConstant},
     {"depthwise_conv", CreateConv2D},
     {"conv_with_reverse", Create2DConvWithReverse},
     {"bias_apply", ConvBiasApply},
     {"zero_pad", CreateZeroPadOp},
     {"depthwise_filter", CreateDepthwiseBackpropFilter},
-    {"max_pool", CreatePoplibsWindowReduction},
-    {"max_pool_grad", CreateBwdMaxPool},
     {"scaled_inplace", CreateScaledInplace},
     {"conv_scaled_inplace", CreateConvScaledInplace},
     {"padding_reduce_window", CreatePaddingReduceWindow},
@@ -273,7 +269,6 @@ Status BaseVisitor::HandleTranspose(HloInstruction* inst) {
 }
 
 Status BaseVisitor::HandleFusion(HloInstruction* inst) {
-  VLOG(1) << "Processing " << inst->name();
   poplar::program::Program prog;
   HloComputation* comp = inst->fused_instructions_computation();
 
@@ -523,7 +518,11 @@ Status BaseVisitor::HandleGetDimensionSize(HloInstruction* inst) {
 }
 
 Status BaseVisitor::HandleAddDependency(HloInstruction* inst) {
-  VLOG(1) << "Processing " << inst->name();
+  std::vector<std::string> dep_names;
+  GetAllDepNames(inst->operand(1), dep_names);
+
+  VLOG(1) << "Processing " << inst->name() << " on "
+          << absl::StrJoin(dep_names, ",");
   TF_ASSIGN_OR_RETURN(
       ArgVectors inputs,
       GetInplaceOutputTensors(tensor_map, resources_, inst, sequence));
@@ -532,9 +531,18 @@ Status BaseVisitor::HandleAddDependency(HloInstruction* inst) {
   for (int64 idx = 0; idx < inputs[0].size(); idx++) {
     TF_CHECK_OK(AddOutputTensor(tensor_map, inst, idx, inputs[0][idx]));
   }
+  return Status::OK();
 }
 
 Status BaseVisitor::HandleReplicaId(HloInstruction* inst) {
+  return Unimplemented(inst);
+}
+
+Status BaseVisitor::HandleTriangularSolve(HloInstruction* inst) {
+  return Unimplemented(inst);
+}
+
+Status BaseVisitor::HandleCholesky(HloInstruction* inst) {
   return Unimplemented(inst);
 }
 

@@ -211,7 +211,7 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['max/fusion/maxPool']
+      ok = ['max/custom-call.*/maxPool5x5']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testFwdAndBwdMaxPool(self):
@@ -261,8 +261,8 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
       cs_list = tu.get_compute_sets_from_report(s)
 
       ok = ['Copy_*',
-            'MaxPool/fusion/maxPool2x2/',
-            'MaxPoolGrad/fusion.1/maxPool2x2']
+            'MaxPool/custom-call.*/maxPool2x2/',
+            'MaxPoolGrad/custom-call.*/maxPool2x2']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testScaledAddTo(self):
@@ -456,10 +456,10 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
             'host-exchange-local-copy-',
             'vs/conv2d/Conv2D/convolution*/Conv_1x1/Convolve',
             'vs/conv2d/BiasAdd/fusion*/addToChannel',
-            'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/ReduceFinalStage/IntermediateToOutput/Reduce',
-            'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/AddTo',
             'gradients/vs/conv2d_1/Conv2D_grad/Conv2DBackpropFilter/fusion*/Conv_4x4',
             'gradients/vs/conv2d_1/Conv2D_grad/Conv2DBackpropFilter/fusion*/AddTo',
+            'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/ReduceFinalStage/IntermediateToOutput/Reduce',
+            'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/AddTo',
             'GradientDescent/update_vs/conv2d_1/bias/ResourceApplyGradientDescent/multiply*/Op/Multiply',
             'GradientDescent/update_vs/conv2d_1/bias/ResourceApplyGradientDescent/subtract*/AddTo',
             'vs/conv2d_1/BiasAdd/fusion*/addToChannel',
@@ -499,7 +499,7 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['avg/fusion/avgPool10x10']
+      ok = ['avg/custom-call.*/avgPool10x10']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testAvgPoolValidWithBroadcast(self):
@@ -537,7 +537,7 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['avg/fusion/avgPool5x5']
+      ok = ['avg/custom-call.*/avgPool5x5']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
 
@@ -577,7 +577,7 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
 
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
-      ok = ['avg/fusion/avgPool5x5']
+      ok = ['avg/custom-call.*/avgPool5x5']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testFullyConnectedWithBias(self):

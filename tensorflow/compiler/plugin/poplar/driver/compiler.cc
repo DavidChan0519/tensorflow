@@ -34,9 +34,9 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/passes/commutative_instruction_reorder_operands.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/computation_flattener.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/constant_slice_folding.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/dependency_replacer.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/expression_outliner.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/forward_allocation.h"
-#include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_max_pool.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_ops_early.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_ops_late.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_wide_const.h"
@@ -55,6 +55,7 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/visitors/entry_visitor.h"
 
 #include "tensorflow/compiler/xla/service/algebraic_simplifier.h"
+#include "tensorflow/compiler/xla/service/cholesky_expander.h"
 #include "tensorflow/compiler/xla/service/computation_placer.h"
 #include "tensorflow/compiler/xla/service/dot_decomposer.h"
 #include "tensorflow/compiler/xla/service/dynamic_index_splitter.h"
@@ -62,14 +63,15 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/hlo_cse.h"
 #include "tensorflow/compiler/xla/service/hlo_dce.h"
 #include "tensorflow/compiler/xla/service/hlo_get_dimension_size_rewriter.h"
+#include "tensorflow/compiler/xla/service/hlo_graph_dumper.h"
 #include "tensorflow/compiler/xla/service/hlo_memory_scheduler.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_fix.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_pipeline.h"
 #include "tensorflow/compiler/xla/service/hlo_subcomputation_unification.h"
-#include "tensorflow/compiler/xla/service/hlo_tfgraph_builder.h"
 #include "tensorflow/compiler/xla/service/map_inliner.h"
 #include "tensorflow/compiler/xla/service/reshape_mover.h"
 #include "tensorflow/compiler/xla/service/sort_simplifier.h"
+#include "tensorflow/compiler/xla/service/triangular_solve_expander.h"
 #include "tensorflow/compiler/xla/service/tuple_simplifier.h"
 #include "tensorflow/compiler/xla/service/while_loop_constant_sinking.h"
 #include "tensorflow/compiler/xla/service/zero_sized_hlo_elimination.h"
@@ -226,14 +228,30 @@ bool AreAllOutputsParameters(
       root->shape(),
       root->GetModule()->entry_computation_layout().result_shape());
 }
+
+void ConfigurePoplarXFeedManager(const InfeedInfos& infeed_infos,
+                                 const OutfeedInfos& outfeed_infos,
+                                 int device_ordinal) {
+  auto* xfeed_manager = GetXfeedManager(device_ordinal);
+  for (const auto& outfeed_info : outfeed_infos) {
+    if (outfeed_info->outfeed_config() == "get_last") {
+      const auto& outfeed_shape = outfeed_info->outfeed_shape();
+      if (outfeed_shape.IsTuple()) {
+        const auto num_elements = ShapeUtil::TupleElementCount(outfeed_shape);
+        xfeed_manager->outfeed()->set_size(num_elements);
+      } else {
+        xfeed_manager->outfeed()->set_size(1);
+      }
+    } else if (outfeed_info->outfeed_config() == "all") {
+      xfeed_manager->outfeed()->set_size(
+          PoplarXfeedQueueManager::DEFAULT_QUEUE_SIZE);
+    }
+  }
+}
 }  // namespace
 
 static std::string SerializeComputationToGraphDef(const HloComputation& comp) {
-  std::string buffer;
-  hlo_graph_dumper::HloTfGraphBuilder builder;
-  TF_CHECK_OK(builder.AddComputation(comp));
-  builder.GetGraphDef().SerializeToString(&buffer);
-  return buffer;
+  return hlo_graph_dumper::HloComputationToDotGraph(comp, {});
 }
 
 StatusOr<std::unique_ptr<HloModule>> PoplarCompiler::RunHloPasses(
@@ -309,12 +327,22 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   popops::addCodelets(resources.main_graph);
   poprand::addCodelets(resources.main_graph);
 
+  poplar::Graph* sharding_main_graph = &resources.main_graph;
+
+  int replication_count = poplarExecutor->GetNumberOfReplicas();
+  if (replication_count > 1) {
+    resources.replicated_graph =
+        resources.main_graph.createReplicatedGraph(replication_count);
+    VLOG(1) << "Created " << replication_count << " replica IPU graphs";
+    sharding_main_graph = &(resources.replicated_graph.value());
+  }
+
   if (ShardingEnabled(module.get())) {
-    auto numIPUs = resources.main_graph.getTarget().getNumIPUs();
-    auto tilesPerIPU = resources.main_graph.getTarget().getTilesPerIPU();
+    auto numIPUs = sharding_main_graph->getTarget().getNumIPUs();
+    auto tilesPerIPU = sharding_main_graph->getTarget().getTilesPerIPU();
     for (unsigned ipu = 0; ipu < numIPUs; ++ipu) {
       resources.shard_graphs.emplace_back(
-          resources.main_graph.createVirtualGraph(ipu * tilesPerIPU,
+          sharding_main_graph->createVirtualGraph(ipu * tilesPerIPU,
                                                   (ipu + 1) * tilesPerIPU));
     }
     VLOG(1) << "Created " << numIPUs << " IPU shards";
@@ -329,8 +357,13 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     simplifier_opts.set_enable_window_reduce_to_reduce_replacement(false);
 
     HloPassPipeline pipeline("IPU");
+    if (!poplarExecutor->RetainControlDependencies()) {
+      pipeline.AddPass<DependencyReplacer>(false);
+    }
     pipeline.AddPass<HloGetDimensionSizeRewriter>();
     pipeline.AddPass<HloComputationNameUniquify>();
+    pipeline.AddPass<CholeskyExpander>();
+    pipeline.AddPass<TriangularSolveExpander>();
     pipeline.AddPass<NotSupportedGatherExpander>();
     pipeline.AddPass<NotSupportedScatterExpander>();
     pipeline.AddPass<DynamicIndexSplitter>();
@@ -362,7 +395,6 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       pass.AddPass<WhileLoopConstantSinking>();
       pass.AddPass<HloPassFix<AlgebraicSimplifier>>(simplifier_opts);
       pass.AddPass<SortSimplifier>();
-      pass.AddPass<HloPassFix<FuseMaxPool>>(resources.annotations);
       pass.AddPass<HloPassFix<FuseOpsLate>>(resources.annotations);
       pass.AddPass<FuseWideConst>(resources.annotations);
       pass.AddPass<HloDCE>();
@@ -373,6 +405,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     pipeline.AddPass<NonLinearityRecomputaion>(
         poplarExecutor->NonLinearityRecomputaionEnabled());
     pipeline.AddPass<HloDCE>();
+    pipeline.AddPass<DependencyReplacer>(true);
     pipeline.AddPass<InplaceFinder>(resources.annotations);
     pipeline.AddPass<ShardingPass>();
     pipeline.AddPass<HloDCE>();
@@ -508,13 +541,18 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
                                              map_json, duration);
   }
 
+  ConfigurePoplarXFeedManager(resources.annotations.infeed_infos,
+                              resources.annotations.outfeed_infos,
+                              stream_exec->device_ordinal());
+
   std::unique_ptr<Executable> executable;
   PoplarExecutable* poplar_executable = new PoplarExecutable(
       std::move(module), std::move(profile_printer),
       std::move(profile_index_map), std::move(engine),
       std::move(resources.annotations.input_output_aliasing_map),
       is_constant_graph, std::move(constant_output), is_remap_graph,
-      std::move(remaped_output), std::move(resources.annotations.infeed_infos),
+      std::move(remaped_output), replication_count,
+      std::move(resources.annotations.infeed_infos),
       std::move(resources.annotations.outfeed_infos));
 
   executable.reset(poplar_executable);

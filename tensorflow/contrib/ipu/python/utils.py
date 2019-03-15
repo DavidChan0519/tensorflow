@@ -30,7 +30,8 @@ def create_ipu_config(profiling=False, enable_ipu_events=False,
                       use_poplar_text_report=False,
                       report_every_nth_execution=0,
                       always_rearrange_copies_on_the_host=False,
-                      disable_graph_convolution_caching=False):
+                      disable_graph_convolution_caching=False,
+                      retain_control_dependencies=False):
   """Create an empty IPU session configuration structure.
 
   Args:
@@ -61,6 +62,12 @@ def create_ipu_config(profiling=False, enable_ipu_events=False,
                                               convoltuion. This can improve 
                                               runtime at the expense of graph
                                               size.
+    :param retain_control_dependencies: When set to true, control dependencies
+                                        from the Tensorflow graph are passed
+                                        through to the backend.  This can result
+                                        in a different memory size due to
+                                        differing constraints on the operation
+                                        scheduler.
 
   Returns:
 
@@ -85,6 +92,9 @@ def create_ipu_config(profiling=False, enable_ipu_events=False,
   opts.speed_size_config.always_rearrange_copies_on_the_host = always_rearrange_copies_on_the_host
 
   opts.speed_size_config.disable_graph_convolution_caching = disable_graph_convolution_caching
+
+  opts.retain_control_dependencies = retain_control_dependencies
+
   return opts
 
 def set_compilation_options(opts, compilation_options=None):
@@ -259,7 +269,7 @@ def set_recomputation_options(opts, recompute_non_linearities=True):
 
   return opts
 
-def auto_select_ipus(opts, num_ipus, sharded=False):
+def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
   """Configure the IPUs to be used by the session.
 
   The configuration describes a system consisting of multiple Tensorflow
@@ -301,6 +311,8 @@ def auto_select_ipus(opts, num_ipus, sharded=False):
     :param opts: An IPUOptions session control protobuf.
     :param num_ipus: List of IPUs per Tensorflow device
     :param sharded: Deprecated.
+    :param number_of_replicas: The number of replicas to divide the device into.
+                               This should be a divisor of the number of IPUs.
   Returns:
 
     :return: The IPUOptions configuration protobuf, configured for
@@ -312,22 +324,29 @@ def auto_select_ipus(opts, num_ipus, sharded=False):
   if not isinstance(num_ipus, (int, list, tuple)):
     raise Exception("`num_ipus` must be an integer, list or tuple.")
 
+  if number_of_replicas is not None:
+    if type(number_of_replicas) is not type(num_ipus):
+      raise Exception("`number_of_replicas` must be same type as `num_ipus`")
+
   if sharded:
     logging.warning("`sharded` has been deprecated.  Mark operations with a "
                     "sharding attribute to enable sharding")
 
-
   if isinstance(num_ipus, int):
     dev = opts.device_config.add()
     dev.auto_count = num_ipus
+    if isinstance(number_of_replicas, (int)):
+      dev.num_replicas = number_of_replicas
   else:
-    for n in num_ipus:
+    for i, n in enumerate(num_ipus):
       dev = opts.device_config.add()
       dev.auto_count = n
+      if isinstance(number_of_replicas, (list, tuple)):
+        dev.num_replicas = number_of_replicas[i]
 
   return opts
 
-def select_ipus(opts, indices, sharded=False):
+def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
   """Configure the IPUs to be used by the session.
 
   The configuration describes a system consisting of multiple Tensorflow
@@ -493,6 +512,8 @@ def select_ipus(opts, indices, sharded=False):
     :param opts: An IPUOptions session control protobuf.
     :param indicies: List of IPU configuration indicies.
     :param sharded: Deprecated.
+    :param number_of_replicas: The number of replicas to divide the device into.
+                               This should be a divisor of the number of IPUs.
   Returns:
 
     :return: The IPUOptions configuration protobuf, with a number of devices
@@ -505,13 +526,19 @@ def select_ipus(opts, indices, sharded=False):
   if not isinstance(indices, (list, tuple)):
     raise Exception("`indicies` must be a list or tuple.")
 
+  if number_of_replicas is not None:
+    if not isinstance(number_of_replicas, (list, tuple)):
+      raise Exception("`number_of_replicas` must be a list or tuple.")
+
   if sharded:
     logging.warning("`sharded` has been deprecated.  Mark operations with a "
                     "sharding attribute to enable sharding")
 
-  for i in indices:
+  for n, i in enumerate(indices):
     dev = opts.device_config.add()
     dev.cfg_index = i
+    if isinstance(number_of_replicas, (list, tuple)):
+      dev.num_replicas = number_of_replicas[n]
 
   return opts
 
@@ -601,35 +628,47 @@ def extract_all_io_events(events):
         pass
   return result
 
-def extract_execution_state_timing_list_from_events(events):
-  """Get execution state timing lists out of the execution event trace. Any
-  execution events which have a timing list will be included in the results.
-  :param events: A list of IpuTraceEvent objects
-  :return: A list of one entry per execute event, of a tuple containing the
-           module name and the execution state timings list"""
+def extract_compile_reports(events):
+  """Get a list of all compiler reports in the event list.
+  :param events: A list of trace event serialized protobufs
+  :return: A list of tuples containing the module namd and report."""
+  result = []
+  for e in events:
+    evt = IpuTraceEvent.FromString(e)
+    if evt.type == IpuTraceEvent.COMPILE_END:
+      try:
+        module = evt.compile_end.module_name.decode('utf-8')
+        rep = evt.compile_end.compilation_report.decode('utf-8')
+        result += [(module, rep)]
+      except UnicodeDecodeError:
+        pass
+  return result
+
+def extract_execute_reports(events):
+  """Get a list of all compiler reports in the event list.
+  :param events: A list of trace event serialized protobufs
+  :return: A list of tuples containing the module namd and report."""
   result = []
   for e in events:
     evt = IpuTraceEvent.FromString(e)
     if evt.type == IpuTraceEvent.EXECUTE:
       try:
         module = evt.execute.module_name.decode('utf-8')
-        timings = evt.execute.activity_trace.decode('utf-8')
-        result += [(module, timings)]
+        rep = evt.execute.execution_report.decode('utf-8')
+        result += [(module, rep)]
       except UnicodeDecodeError:
         pass
   return result
 
-def extract_xla_graph_def_from_compilation_event(evt):
+def extract_graphviz_from_compilation_event(evt):
   """Return the final optimized XLA graph from a COMPILE_BEGIN event.
   :param evt: An IpuTraceEvent which is of type COMPILE_BEGIN.
-  :return: A GraphDef of the main XLA computation.
+  :return: A DOT file string of the main XLA computation.
   """
   if evt.type != IpuTraceEvent.COMPILE_BEGIN:
     raise Exception(
       "`evt` must be a COMPILE_BEGIN event")
-  gdef = graph_pb2.GraphDef()
-  gdef.ParseFromString(evt.compile_begin.xla_graph)
-  return gdef
+  return evt.compile_begin.xla_graph
 
 def get_memory_size_from_events(events):
   """Get the total memory consumption for the first compilation in the list

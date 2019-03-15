@@ -32,8 +32,8 @@ PoplarExecutable::PoplarExecutable(
     const InputOutputAliasingMap& input_output_aliasing_map,
     const bool is_constant_graph,
     std::vector<std::vector<Literal>> literal_output, const bool is_remap_graph,
-    std::vector<uint64> remaped_output, const InfeedInfos& infeed_infos,
-    const OutfeedInfos& outfeed_infos)
+    std::vector<uint64> remaped_output, int replication_count,
+    const InfeedInfos& infeed_infos, const OutfeedInfos& outfeed_infos)
     : Executable(std::move(hlo_module), std::move(profile_printer),
                  std::move(profile_index_map)),
       poplar_engine_(std::move(engine)),
@@ -43,8 +43,16 @@ PoplarExecutable::PoplarExecutable(
       remaped_output_(std::move(remaped_output)),
       is_remap_graph_(is_remap_graph),
       execution_count_(0),
+      replication_count_(replication_count),
       infeed_infos_(std::move(infeed_infos)),
-      outfeed_infos_(std::move(outfeed_infos)) {}
+      outfeed_infos_(std::move(outfeed_infos)) {
+  auto platform =
+      se::MultiPlatformManager::PlatformWithName(tensorflow::PLATFORM_NAME);
+  if (platform.ok()) {
+    auto* p = static_cast<PoplarPlatform*>(platform.ValueOrDie());
+    p->ResetXfeedManagers();
+  }
+}
 
 PoplarExecutable::~PoplarExecutable() {
   if (poplar_engine_.get() != nullptr) {

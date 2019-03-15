@@ -7,7 +7,7 @@ import re
 
 from tensorflow.compiler.plugin.poplar.driver.trace_pb2 import IpuTraceEvent
 from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
-from tensorflow.contrib.compiler import xla
+from tensorflow.contrib.ipu import ipu_compiler
 from tensorflow.core.protobuf import config_pb2
 from tensorflow.python.client import session as sl
 from tensorflow.python.framework import test_util
@@ -64,6 +64,15 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
     self.assertTrue(cfg.device_config[1].auto_count, 4)
 
     cfg = ipu.utils.create_ipu_config()
+    cfg = ipu.utils.auto_select_ipus(cfg, [4, 4], number_of_replicas=[2, 1])
+    self.assertTrue(isinstance(cfg, config_pb2.IPUOptions))
+    self.assertTrue(len(cfg.device_config), 2)
+    self.assertTrue(cfg.device_config[0].auto_count, 4)
+    self.assertTrue(cfg.device_config[0].num_replicas, 2)
+    self.assertTrue(cfg.device_config[1].auto_count, 4)
+    self.assertTrue(cfg.device_config[1].num_replicas, 1)
+
+    cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.select_ipus(cfg, [2, 3])
     self.assertTrue(isinstance(cfg, config_pb2.IPUOptions))
     self.assertTrue(len(cfg.device_config), 2)
@@ -82,6 +91,14 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       cfg = ipu.utils.create_ipu_config()
       cfg = ipu.utils.auto_select_ipus(cfg, [4, 4])
       cfg = ipu.utils.select_ipus(cfg, [4, 4])
+
+    with self.assertRaises(Exception):
+      cfg = ipu.utils.create_ipu_config()
+      cfg = ipu.utils.auto_select_ipus(cfg, [4, 4], number_of_replicas=1)
+
+    with self.assertRaises(Exception):
+      cfg = ipu.utils.create_ipu_config()
+      cfg = ipu.utils.select_ipus(cfg, [4, 4], number_of_replicas=1)
 
     with self.assertRaises(Exception):
       cfg = ipu.utils.create_ipu_config(profiling=True, enable_ipu_events=True)
@@ -125,7 +142,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       events = gen_ipu_ops.ipu_event_trace()
 
     with ipu.ops.ipu_scope("/device:IPU:0"):
-      r = xla.compile(my_net, inputs=[a, b])
+      r = ipu_compiler.compile(my_net, inputs=[a, b])
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
@@ -145,16 +162,21 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       evts = ipu.utils.extract_all_events(e)
       self.assertEqual(count_compile_end_events(evts), 1)
 
-      t_list = ipu.utils.extract_execution_state_timing_list_from_events(e)
-      self.assertEqual(len(t_list), 1)
-      self.assertEqual(type(t_list), list)
-      self.assertEqual(type(t_list[0]), tuple)
-      self.assertTrue(t_list[0][0].startswith("cluster"))
+      compilation_rep  = ipu.utils.extract_compile_reports(e)
+      self.assertEqual(len(compilation_rep), 1)
+      self.assertEqual(type(compilation_rep), list)
+      self.assertEqual(type(compilation_rep[0]), tuple)
+      self.assertTrue(compilation_rep[0][0].startswith("cluster"))
+      self.assertTrue(len(compilation_rep[0][1]) > 1000)
+      self.assertTrue(compilation_rep[0][1].startswith('{'))
 
-      lines = t_list[0][1].split()
-      for l in lines:
-        m = re.match(r'\d+,\d+,\d+,\d+,\d+$', l)
-        self.assertTrue(m)
+      execution_rep  = ipu.utils.extract_execute_reports(e)
+      self.assertEqual(len(execution_rep), 1)
+      self.assertEqual(type(execution_rep), list)
+      self.assertEqual(type(execution_rep[0]), tuple)
+      self.assertTrue(execution_rep[0][0].startswith("cluster"))
+      self.assertTrue(len(execution_rep[0][1]) > 1000)
+      self.assertTrue(execution_rep[0][1].startswith('{'))
 
   def testIpuWhileScope(self):
     # 1: design is targetted at the device
@@ -185,7 +207,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     with ipu.ops.ipu_scope("/device:IPU:0"):
 
-      l = xla.compile(my_net, inputs=[a, b])
+      l = ipu_compiler.compile(my_net, inputs=[a, b])
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)

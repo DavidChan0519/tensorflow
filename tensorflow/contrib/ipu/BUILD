@@ -14,7 +14,9 @@ py_library(
       "__init__.py",
       "python/autoshard.py",
       "python/autoshard_cnn.py",
+      "python/ipu_compiler.py",
       "python/ipu_infeed_queue.py",
+      "python/ipu_outfeed_queue.py",
       "python/loops.py",
       "python/ops.py",
       "python/popnn_normalization.py",
@@ -99,6 +101,7 @@ tf_py_test(
 tf_py_test(
     name = "resnet18_nobn_test",
     size = "large",
+    shard_count = 2,
     srcs = ["size_speed_tests/resnet18_nobn_test.py"],
     additional_deps = [
         ":ipu",
@@ -156,6 +159,7 @@ tf_py_test(
     additional_deps = [
         ":ipu",
         "//tensorflow:tensorflow_py",
+        "//tensorflow/compiler/plugin/poplar:test_utils_py",
         "//tensorflow/contrib/compiler:xla",
         "//tensorflow/python:array_ops",
         "//tensorflow/python:framework",
@@ -258,6 +262,7 @@ test_suite(
     tests = [
       ":all_tests",
       "//tensorflow/compiler/tests:poplar_tests",
+      "//tensorflow/compiler/xla/client/lib:poplar_tests",
       "//tensorflow/compiler/xla/tests:poplar_tests",
       "//tensorflow/compiler/plugin/poplar:all_tests",
     ],
