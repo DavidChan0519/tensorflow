@@ -18,33 +18,52 @@ using ::absl::StrCat;
 namespace xla {
 namespace poplarplugin {
 
-poplar::Graph& GetGraph(CompilerResources& res, const HloInstruction* inst) {
-  if (inst->has_sharding()) {
-    const auto& sharding = inst->sharding();
-    if (sharding.HasUniqueDevice()) {
-      uint64 device_id = sharding.GetUniqueDevice();
-      if (device_id < res.shard_graphs.size()) {
-        return res.shard_graphs[device_id];
-      }
-    }
+poplar::Graph& GetMasterGraph(CompilerResources& res) { return res.main_graph; }
+
+poplar::Graph& GetReplicatedGraph(CompilerResources& res) {
+  if (res.replicated_graph) {
+    return *res.replicated_graph;
   }
 
-  if (res.replicated_graph.has_value()) {
-    return res.replicated_graph.value();
-  }
-
-  return res.main_graph;
+  return GetMasterGraph(res);
 }
 
-uint64 GetShardingDeviceId(const HloInstruction* inst) {
-  // This function works on the assumptions:
-  // * that all the instructions either have sharding or none of them do (see
-  //   ShardingPass).
-  // * If an instruction has sharding, then that sharding contains a unique
-  //   device.
-  return inst->has_sharding() && inst->sharding().HasUniqueDevice()
-             ? inst->sharding().GetUniqueDevice()
-             : 0;
+uint64 GetShardForOutputIndex(const HloInstruction* inst,
+                              int flattened_output_tuple_index) {
+  if (inst->has_sharding()) {
+    const auto& sharding = GetShardingDeviceIdVector(inst->sharding());
+    if (flattened_output_tuple_index >= sharding.size()) {
+      LOG(FATAL) << "Sharding index out of range on " << inst->ToString();
+    }
+
+    return sharding[flattened_output_tuple_index];
+  }
+
+  return 0;
+}
+
+poplar::Graph& GetGraphWithOutputIndex(CompilerResources& res,
+                                       const HloInstruction* inst,
+                                       int flattened_output_tuple_index) {
+  if (inst->has_sharding()) {
+    int device_id = GetShardForOutputIndex(inst, flattened_output_tuple_index);
+
+    if (device_id >= res.shard_graphs.size()) {
+      LOG(FATAL) << "Graph index out of range on " << inst->ToString();
+    }
+
+    return res.shard_graphs[device_id];
+  }
+
+  return GetReplicatedGraph(res);
+}
+
+poplar::Graph& GetGraph(CompilerResources& res, const HloInstruction* inst) {
+  return GetGraphWithOutputIndex(res, inst, 0);
+}
+
+bool HasReplicatedGraph(CompilerResources& res) {
+  return res.replicated_graph.has_value();
 }
 
 template <typename TYPE>

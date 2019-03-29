@@ -26,6 +26,7 @@ limitations under the License.
 #include "tensorflow/stream_executor/host/host_timer.h"
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_annotations.h"
+#include "tensorflow/compiler/plugin/poplar/driver/config.pb.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/input_output_aliasing_map.h"
 #include "tensorflow/compiler/plugin/poplar/driver/trace.pb.h"
 #include "tensorflow/compiler/plugin/poplar/driver/transfer_manager.h"
@@ -43,9 +44,9 @@ limitations under the License.
 #include "tensorflow/stream_executor/stream_executor_internal.h"
 
 #include "tensorflow/core/framework/dataset.h"
+#include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/lib/gtl/array_slice.h"
 #include "tensorflow/core/lib/io/path.h"
-#include "tensorflow/core/protobuf/config.pb.h"
 
 #include <list>
 #include <mutex>
@@ -247,7 +248,7 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   std::string GetDeviceTargetName() const;
 
-  Status ConfigurePoplarDevice(const tensorflow::IPUOptions&);
+  Status ConfigurePoplarDevice(const IpuOptions&);
 
   const poplar::Device& GetPoplarDevice() const { return poplar_device_; }
 
@@ -283,11 +284,11 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
         .disable_graph_convolution_caching();
   }
 
-  bool NonLinearityRecomputaionEnabled() const {
+  bool NormInputRecomputationEnabled() const {
     // Re-computation of non linearities is enabled by default unless the user
     // has specifically told us not to do it.
-    return current_config_.speed_size_config().has_recompute_non_linearities()
-               ? current_config_.speed_size_config().recompute_non_linearities()
+    return current_config_.speed_size_config().has_recompute_norm_inputs()
+               ? current_config_.speed_size_config().recompute_norm_inputs()
                : false;
   }
 
@@ -299,7 +300,7 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
     return current_config_.retain_control_dependencies();
   }
 
-  int GetNumberOfReplicas() const {
+  int64 GetNumberOfReplicas() const {
     if (current_config_.device_config_size() > ordinal_) {
       return current_config_.device_config(ordinal_).num_replicas();
     } else {
@@ -511,7 +512,20 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   // Connect buffers provided by transfer manager to Poplar
   // deviceToHostFIFO()
   void ConnectOutfeedToStreamCallback(se::StreamExecutor* executor,
-                                      const OutfeedInfos& outfeed_infos);
+                                      const OutfeedInfos& outfeed_infos,
+                                      const uint32 replication_factor);
+
+  // Creates and launches the thread which will fetch inputs from
+  // the InfeedDatasetIterator and enqueue them in the TransferManager.
+  // The thread is joined when the pointer is deleted.
+  void LaunchInfeedThread(se::StreamExecutor* executor,
+                          const InfeedInfos& infeed_infos);
+
+  std::function<void()> CreateInfeedIOThreadFunction(
+      se::StreamExecutor* executor, const InfeedInfos& infeed_infos);
+
+  // Sets cancellation flags and notifies the threads running in thread_pool_
+  void StopThreadPool();
 
   void DeferredDeallocation();
 
@@ -540,20 +554,34 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   ArgsHandleMap args_map_;
   OutputsHandleMap outputs_map_;
 
-  tensorflow::IPUOptions current_config_;
+  bool hardware_configured_;
+
+  IpuOptions current_config_;
 
   std::list<tensorflow::IpuTraceEvent> reports_;
+
+  std::atomic<bool> infeed_thread_cancelled_;
+
+  static const int NUM_THREADS = 1;
+  tensorflow::thread::ThreadPool thread_pool_;
 
   struct InfeedDatasetIterator {
     std::unique_ptr<tensorflow::data::IteratorBase> iterator;
     std::unique_ptr<tensorflow::data::IteratorContext> iterator_ctx;
     const std::vector<xla::Shape> shapes;
     std::vector<bool> used;
+    std::condition_variable tensors_dequeued_cv;
+
     std::vector<tensorflow::Tensor> tensors;
+
+    // Need to acquire mutex before calling this function
+    bool all_tensors_used() {
+      return absl::c_all_of(used, [](bool v) { return v; });
+    }
 
     // Mutex used to make sure only one callback is accessing the dataset
     // iterator.
-    std::recursive_mutex mutex;
+    std::mutex mutex;
 
     InfeedDatasetIterator(
         std::unique_ptr<tensorflow::data::IteratorBase> iterator,
@@ -562,10 +590,11 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
         : iterator(std::move(iterator)),
           iterator_ctx(std::move(iterator_ctx)),
           shapes(std::move(shapes)),
-          used(shapes.size(), true){};
+          used(shapes.size(), true) {}
   };
+
   absl::flat_hash_map<std::string, std::unique_ptr<InfeedDatasetIterator>>
-      infeed_dataset_iterators;
+      infeed_dataset_iterators_;
 };
 
 }  // namespace poplarplugin

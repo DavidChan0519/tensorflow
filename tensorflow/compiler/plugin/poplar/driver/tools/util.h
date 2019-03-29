@@ -48,7 +48,34 @@ absl::optional<To> convert_scalar(const From& from) {
   return check_convert_ok(to, from) ? absl::optional<To>(to) : absl::nullopt;
 };
 
+// Check if there are any operations in the computation which have sharding
+// information
+bool HaveSharding(HloComputation* comp);
+
+// Check if there are any operations in the module which have sharding
+// information
+bool HaveSharding(HloModule* module);
+
+// Check whether the sharding info contains only supported sharding
+bool IsSupportedSharding(const HloSharding& sharding);
+
+// Get the sharding for a particular input operand of an instruction
+HloSharding GetShardingForOperand(const HloInstruction* inst, int operand);
+
+// Get sharding information for the output of an instruction
+const HloSharding& GetShardingOfOutputTensor(const HloInstruction* inst);
+
+// Get the vector of maximal sharding ids from the leaf nodes of a sharding
+// object
+std::vector<int64> GetShardingDeviceIdVector(const HloSharding& sharding);
+
+// Get the sharding Id of the output tensor, given the knowledge that the
+// sharding must be a single value.
+int64 GetSingleShardingDeviceId(const HloInstruction* inst);
+
+// Count the number of leaf shapes in a shape tuple
 int64 CountShapes(const Shape& shape);
+
 // Find the index when embedding a shape into a tuple. The tuple_index is the
 // index of the shape in the new tuple, and the original_index is the index
 // of the tensor in the original shape.

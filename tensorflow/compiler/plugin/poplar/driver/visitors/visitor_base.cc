@@ -179,7 +179,29 @@ Status BaseVisitor::HandleConvolution(HloInstruction* inst) {
 }
 
 Status BaseVisitor::HandleAllReduce(HloInstruction* inst) {
-  return Unimplemented(inst);
+  VLOG(1) << "Processing " << inst->name();
+
+  auto reduction = inst->to_apply();
+  auto reduction_root = reduction->root_instruction();
+
+  if (reduction_root->opcode() != HloOpcode::kAdd) {
+    return xla::FailedPrecondition(
+        "Unsupported all-reduce reduction computation.");
+  }
+
+  for (auto& reduction_operand : reduction_root->operands()) {
+    if (reduction_operand->opcode() != HloOpcode::kParameter) {
+      return xla::FailedPrecondition(
+          "Unsupported all-reduce reduction computation.");
+    }
+  }
+
+  TF_ASSIGN_OR_RETURN(
+      auto seq, CreateReplicatedAllReduce(resources_, inst,
+                                          GetOutputShape(inst), tensor_map));
+
+  sequence.add(seq);
+  return Status::OK();
 }
 
 Status BaseVisitor::HandleRng(HloInstruction* inst) {
@@ -237,13 +259,13 @@ Status BaseVisitor::HandleConstant(HloInstruction* inst) {
 Status BaseVisitor::HandleGetTupleElement(HloInstruction* inst) {
   VLOG(1) << "Processing " << inst->name();
   TF_ASSIGN_OR_RETURN(
-      ArgVectors inputs,
+      ArgVectors output_tensors,
       GetInplaceOutputTensors(tensor_map, resources_, inst, sequence));
-  CHECK_EQ(inputs.size(), 1);
-  CHECK_EQ(inputs[0].size(), CountShapes(inst->shape()));
-  for (int64 i = 0; i < inputs[0].size(); i++) {
+  CHECK_EQ(output_tensors.size(), 1);
+  CHECK_EQ(output_tensors[0].size(), CountShapes(inst->shape()));
+  for (int64 i = 0; i < output_tensors[0].size(); i++) {
     poplar::Tensor out;
-    TF_CHECK_OK(AddOutputTensor(tensor_map, inst, i, inputs[0][i]));
+    TF_CHECK_OK(AddOutputTensor(tensor_map, inst, i, output_tensors[0][i]));
   }
   return Status::OK();
 }
@@ -416,7 +438,6 @@ Status BaseVisitor::HandleOutfeed(HloInstruction* inst) {
   }
 
   HloOutfeedInstruction* outfeed = Cast<HloOutfeedInstruction>(inst);
-  poplar::Graph& graph = GetGraph(resources_, inst);
   poplar::program::Sequence& seq = sequence;
 
   // operand 1 is the input
@@ -445,6 +466,12 @@ Status BaseVisitor::HandleOutfeed(HloInstruction* inst) {
 
   for (unsigned i = 0; i < input_tensors.size(); ++i) {
     poplar::Tensor& in = input_tensors[i];
+    poplar::Graph& graph = GetMasterGraph(resources_);
+
+    if (HasReplicatedGraph(resources_)) {
+      in = graph.getNonReplicatedTensor(in);
+    }
+
     auto fifo = graph.addDeviceToHostFIFO(GetOutfeedCopyHandle(inst->name(), i),
                                           in.elementType(), in.numElements());
 

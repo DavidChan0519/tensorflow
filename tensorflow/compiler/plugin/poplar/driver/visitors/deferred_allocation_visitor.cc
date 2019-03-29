@@ -29,10 +29,15 @@ namespace poplarplugin {
 Status DeferredAllocationVisitor::AllocateInput(const HloInstruction* inst,
                                                 int64 flat_tuple_index,
                                                 const Shape& shape) {
-  poplar::Graph& graph = GetGraph(resources_, inst);
+  poplar::Graph& graph =
+      GetGraphWithOutputIndex(resources_, inst, flat_tuple_index);
 
   auto source = std::make_pair(inst, flat_tuple_index);
-  // Do the allocation.
+
+  // Do the allocation
+  VLOG(2) << "Allocating input tensor for " << inst->name() << ":"
+          << flat_tuple_index << " shape " << shape.ToString() << " on shard "
+          << GetShardForOutputIndex(inst, flat_tuple_index);
   TF_ASSIGN_OR_RETURN(poplar::Tensor out,
                       AddTensor(graph, source, shape, resources_, tensor_map));
 
@@ -167,13 +172,19 @@ Status DeferredAllocationVisitor::HandleInfeed(HloInstruction* inst) {
 
 StatusOr<poplar::Tensor> DeferredAllocationVisitor::PostProcessInfeedAllocation(
     const HloInstruction* inst, int64 flat_tuple_index, poplar::Tensor tensor) {
-  poplar::Graph& graph = GetGraph(resources_, inst);
+  poplar::Graph& master_graph = GetMasterGraph(resources_);
   if (!UseSyntheticData()) {
-    auto fifo = graph.addHostToDeviceFIFO(
-        GetInfeedCopyHandle(inst->name(), flat_tuple_index),
-        tensor.elementType(), tensor.numElements());
+    poplar::Tensor master_tensor = tensor;
 
-    sequence.add(poplar::program::Copy(fifo, tensor, false));
+    if (HasReplicatedGraph(resources_)) {
+      master_tensor = master_graph.getNonReplicatedTensor(master_tensor);
+    }
+
+    auto fifo = master_graph.addHostToDeviceFIFO(
+        GetInfeedCopyHandle(inst->name(), flat_tuple_index),
+        master_tensor.elementType(), master_tensor.numElements());
+
+    sequence.add(poplar::program::Copy(fifo, master_tensor, false));
   }
   return tensor;
 }

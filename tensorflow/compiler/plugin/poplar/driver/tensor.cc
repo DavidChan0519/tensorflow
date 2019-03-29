@@ -38,6 +38,7 @@ limitations under the License.
 #include "tensorflow/core/util/bcast.h"
 #include "tensorflow/stream_executor/lib/status.h"
 
+#include "absl/algorithm/container.h"
 #include "absl/strings/str_cat.h"
 
 #include <poplar/Engine.hpp>
@@ -55,17 +56,6 @@ namespace xla {
 namespace poplarplugin {
 namespace {
 using TensorVector = std::vector<std::pair<TensorKey, poplar::Tensor>>;
-
-bool InstructionSharded(const HloInstruction* a) {
-  if (a->has_sharding()) {
-    const auto& a_sharding = a->sharding();
-    if (a_sharding.HasUniqueDevice()) {
-      return true;
-    }
-  }
-
-  return false;
-}
 
 TensorVector GetTensorsInMap(
     const TensorMap& map, const HloInstruction* inst,
@@ -91,13 +81,14 @@ ArgVector GetTensorsMaybeExpand(
     absl::optional<int64> opt_tensors_end = absl::nullopt) {
   TensorVector tensor_vector =
       GetTensorsInMap(map, inst, opt_tensors_start, opt_tensors_end);
-  auto& graph = GetGraph(res, inst);
   ArgVector outputs;
   for (auto pair : tensor_vector) {
     const auto key = pair.first;
     poplar::Tensor tensor = pair.second;
     // Check if we need to expand the constant tensor.
     if (tensor.containsConstant() && expand_constants) {
+      auto& graph = GetGraphWithOutputIndex(res, inst, key.second);
+
       const auto& mapping = graph.getTileMapping(tensor);
       // We only expand the constant tensor if it's mapped to 1 tile and it is
       // not a tensor of scalar shape.
@@ -513,6 +504,116 @@ static StatusOr<poplar::Tensor> AddMatMulAddBiasTensor(
   return poplin::createBiases(graph, acts, debug_name);
 }
 
+// Compute the poplar shape of a grouped matmul's LHS
+static std::vector<std::size_t> PoplarLeftMatMulShape(
+    const std::vector<std::size_t>& left_shape,
+    const DotDimensionNumbers& dim_numbers) {
+  auto lhs_reduction_dimensions = dim_numbers.lhs_contracting_dimensions();
+  auto lhs_batch_dimensions = dim_numbers.lhs_batch_dimensions();
+
+  std::size_t b = 1;
+  std::size_t m = 1;
+  std::size_t k = 1;
+
+  for (int i = 0; i < left_shape.size(); ++i) {
+    if (absl::c_find(lhs_batch_dimensions, i) != lhs_batch_dimensions.end()) {
+      b *= left_shape[i];
+    } else if (absl::c_find(lhs_reduction_dimensions, i) !=
+               lhs_reduction_dimensions.end()) {
+      k *= left_shape[i];
+    } else {
+      m *= left_shape[i];
+    }
+  }
+
+  return {b, m, k};
+}
+
+// Compute the poplar shape of a grouped matmul's RHS
+static std::vector<std::size_t> PoplarRightMatMulShape(
+    const std::vector<std::size_t>& right_shape,
+    const DotDimensionNumbers& dim_numbers) {
+  auto rhs_reduction_dimensions = dim_numbers.rhs_contracting_dimensions();
+  auto rhs_batch_dimensions = dim_numbers.rhs_batch_dimensions();
+
+  std::size_t b = 1;
+  std::size_t n = 1;
+  std::size_t k = 1;
+
+  for (int i = 0; i < right_shape.size(); ++i) {
+    if (absl::c_find(rhs_batch_dimensions, i) != rhs_batch_dimensions.end()) {
+      b *= right_shape[i];
+    } else if (absl::c_find(rhs_reduction_dimensions, i) !=
+               rhs_reduction_dimensions.end()) {
+      k *= right_shape[i];
+    } else {
+      n *= right_shape[i];
+    }
+  }
+
+  return {b, k, n};
+}
+
+static std::vector<unsigned> InvertPermutation(
+    const std::vector<unsigned>& permutation) {
+  std::vector<unsigned> result(permutation.size());
+
+  for (int i = 0; i < permutation.size(); ++i) {
+    result[permutation[i]] = i;
+  }
+
+  return result;
+}
+
+// Reshape and permute the dimensions back from poplar to XLA
+static poplar::Tensor BackShapeLeftMatMul(
+    const std::vector<std::size_t>& shape, poplar::Tensor left,
+    const DotDimensionNumbers& dim_numbers) {
+  auto lhs_reduction_dimensions = dim_numbers.lhs_contracting_dimensions();
+  auto lhs_batch_dimensions = dim_numbers.lhs_batch_dimensions();
+
+  // Expand the matrix dimensions
+  std::vector<std::size_t> tmp_size;
+  tmp_size.reserve(shape.size());
+
+  for (int i = 0; i < lhs_batch_dimensions.size(); ++i) {
+    tmp_size.push_back(shape[lhs_batch_dimensions[i]]);
+  }
+
+  for (int i = 0; i < shape.size(); ++i) {
+    if (absl::c_find(lhs_batch_dimensions, i) == lhs_batch_dimensions.end() &&
+        absl::c_find(lhs_reduction_dimensions, i) ==
+            lhs_reduction_dimensions.end()) {
+      tmp_size.push_back(shape[i]);
+    }
+  }
+
+  for (int i = 0; i < lhs_reduction_dimensions.size(); ++i) {
+    tmp_size.push_back(shape[lhs_reduction_dimensions[i]]);
+  }
+
+  left = left.reshape(tmp_size);
+
+  // Permute the matrix dimensions back to the XLA shape
+  std::vector<unsigned> permutation;
+  permutation.reserve(left.rank());
+  permutation.insert(permutation.end(), lhs_batch_dimensions.begin(),
+                     lhs_batch_dimensions.end());
+
+  for (int i = 0; i < shape.size(); ++i) {
+    if (absl::c_find(lhs_batch_dimensions, i) == lhs_batch_dimensions.end() &&
+        absl::c_find(lhs_reduction_dimensions, i) ==
+            lhs_reduction_dimensions.end()) {
+      permutation.push_back(i);
+    }
+  }
+
+  permutation.insert(permutation.end(), lhs_reduction_dimensions.begin(),
+                     lhs_reduction_dimensions.end());
+
+  return left.dimShuffle(InvertPermutation(permutation));
+}
+
 static StatusOr<poplar::Tensor> AddLeftMatMul(poplar::Graph& graph,
                                               const std::string& debug_name,
                                               const xla::Shape& shape,
@@ -520,12 +621,64 @@ static StatusOr<poplar::Tensor> AddLeftMatMul(poplar::Graph& graph,
                                               CompilerResources& resources) {
   poplar::Type type;
   TF_ASSIGN_OR_RETURN(type, PoplarDataType(shape));
-  const auto& aShape = PoplarShapeFromXlaShape(target->operand(0)->shape());
-  const auto& bShape = PoplarShapeFromXlaShape(target->operand(1)->shape());
+  auto a_shape = PoplarShapeFromXlaShape(target->operand(0)->shape());
+  auto b_shape = PoplarShapeFromXlaShape(target->operand(1)->shape());
+  auto o_shape = a_shape;
+  a_shape = PoplarLeftMatMulShape(a_shape, target->dot_dimension_numbers());
+  b_shape = PoplarRightMatMulShape(b_shape, target->dot_dimension_numbers());
   auto name = StrCat(debug_name, "_lhs");
   poplar::OptionFlags opts;
-  return poplin::createMatMulInputLHS(graph, type, aShape, bShape, name, opts,
-                                      &resources.dot_cache);
+
+  auto result = poplin::createMatMulGroupedInputLHS(
+      graph, type, a_shape, b_shape, name, opts, &resources.dot_cache);
+
+  return BackShapeLeftMatMul(o_shape, result, target->dot_dimension_numbers());
+}
+
+// Reshape and permute the dimensions back from poplar to XLA
+static poplar::Tensor BackShapeRightMatMul(
+    const std::vector<std::size_t>& shape, poplar::Tensor right,
+    const DotDimensionNumbers& dim_numbers) {
+  auto rhs_reduction_dimensions = dim_numbers.rhs_contracting_dimensions();
+  auto rhs_batch_dimensions = dim_numbers.rhs_batch_dimensions();
+
+  // Expand the matrix dimensions
+  std::vector<std::size_t> tmp_size;
+  tmp_size.reserve(shape.size());
+
+  for (int i = 0; i < rhs_batch_dimensions.size(); ++i) {
+    tmp_size.push_back(shape[rhs_batch_dimensions[i]]);
+  }
+
+  for (int i = 0; i < rhs_reduction_dimensions.size(); ++i) {
+    tmp_size.push_back(shape[rhs_reduction_dimensions[i]]);
+  }
+
+  for (int i = 0; i < shape.size(); ++i) {
+    if (absl::c_find(rhs_batch_dimensions, i) == rhs_batch_dimensions.end() &&
+        absl::c_find(rhs_reduction_dimensions, i) ==
+            rhs_reduction_dimensions.end()) {
+      tmp_size.push_back(shape[i]);
+    }
+  }
+
+  right = right.reshape(tmp_size);
+
+  // Permute back to the XLA shape
+  std::vector<unsigned> permutation;
+  permutation.reserve(right.rank());
+  permutation.insert(permutation.end(), rhs_batch_dimensions.begin(),
+                     rhs_batch_dimensions.end());
+  permutation.insert(permutation.end(), rhs_reduction_dimensions.begin(),
+                     rhs_reduction_dimensions.end());
+
+  for (int i = 0; i < shape.size(); ++i) {
+    if (absl::c_find(permutation, i) == permutation.end()) {
+      permutation.push_back(i);
+    }
+  }
+
+  return right.dimShuffle(InvertPermutation(permutation));
 }
 
 static StatusOr<poplar::Tensor> AddRightMatMul(poplar::Graph& graph,
@@ -535,12 +688,20 @@ static StatusOr<poplar::Tensor> AddRightMatMul(poplar::Graph& graph,
                                                CompilerResources& resources) {
   poplar::Type type;
   TF_ASSIGN_OR_RETURN(type, PoplarDataType(shape));
-  const auto& aShape = PoplarShapeFromXlaShape(target->operand(0)->shape());
-  const auto& bShape = PoplarShapeFromXlaShape(target->operand(1)->shape());
+  auto a_shape = PoplarShapeFromXlaShape(target->operand(0)->shape());
+  auto b_shape = PoplarShapeFromXlaShape(target->operand(1)->shape());
+  auto o_shape = b_shape;
+  a_shape = PoplarLeftMatMulShape(a_shape, target->dot_dimension_numbers());
+  b_shape = PoplarRightMatMulShape(b_shape, target->dot_dimension_numbers());
   auto name = StrCat(debug_name, "_rhs");
   poplar::OptionFlags opts;
-  return poplin::createMatMulInputRHS(graph, type, aShape, bShape, name, opts,
-                                      &resources.dot_cache);
+
+  auto result = poplin::createMatMulGroupedInputRHS(
+      graph, type, a_shape, b_shape, name, opts, &resources.dot_cache);
+  result =
+      BackShapeRightMatMul(o_shape, result, target->dot_dimension_numbers());
+
+  return result;
 }
 
 StatusOr<poplar::Tensor> AddNormScaleTensor(
@@ -1240,7 +1401,6 @@ StatusOr<ArgVectors> GetInplaceOutputTensors(TensorMap& map,
   }
 
   // Go through all the inplace tensors and check if we need to add copies.
-  auto& graph = GetGraph(res, inst);
   for (uint64 i = 0; i < inplace_indexes.size(); i++) {
     for (uint64 j = 0; j < tensors[i].size(); j++) {
       poplar::Tensor t = tensors[i][j];
@@ -1251,6 +1411,7 @@ StatusOr<ArgVectors> GetInplaceOutputTensors(TensorMap& map,
           !t.isParallelWriteable() || !is_still_inplace;
       if (requires_copy_inplace) {
         VLOG(1) << "Adding a copy for inplace op " << inst->name();
+        auto& graph = GetGraphWithOutputIndex(res, inst, inplace_indexes[i]);
         poplar::Tensor copy = graph.clone(t, GetDebugName(inst) + ".clone");
         seq.add(poplar::program::Copy(t, copy));
         t = copy;

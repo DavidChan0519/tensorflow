@@ -20,6 +20,8 @@ limitations under the License.
 #include <stdlib.h>
 #include <unistd.h>
 #include <fstream>
+#include <limits>
+#include <random>
 
 #include "absl/strings/str_cat.h"
 
@@ -41,7 +43,8 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_ops_late.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_wide_const.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/hlo_computation_name_uniquify.h"
-#include "tensorflow/compiler/plugin/poplar/driver/passes/non_linearity_recomputation.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/inter_ipu_copy_inserter.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/norm_input_recomputation.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/not_supported_gather_expander.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/not_supported_scatter_expander.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/root_token_replacer.h"
@@ -57,7 +60,6 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/algebraic_simplifier.h"
 #include "tensorflow/compiler/xla/service/cholesky_expander.h"
 #include "tensorflow/compiler/xla/service/computation_placer.h"
-#include "tensorflow/compiler/xla/service/dot_decomposer.h"
 #include "tensorflow/compiler/xla/service/dynamic_index_splitter.h"
 #include "tensorflow/compiler/xla/service/hlo_constant_folding.h"
 #include "tensorflow/compiler/xla/service/hlo_cse.h"
@@ -89,6 +91,7 @@ limitations under the License.
 #include <poplin/codelets.hpp>
 #include <popnn/codelets.hpp>
 #include <popops/codelets.hpp>
+#include <poprand/RandomGen.hpp>
 #include <poprand/codelets.hpp>
 
 namespace se = ::stream_executor;
@@ -190,6 +193,26 @@ bool ShardingEnabled(const HloModule* module) {
       }
     }
   }
+  return false;
+}
+
+int64 MaximalShard(const HloModule* module) {
+  std::vector<HloComputation*> comps = module->MakeNonfusionComputations();
+  int64 maximal_shard = 0;
+  for (const auto* c : comps) {
+    for (const auto* inst : c->instructions()) {
+      if (inst->has_sharding()) {
+        auto sharding = inst->sharding();
+        if (IsSupportedSharding(sharding)) {
+          const auto& vec = GetShardingDeviceIdVector(sharding);
+          for (auto s : vec) {
+            maximal_shard = std::max(maximal_shard, s);
+          }
+        }
+      }
+    }
+  }
+  return maximal_shard;
 }
 
 bool AreAllOutputsParameters(
@@ -248,11 +271,65 @@ void ConfigurePoplarXFeedManager(const InfeedInfos& infeed_infos,
     }
   }
 }
-}  // namespace
 
-static std::string SerializeComputationToGraphDef(const HloComputation& comp) {
+std::string SerializeComputationToGraphDef(const HloComputation& comp) {
   return hlo_graph_dumper::HloComputationToDotGraph(comp, {});
 }
+
+HloPrintOptions GetPrintOptions() {
+  HloPrintOptions opts;
+  opts.set_print_operand_shape(false)
+      .set_print_percent(false)
+      .set_include_layout_in_shapes(false);
+  return opts;
+}
+
+std::pair<poplar::program::Program, poplar::DataStream> InitializeSeed(
+    poplar::Graph& master_graph, poplar::Graph& graph, int replication_factor,
+    poplar::program::Program& prog) {
+  const std::string seed_prefix = "__seed";
+
+  auto seed =
+      graph.addVariable(poplar::UNSIGNED_INT, {2}, seed_prefix + "/tensor");
+  graph.setTileMapping(seed, 0);
+
+  auto data_stream = master_graph.addHostToDeviceFIFO(
+      seed_prefix + "/stream", seed.elementType(),
+      seed.numElements() * std::max(replication_factor, 1));
+
+  poplar::program::Sequence seq;
+  if (replication_factor > 1) {
+    seq.add(poplar::program::Copy(data_stream,
+                                  master_graph.getNonReplicatedTensor(seed)));
+  } else {
+    seq.add(poplar::program::Copy(data_stream, seed));
+  }
+
+  poprand::setSeed(graph, seed, 0, seq, seed_prefix + "/set");
+
+  seq.add(prog);
+
+  return {seq, data_stream};
+}
+
+void ConnectSeedCallback(poplar::Engine& engine, int replication_factor,
+                         poplar::DataStream stream) {
+  std::random_device rd;
+  std::mt19937 gen(rd());
+
+  auto callback = [gen, replication_factor](void* ptr) mutable {
+    std::uniform_int_distribution<uint64_t> dis;
+    uint64_t* seedValue = reinterpret_cast<uint64_t*>(ptr);
+
+    for (int i = 0; i < replication_factor; ++i) {
+      seedValue[i] = dis(gen);
+    }
+  };
+
+  engine.connectStreamToCallback(stream, callback);
+}
+
+}  // namespace
 
 StatusOr<std::unique_ptr<HloModule>> PoplarCompiler::RunHloPasses(
     std::unique_ptr<HloModule> module,
@@ -319,6 +396,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
                               poplarExecutor->GetConvolutionOptions(),
                               poplarExecutor->GetPoolingOptions(),
                               poplarExecutor->DisableGraphConvCaching(),
+                              poplarExecutor->GetNumberOfReplicas(),
                               module.get());
 
   resources.main_graph.addCodelets(GetPathToGraphProgFile("tf.gp"));
@@ -329,23 +407,32 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
   poplar::Graph* sharding_main_graph = &resources.main_graph;
 
-  int replication_count = poplarExecutor->GetNumberOfReplicas();
-  if (replication_count > 1) {
+  const auto replication_factor = resources.replication_factor;
+  if (replication_factor > 1) {
     resources.replicated_graph =
-        resources.main_graph.createReplicatedGraph(replication_count);
-    VLOG(1) << "Created " << replication_count << " replica IPU graphs";
+        resources.main_graph.createReplicatedGraph(replication_factor);
+    VLOG(1) << "Created " << replication_factor << " replica IPU graphs.";
     sharding_main_graph = &(resources.replicated_graph.value());
   }
 
   if (ShardingEnabled(module.get())) {
-    auto numIPUs = sharding_main_graph->getTarget().getNumIPUs();
-    auto tilesPerIPU = sharding_main_graph->getTarget().getTilesPerIPU();
-    for (unsigned ipu = 0; ipu < numIPUs; ++ipu) {
-      resources.shard_graphs.emplace_back(
-          sharding_main_graph->createVirtualGraph(ipu * tilesPerIPU,
-                                                  (ipu + 1) * tilesPerIPU));
+    auto num_ipus = sharding_main_graph->getTarget().getNumIPUs();
+    // Check that we have enough IPUs for this sharding configuration.
+    auto maximal_shard = MaximalShard(module.get());
+    if (maximal_shard >= num_ipus) {
+      return xla::ResourceExhaustedStrCat(
+          "Trying to compile a graph for ", maximal_shard + 1,
+          " shards, however the Multi-IPU device ordinal ",
+          stream_exec->device_ordinal(), " is a configuration which has ",
+          num_ipus, " IPU", (num_ipus > 1 ? "s." : "."));
     }
-    VLOG(1) << "Created " << numIPUs << " IPU shards";
+    auto tiles_per_ipu = sharding_main_graph->getTarget().getTilesPerIPU();
+    for (unsigned ipu = 0; ipu < num_ipus; ++ipu) {
+      resources.shard_graphs.emplace_back(
+          sharding_main_graph->createVirtualGraph(ipu * tiles_per_ipu,
+                                                  (ipu + 1) * tiles_per_ipu));
+    }
+    VLOG(1) << "Created " << num_ipus << " IPU shards";
   }
 
   {
@@ -367,7 +454,6 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     pipeline.AddPass<NotSupportedGatherExpander>();
     pipeline.AddPass<NotSupportedScatterExpander>();
     pipeline.AddPass<DynamicIndexSplitter>();
-    pipeline.AddPass<DotDecomposer>();
     pipeline.AddPass<HloPassFix<ConstantSliceFolding>>();
     pipeline.AddPass<HloPassFix<FuseOpsEarly>>(resources.annotations);
     pipeline.AddPass<HloCSE>(false);
@@ -402,15 +488,18 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       pass.AddPass<WhileLoopToRepeatSimplify>();
     }
     pipeline.AddPass<HloSubcomputationUnification>();
-    pipeline.AddPass<NonLinearityRecomputaion>(
-        poplarExecutor->NonLinearityRecomputaionEnabled());
+    pipeline.AddPass<NormInputRecomputation>(
+        poplarExecutor->NormInputRecomputationEnabled());
     pipeline.AddPass<HloDCE>();
     pipeline.AddPass<DependencyReplacer>(true);
     pipeline.AddPass<InplaceFinder>(resources.annotations);
-    pipeline.AddPass<ShardingPass>();
-    pipeline.AddPass<HloDCE>();
     pipeline.AddPass<ExpressionOutliner>(resources.annotations);
     pipeline.AddPass<HloSubcomputationUnification>();
+    pipeline.AddPass<ShardingPass>();
+    pipeline.AddPass<InterIpuCopyInserter>();
+    pipeline.AddPass<HloDCE>();
+    // Beyond this point non of the passes in the pipeline are allowed to modify
+    // the instructions in the HloModule.
     pipeline.AddPass<ConvolutionClassifier>(resources.annotations);
     pipeline.AddPass<AllocationFinder>(resources.annotations);
     pipeline.AddPass<HloPassFix<ForwardAllocation>>(resources.annotations);
@@ -440,7 +529,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   }
 
   VLOG(1) << "Compiling main computation " << entry->name();
-  XLA_VLOG_LINES(1, module->ToString());
+  XLA_VLOG_LINES(1, module->ToString(GetPrintOptions()));
 
   std::unique_ptr<poplar::Engine> engine;
   std::vector<poplar::program::Program> progs;
@@ -470,12 +559,15 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       return PoplarExceptionToTensorflowStatus("[Build graph] ", e);
     }
 
+    auto seed_setup = InitializeSeed(resources.main_graph, *sharding_main_graph,
+                                     replication_factor, visitor.sequence);
+
     // =======================================================================
     // DO NOT CHANGE THE ORDER OF THESE WITHOUT UPDATING PoplarProgramType IN
     // exectutor.h
     // =======================================================================
     progs.push_back(visitor.GetHostToDevice());
-    progs.push_back(visitor.sequence);
+    progs.push_back(seed_setup.first);
     progs.push_back(visitor.GetDeviceToHost());
 
     char* vertex_filename = getenv("TF_DUMP_VERTEX_GRAPH");
@@ -498,8 +590,8 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
         // Generate this JSON early so that the VLOG trace can contain the
         // output whether the engine compilation completes or not.
-        map_json =
-            GetTensorMappingJson(resources.main_graph, resources.tensor_maps);
+        map_json = GetTensorMappingJson(GetReplicatedGraph(resources),
+                                        resources.tensor_maps);
 
         auto& opts = poplarExecutor->GetOptionsFlags();
         auto progress_logging = [](int progress, int total) {
@@ -511,6 +603,8 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
         engine.reset(new poplar::Engine(resources.main_graph, progs, opts,
                                         progress_logging));
+
+        ConnectSeedCallback(*engine, replication_factor, seed_setup.second);
       } catch (const std::exception& e) {
         return PoplarExceptionToTensorflowStatus("[Compile engine] ", e);
       }
@@ -551,7 +645,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       std::move(profile_index_map), std::move(engine),
       std::move(resources.annotations.input_output_aliasing_map),
       is_constant_graph, std::move(constant_output), is_remap_graph,
-      std::move(remaped_output), replication_count,
+      std::move(remaped_output), replication_factor,
       std::move(resources.annotations.infeed_infos),
       std::move(resources.annotations.outfeed_infos));
 

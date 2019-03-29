@@ -28,8 +28,15 @@ namespace poplarplugin {
  * This adds sharding information to operations which do not have any, but are
  * parents of operations which do.
  *
- * It also inserts inter-IPU copy operations between instructions which are on
- * different IPUs.
+ * The sharding represents the IPU where the output tensor of an operation is
+ * located. This will be in the same place as the operation vertices are
+ * located. Operations which output a tuple of tensors (batchnorm training)
+ * will have a tuple of sharding values, although they will all be the same.
+ *
+ * Plumbing ops and flow control ops (call, while, conditional, tuple, GTE) can
+ * have a 'single' or 'tuple' type sharding info, indicating where the tensors
+ * are that they produce.
+ *
  */
 class ShardingPass : public HloModulePass {
  public:

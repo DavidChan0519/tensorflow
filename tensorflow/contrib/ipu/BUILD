@@ -17,17 +17,21 @@ py_library(
       "python/ipu_compiler.py",
       "python/ipu_infeed_queue.py",
       "python/ipu_outfeed_queue.py",
+      "python/ipu_optimizer.py",
       "python/loops.py",
       "python/ops.py",
       "python/popnn_normalization.py",
       "python/popnn_rnn.py",
       "python/sharded_optimizer.py",
+      "python/popops_cross_replica_sum.py",
+      "python/sharding.py",
       "python/utils.py",
     ],
     srcs_version = "PY2AND3",
     deps = [
         "//tensorflow/compiler/plugin/poplar:ipu_ops_py",
         "//tensorflow/compiler/plugin/poplar:popnn_ops_py",
+        "//tensorflow/compiler/plugin/poplar:popops_ops_py",
         "//tensorflow/compiler/xla:xla_data_proto_py",
         "//tensorflow/contrib/compiler:compiler_py",
         "//tensorflow/contrib/layers:layers_py",
@@ -152,6 +156,22 @@ tf_py_test(
 )
 
 tf_py_test(
+    name = "while_loop_sharded_test",
+    size = "medium",
+    srcs = ["python/tests/while_loop_sharded_test.py"],
+    additional_deps = [
+        ":ipu",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:platform",
+        "//tensorflow/python:state_ops",
+        "//tensorflow/python:variables",
+    ],
+)
+
+tf_py_test(
     name = "multi_ipu_test",
     size = "medium",
     tags = ['exclusive'],
@@ -173,6 +193,22 @@ tf_py_test(
     name = "sort_op_test",
     size = "medium",
     srcs = ["python/tests/sort_op_test.py"],
+    additional_deps = [
+        ":ipu",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:platform",
+        "//tensorflow/python:state_ops",
+        "//tensorflow/python:variables",
+    ],
+)
+
+tf_py_test(
+    name = "popops_cross_replica_sum_test",
+    size = "medium",
+    srcs = ["python/tests/popops_cross_replica_sum_test.py"],
     additional_deps = [
         ":ipu",
         "//tensorflow:tensorflow_py",
@@ -226,19 +262,40 @@ tf_py_test(
     ],
 )
 
+tf_py_test(
+    name = "replicated_graph_test",
+    size = "large",
+    tags = ['exclusive'],
+    srcs = ["python/tests/replicated_graph_test.py"],
+    additional_deps = [
+        ":ipu",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/compiler/plugin/poplar:test_utils_py",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:platform",
+        "//tensorflow/python:state_ops",
+        "//tensorflow/python:variables",
+    ],
+)
+
 test_suite(
     name = "all_tests",
     tests = [
         "autoshard_cnn_test",
-        "ops_test",
-        "while_loop_perf_test",
         "conditional_test",
-        "mapping_test",
-        "while_loop_test",
-        "sort_op_test",
-        "multi_ipu_test",
         "infeed_outfeed_test",
+        "mapping_test",
+        "multi_ipu_test",
+        "ops_test",
         "popnn_normalization_test",
+        "popops_cross_replica_sum_test",
+        "replicated_graph_test",
+        "sort_op_test",
+        "while_loop_perf_test",
+        "while_loop_sharded_test",
+        "while_loop_test",
     ],
 )
 

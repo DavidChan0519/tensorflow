@@ -5,12 +5,99 @@
 #include "tensorflow/compiler/xla/primitive_util.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
+#include "tensorflow/compiler/xla/service/hlo_module.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 
 #include "absl/types/optional.h"
 
 namespace xla {
 namespace poplarplugin {
+
+bool IsSupportedSharding(const HloSharding& sharding) {
+  // We support unique single device sharding, representing an op/tensor which
+  // is on an IPU, or single device sharding in a tuple/tree, repesenting a
+  // tuple/tree of tensors on multiple devices.
+  if (sharding.IsTuple()) {
+    for (const auto& s : sharding.tuple_elements()) {
+      if (!sharding.HasUniqueDevice()) {
+        return false;
+      }
+    }
+    return true;
+  } else {
+    return sharding.HasUniqueDevice();
+  }
+}
+
+// Get the sharding for a particular input operand of an instruction
+HloSharding GetShardingForOperand(const HloInstruction* inst, int operand) {
+  switch (inst->opcode()) {
+    case HloOpcode::kCall: {
+      auto* comp = inst->to_apply();
+      return comp->parameter_instruction(operand)->sharding();
+    }
+    case HloOpcode::kWhile: {
+      auto* comp = inst->while_body();
+      return comp->parameter_instruction(operand)->sharding();
+    }
+    case HloOpcode::kConditional: {
+      auto* comp = inst->true_computation();
+      return comp->parameter_instruction(operand)->sharding();
+    }
+    case HloOpcode::kTuple: {
+      auto s = inst->sharding();
+      return s.GetSubSharding(inst->shape(), {operand});
+    }
+    default: { return inst->sharding(); }
+  }
+}
+
+const HloSharding& GetShardingOfOutputTensor(const HloInstruction* inst) {
+  return inst->sharding();
+}
+
+std::vector<int64> GetShardingDeviceIdVector(const HloSharding& sharding) {
+  std::vector<int64> ids;
+  if (sharding.IsTuple()) {
+    for (const auto& s : sharding.tuple_elements()) {
+      ids.push_back(s.GetUniqueDevice());
+    }
+  } else {
+    ids.push_back(sharding.GetUniqueDevice());
+  }
+  return ids;
+}
+
+bool HaveSharding(HloComputation* comp) {
+  for (auto* inst : comp->instructions()) {
+    if (inst->has_sharding()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HaveSharding(HloModule* module) {
+  for (auto* comp : module->computations()) {
+    if (IsPopOpsFusion(comp)) {
+      continue;
+    }
+
+    // If there is no sharding information, no need to continue
+    if (HaveSharding(comp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int64 GetSingleShardingDeviceId(const HloInstruction* inst) {
+  if (inst->has_sharding()) {
+    return GetShardingDeviceIdVector(inst->sharding())[0];
+  } else {
+    return 0;
+  }
+}
 
 int64 CountShapes(const Shape& shape) {
   int64 n = 0;
@@ -154,11 +241,6 @@ bool IsRepeatLoop(const xla::HloInstruction* inst) {
     }
   }
   return false;
-}
-
-bool IsSupportedSharding(const HloSharding& sharding) {
-  // We currently only support sharding with unique devices.
-  return sharding.HasUniqueDevice();
 }
 
 bool IsInterIpuCopy(const HloInstruction* inst) {

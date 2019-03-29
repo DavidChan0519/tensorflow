@@ -64,9 +64,27 @@ StatusOr<popops::expr::BinaryOpType> LookupBinaryFn(const HloInstruction*);
 Status SetVertexField(poplar::Graph& graph, const poplar::FieldRef& field,
                       const Literal& literal);
 
+// Get the master graph
+poplar::Graph& GetMasterGraph(CompilerResources&);
+
+// Get the replicated graph if there is one, master graph if not
+poplar::Graph& GetReplicatedGraph(CompilerResources&);
+
+// Get the appropriate virtual graph, or the replicated/master graph if not
 poplar::Graph& GetGraph(CompilerResources&, const HloInstruction*);
 
-uint64 GetShardingDeviceId(const HloInstruction* inst);
+// Get the shard Id for a given output of the given instruction.
+uint64 GetShardForOutputIndex(const HloInstruction* inst,
+                              int flattened_output_tuple_index);
+
+// Get the virtual graph for a particular output of an operation. Operations
+// like Parameter, Infeed, Call, While, Tuple can have multiple tensor
+// outputs on different IPUs.
+poplar::Graph& GetGraphWithOutputIndex(CompilerResources&,
+                                       const HloInstruction*,
+                                       int flattened_output_tuple_index);
+
+bool HasReplicatedGraph(CompilerResources&);
 
 // Convert a poplar/poplibs exception to a Tensorflow error Status
 Status PoplarExceptionToTensorflowStatus(const std::string& prefix,
@@ -304,6 +322,10 @@ StatusOr<poplar::program::Program> CreateInterIpuCopy(
     const xla::Shape& output_shape, TensorMap& tensor_map);
 
 StatusOr<poplar::program::Program> CreatePaddingReduceWindow(
+    CompilerResources& res, const HloInstruction* inst,
+    const xla::Shape& output, TensorMap& tensor_map);
+
+StatusOr<poplar::program::Program> CreateReplicatedAllReduce(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output, TensorMap& tensor_map);
 

@@ -44,23 +44,24 @@ from tensorflow.contrib.ipu import ipu_infeed_queue
 from tensorflow.contrib.ipu import ipu_outfeed_queue
 from tensorflow.contrib.ipu import loops
 
-def create_increasing_dataset(value, shape=[4,4], dtype=np.float32):
+
+def create_increasing_dataset(value, shape=[4, 4], dtype=np.float32):
   def _get_one_input(data):
     return math_ops.cast(
-            gen_array_ops.broadcast_to(data, shape=shape), dtype=dtype)
+        gen_array_ops.broadcast_to(data, shape=shape), dtype=dtype)
 
   dataset = Dataset.range(value).repeat().map(_get_one_input)
   return dataset
 
-class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
+class InfeedOutfeedTest(test_util.TensorFlowTestCase):
   def testSingleInfeedRepeatNonTuple(self):
     dataset = create_increasing_dataset(10)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
 
-    def body(v):
-      v = v + infeed_queue.get_next()
+    def body(v, x):
+      v = v + x
       return (v)
 
     def my_net(v):
@@ -75,9 +76,11 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
-      result = sess.run(res, {v:np.ones([4, 4], np.float32)})
+      result = sess.run(res, {v: np.ones([4, 4], np.float32)})
       self.assertAllClose(result[0], np.broadcast_to(91, [4, 4]))
 
   def testSingleInfeedRepeatTuple(self):
@@ -87,17 +90,17 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
       image_1 = value
       image_2 = (value + 10.) / 2.0
       return (image_1, image_2)
+
     dataset = dataset.map(dataset_parser)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
 
-    def body(v):
-      im1, im2 = infeed_queue.get_next()
+    def body(v, im1, im2):
       v = v + im1 + im2
       return (v)
 
     def my_net():
-      v = constant_op.constant(0.0, shape=[4,4], dtype=np.float32)
+      v = constant_op.constant(0.0, shape=[4, 4], dtype=np.float32)
       r = loops.repeat(5, body, [v], infeed_queue)
       return r
 
@@ -106,7 +109,9 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
       result = sess.run(res)
       self.assertAllClose(result[0], np.broadcast_to(31, [4, 4]))
@@ -117,20 +122,22 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
     def dataset_parser(value):
       image_1 = value
       image_2 = (value + 10.) / 2.0
-      return {"a": image_1,
-              "b": image_2}
+      return {"a": image_1, "b": image_2}
+
     dataset = dataset.map(dataset_parser)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
 
-    def body(v):
-      data = infeed_queue.get_next()
-      v = v + data["a"] + data["b"]
-      return (v)
+    # Note how the parameters are swapped around.
+    def body(v1, v2, b, a):
+      v1 = v1 + a
+      v2 = v2 + b
+      return (v1, v2)
 
     def my_net():
-      v = constant_op.constant(0.0, shape=[4,4], dtype=np.float32)
-      r = loops.repeat(5, body, [v], infeed_queue)
+      v1 = constant_op.constant(0.0, shape=[4, 4], dtype=np.float32)
+      v2 = constant_op.constant(0.0, shape=[4, 4], dtype=np.float32)
+      r = loops.repeat(5, body, [v1, v2], infeed_queue)
       return r
 
     with ipu.ops.ipu_scope("/device:IPU:0"):
@@ -138,58 +145,25 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
       result = sess.run(res)
-      self.assertAllClose(result[0], np.broadcast_to(31, [4, 4]))
-
-  def testSingleInfeedRepeatMultipleDequeues(self):
-    dataset = create_increasing_dataset(2)
-
-    def dataset_parser(value):
-      image_1 = value + 1
-      image_2 = image_1 * 2
-      return {"a": image_1,
-              "b": image_2}
-    dataset = dataset.map(dataset_parser)
-
-    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
-
-    # Note how we get the value for a from the first dequeue and value for b
-    # from the second dequeue.
-    def body(v):
-      v = v + infeed_queue.get_next()["a"] + infeed_queue.get_next()["b"]
-      return (v)
-
-    def my_net():
-      v = constant_op.constant(0.0, shape=[4,4], dtype=np.float32)
-      r = loops.repeat(5, body, [v], infeed_queue)
-      return r
-
-    with ipu.ops.ipu_scope("/device:IPU:0"):
-      res = ipu_compiler.compile(my_net, inputs=[])
-
-    cfg = ipu.utils.create_ipu_config()
-    cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
-      sess.run(infeed_queue.initializer)
-      with self.assertRaisesRegexp(errors.FailedPreconditionError,
-                                   'Currently calling'):
-        sess.run(res)
+      self.assertAllClose(result[0], np.broadcast_to(4, [4, 4]))
+      self.assertAllClose(result[1], np.broadcast_to(27, [4, 4]))
 
   def testSingleInfeedMultipleRepeats(self):
     dataset = create_increasing_dataset(2)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
 
-    # Note how we get the value for a from the first dequeue and value for b
-    # from the second dequeue.
-    def body(v):
-      v = v + infeed_queue.get_next()
+    def body(v, x):
+      v = v + x
       return (v)
 
     def my_net():
-      v = constant_op.constant(0.0, shape=[4,4], dtype=np.float32)
+      v = constant_op.constant(0.0, shape=[4, 4], dtype=np.float32)
       r = loops.repeat(5, body, [v], infeed_queue)
       r = loops.repeat(5, body, [r], infeed_queue)
       return r
@@ -199,7 +173,9 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
       result = sess.run(res)
       self.assertAllClose(result[0], np.broadcast_to(5, [4, 4]))
@@ -212,8 +188,8 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
     def cond(i, v):
       return i < 20
 
-    def body(i, v):
-      v = v + infeed_queue.get_next()
+    def body(i, v, x):
+      v = v + x
       return (i + 1, v)
 
     def my_net(v):
@@ -229,9 +205,11 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
-      result = sess.run(res, {v:np.ones([4, 4], np.float32)})
+      result = sess.run(res, {v: np.ones([4, 4], np.float32)})
       self.assertAllClose(result[0], np.broadcast_to(91, [4, 4]))
 
   def testSingleInfeedWhileLoopTuple(self):
@@ -241,6 +219,7 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
       image_1 = value
       image_2 = (value + 10.) / 2.0
       return (image_1, image_2)
+
     dataset = dataset.map(dataset_parser)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
@@ -248,8 +227,7 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
     def cond(i, v):
       return i < 20
 
-    def body(i, v):
-      im1, im2 = infeed_queue.get_next()
+    def body(i, v, im1, im2):
       v = v + im1 + im2
       return (i + 1, v)
 
@@ -266,9 +244,11 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
-      result = sess.run(res, {v:np.ones([4, 4], np.float32)})
+      result = sess.run(res, {v: np.ones([4, 4], np.float32)})
       self.assertAllClose(result[0], np.broadcast_to(129.5, [4, 4]))
 
   def testSingleInfeedMultipleRuns(self):
@@ -277,12 +257,12 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
 
     def program(iters):
-      def body(v):
-        v = v + infeed_queue.get_next()
+      def body(v, x):
+        v = v + x
         return (v)
 
       def my_net():
-        v = constant_op.constant(0.0, shape=[4,4], dtype=np.float32)
+        v = constant_op.constant(0.0, shape=[4, 4], dtype=np.float32)
         r = loops.repeat(iters, body, (v), infeed_queue)
         return r
 
@@ -291,7 +271,9 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
       result = sess.run(program(0))
       self.assertAllClose(result[0], np.broadcast_to(0, [4, 4]))
@@ -313,12 +295,12 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
     infeed_queue2 = ipu_infeed_queue.IPUInfeedQueue(dataset2)
 
     def program(iters, infeed_queue):
-      def body(v):
-        v = v + infeed_queue.get_next()
+      def body(v, x):
+        v = v + x
         return (v)
 
       def my_net():
-        v = constant_op.constant(0.0, shape=[4,4], dtype=np.float32)
+        v = constant_op.constant(0.0, shape=[4, 4], dtype=np.float32)
         r = loops.repeat(iters, body, (v), infeed_queue)
         return r
 
@@ -327,7 +309,9 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue1.initializer)
       sess.run(infeed_queue2.initializer)
       result = sess.run(program(5, infeed_queue1))
@@ -342,23 +326,25 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
   def testUndefinedShape(self):
     dataset = create_increasing_dataset(10)
     dataset = dataset.batch(10, drop_remainder=False)
-    with self.assertRaisesRegexp(ValueError,
-                                 'Output shape \(\?,'):
+    with self.assertRaisesRegexp(ValueError, 'Output shape \(\?,'):
       infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
 
   def testTrainingLoopWithInfeed(self):
-    dataset = create_increasing_dataset(10, shape=[4,4,2])
+    dataset = create_increasing_dataset(10, shape=[4, 4, 2])
     dataset = dataset.batch(batch_size=2, drop_remainder=True)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
 
     def my_net(iters):
-      def body(loss):
-        x = infeed_queue.get_next()
+      def body(loss, x):
         with variable_scope.variable_scope("vs", use_resource=True):
-          y = convolutional.conv2d(x, 2, 1, use_bias=True,
-                                 kernel_initializer=init_ops.ones_initializer(),
-                                 name='conv1')
+          y = convolutional.conv2d(
+              x,
+              2,
+              1,
+              use_bias=True,
+              kernel_initializer=init_ops.ones_initializer(),
+              name='conv1')
         loss = math_ops.reduce_sum(y)
         optimizer = gradient_descent.GradientDescentOptimizer(0.1)
         train = optimizer.minimize(loss)
@@ -381,13 +367,12 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
       final_loss = sess.run(r, {iters: 1000})
       self.assertTrue(initial_loss > final_loss)
 
-
   def testSingleOutfeedRepeatNonTuple(self):
 
     outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue()
 
     def body(v):
-      outfeed = outfeed_queue.enqueue([v])
+      outfeed = outfeed_queue.enqueue(v)
       v = v + 1
       return (v, outfeed)
 
@@ -401,17 +386,18 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
     with ipu.ops.ipu_scope("/device:IPU:0"):
       res = ipu_compiler.compile(my_net, inputs=[v])
 
-    cfg = ipu.utils.create_ipu_config(  )
+    cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
+    ipu.utils.configure_ipu_system(cfg)
 
     outfeed = outfeed_queue.dequeue()
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
-      result = sess.run(res, {v:np.ones([4, 4], np.float32)})
+    with session_lib.Session() as sess:
+      result = sess.run(res, {v: np.ones([4, 4], np.float32)})
 
       self.assertAllClose(result[0], np.broadcast_to(21, [4, 4]))
       outfed = sess.run(outfeed)
       for i in range(20):
-        self.assertAllClose(outfed[0][i], np.broadcast_to(i+1, [4, 4]))
+        self.assertAllClose(outfed[i], np.broadcast_to(i + 1, [4, 4]))
 
   def testSingleInfeedOutfeedRepeatNonTuple(self):
     dataset = create_increasing_dataset(10)
@@ -419,10 +405,9 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
     outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue()
 
-
-    def body(v):
-      v = v + infeed_queue.get_next()
-      outfeed = outfeed_queue.enqueue([v])
+    def body(v, x):
+      v = v + x
+      outfeed = outfeed_queue.enqueue(v)
       return (v, outfeed)
 
     def my_net(v):
@@ -437,16 +422,17 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
-      result = sess.run(res, {v:np.ones([4, 4], np.float32)})
+      result = sess.run(res, {v: np.ones([4, 4], np.float32)})
 
       self.assertAllClose(result[0], np.broadcast_to(91, [4, 4]))
       outfed = sess.run(outfeed_queue.dequeue())
-      self.assertEqual(outfed[0].shape, (20, 4, 4))
-      self.assertAllClose(outfed[0][-1], result[0])
-      self.assertAllClose(outfed[0][5], np.broadcast_to(16, [4, 4]))
-
+      self.assertEqual(outfed.shape, (20, 4, 4))
+      self.assertAllClose(outfed[-1], result[0])
+      self.assertAllClose(outfed[5], np.broadcast_to(16, [4, 4]))
 
   def testSingleInfeedOutfeedRepeatTuple(self):
     dataset = create_increasing_dataset(3)
@@ -456,13 +442,13 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
       image_1 = value
       image_2 = (value + 10.) / 2.0
       return (image_1, image_2)
+
     dataset = dataset.map(dataset_parser)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
     outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue()
 
-    def body(v):
-      im1, im2 = infeed_queue.get_next()
+    def body(v, im1, im2):
       v = v + im1 + im2
       outfeed = outfeed_queue.enqueue((v, im1, im2))
       return (v, outfeed)
@@ -478,7 +464,9 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
     outfed = outfeed_queue.dequeue()
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with session_lib.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
       sess.run(infeed_queue.initializer)
       result = sess.run(res)
       self.assertAllClose(result[0], np.broadcast_to(31, shape))
@@ -502,29 +490,180 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
       self.assertAllClose(outfed_result[2][3], np.broadcast_to(5, shape))
       self.assertAllClose(outfed_result[2][4], np.broadcast_to(5.5, shape))
 
+  def testSingleInfeedOutfeedRepeatTupleLast(self):
+    dataset = create_increasing_dataset(3)
+    shape = [4, 4]
+
+    def dataset_parser(value):
+      image_1 = value
+      image_2 = (value + 10.) / 2.0
+      return (image_1, image_2)
+
+    dataset = dataset.map(dataset_parser)
+
+    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
+    outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(outfeed_all=False)
+
+    def body(v, im1, im2):
+      v = v + im1 + im2
+      outfeed = outfeed_queue.enqueue((v, im1, im2))
+      return (v, outfeed)
+
+    def my_net():
+      v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
+      r = loops.repeat(5, body, [v], infeed_queue)
+      return r
+
+    with ipu.ops.ipu_scope("/device:IPU:0"):
+      res = ipu_compiler.compile(my_net, inputs=[])
+
+    outfed = outfeed_queue.dequeue()
+    cfg = ipu.utils.create_ipu_config()
+    cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
+      sess.run(infeed_queue.initializer)
+      result = sess.run(res)
+      self.assertAllClose(result[0], np.broadcast_to(31, shape))
+      outfed_result = sess.run(outfed)
+      self.assertTrue(len(outfed_result) == 3)
+      self.assertAllClose(outfed_result[0], np.broadcast_to(31, shape))
+      self.assertAllClose(outfed_result[1], np.broadcast_to(1, shape))
+      self.assertAllClose(outfed_result[2], np.broadcast_to(5.5, shape))
+
+  def testSingleInfeedOutfeedRepeatNamed(self):
+    dataset = create_increasing_dataset(3)
+    shape = [4, 4]
+
+    def dataset_parser(value):
+      image_1 = value
+      image_2 = (value + 10.) / 2.0
+      return (image_1, image_2)
+
+    dataset = dataset.map(dataset_parser)
+
+    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
+    outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue()
+
+    def body(v, im1, im2):
+      v = v + im1 + im2
+      outfeed = outfeed_queue.enqueue({"v": v, "image1": im1, "image2": im2})
+      return (v, outfeed)
+
+    def my_net():
+      v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
+      r = loops.repeat(5, body, [v], infeed_queue)
+      return r
+
+    with ipu.ops.ipu_scope("/device:IPU:0"):
+      res = ipu_compiler.compile(my_net, inputs=[])
+
+    outfed = outfeed_queue.dequeue()
+    cfg = ipu.utils.create_ipu_config()
+    cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
+      sess.run(infeed_queue.initializer)
+      result = sess.run(res)
+      self.assertAllClose(result[0], np.broadcast_to(31, shape))
+      outfed_result = sess.run(outfed)
+      self.assertTrue(len(outfed_result) == 3)
+      self.assertAllClose(outfed_result["v"][0], np.broadcast_to(5, shape))
+      self.assertAllClose(outfed_result["v"][1], np.broadcast_to(11.5, shape))
+      self.assertAllClose(outfed_result["v"][2], np.broadcast_to(19.5, shape))
+      self.assertAllClose(outfed_result["v"][3], np.broadcast_to(24.5, shape))
+      self.assertAllClose(outfed_result["v"][4], np.broadcast_to(31, shape))
+
+      self.assertAllClose(outfed_result["image1"][0], np.broadcast_to(
+          0, shape))
+      self.assertAllClose(outfed_result["image1"][1], np.broadcast_to(
+          1, shape))
+      self.assertAllClose(outfed_result["image1"][2], np.broadcast_to(
+          2, shape))
+      self.assertAllClose(outfed_result["image1"][3], np.broadcast_to(
+          0, shape))
+      self.assertAllClose(outfed_result["image1"][4], np.broadcast_to(
+          1, shape))
+
+      self.assertAllClose(outfed_result["image2"][0], np.broadcast_to(
+          5, shape))
+      self.assertAllClose(outfed_result["image2"][1],
+                          np.broadcast_to(5.5, shape))
+      self.assertAllClose(outfed_result["image2"][2], np.broadcast_to(
+          6, shape))
+      self.assertAllClose(outfed_result["image2"][3], np.broadcast_to(
+          5, shape))
+      self.assertAllClose(outfed_result["image2"][4],
+                          np.broadcast_to(5.5, shape))
+
+  def testSingleInfeedOutfeedRepeatNamedLast(self):
+    dataset = create_increasing_dataset(3)
+    shape = [4, 4]
+
+    def dataset_parser(value):
+      image_1 = value
+      image_2 = (value + 10.) / 2.0
+      return (image_1, image_2)
+
+    dataset = dataset.map(dataset_parser)
+
+    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
+    outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(outfeed_all=False)
+
+    def body(v, im1, im2):
+      v = v + im1 + im2
+      outfeed = outfeed_queue.enqueue({"v": v, "image1": im1, "image2": im2})
+      return (v, outfeed)
+
+    def my_net():
+      v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
+      r = loops.repeat(5, body, [v], infeed_queue)
+      return r
+
+    with ipu.ops.ipu_scope("/device:IPU:0"):
+      res = ipu_compiler.compile(my_net, inputs=[])
+
+    outfed = outfeed_queue.dequeue()
+    cfg = ipu.utils.create_ipu_config()
+    cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
+    ipu.utils.configure_ipu_system(cfg)
+
+    with session_lib.Session() as sess:
+      sess.run(infeed_queue.initializer)
+      result = sess.run(res)
+      self.assertAllClose(result[0], np.broadcast_to(31, shape))
+      outfed_result = sess.run(outfed)
+      self.assertTrue(len(outfed_result) == 3)
+      self.assertAllClose(outfed_result["v"], np.broadcast_to(31, shape))
+      self.assertAllClose(outfed_result["image1"], np.broadcast_to(1, shape))
+      self.assertAllClose(outfed_result["image2"], np.broadcast_to(5.5, shape))
 
   def testTrainingLoopWithInfeedAndOutfeedGetAll(self):
 
-    dataset = create_increasing_dataset(10, shape=[4,4,2])
+    dataset = create_increasing_dataset(10, shape=[4, 4, 2])
     dataset = dataset.batch(batch_size=2, drop_remainder=True)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
     outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue()
 
     def my_net(iters):
-      def body(loss):
-        x = infeed_queue.get_next()
+      def body(loss, x):
         with variable_scope.variable_scope("vs", use_resource=True):
-          y = convolutional.conv2d(x, 2, 1, use_bias=True,
-                                 kernel_initializer=init_ops.ones_initializer(),
-                                 name='conv1')
+          y = convolutional.conv2d(
+              x,
+              2,
+              1,
+              use_bias=True,
+              kernel_initializer=init_ops.ones_initializer(),
+              name='conv1')
         loss = math_ops.reduce_sum(y)
         optimizer = gradient_descent.GradientDescentOptimizer(0.1)
         train = optimizer.minimize(loss)
-        outfeed = outfeed_queue.enqueue([loss])
+        outfeed = outfeed_queue.enqueue(loss)
         with ops.control_dependencies([train]):
           return (array_ops.identity(loss), outfeed)
-
 
       loss = 0.0
       return loops.repeat(iters, body, (loss), infeed_queue)
@@ -544,27 +683,30 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
       outfed = sess.run(outfeeds)
 
       self.assertTrue(initial_loss > final_loss)
-      self.assertTrue(outfed[0].shape[0], 1001)
-      self.assertTrue(type(outfed[0]) == np.ndarray)
+      self.assertTrue(outfed.shape[0], 1001)
+      self.assertTrue(type(outfed) == np.ndarray)
 
   def testTrainingLoopWithInfeedAndOutfeedGetLast(self):
-    dataset = create_increasing_dataset(10, shape=[4,4,2])
+    dataset = create_increasing_dataset(10, shape=[4, 4, 2])
     dataset = dataset.batch(batch_size=2, drop_remainder=True)
 
     infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
     outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(outfeed_all=False)
 
     def my_net(iters):
-      def body(loss):
-        x = infeed_queue.get_next()
+      def body(loss, x):
         with variable_scope.variable_scope("vs", use_resource=True):
-          y = convolutional.conv2d(x, 2, 1, use_bias=True,
-                                 kernel_initializer=init_ops.ones_initializer(),
-                                 name='conv1')
+          y = convolutional.conv2d(
+              x,
+              2,
+              1,
+              use_bias=True,
+              kernel_initializer=init_ops.ones_initializer(),
+              name='conv1')
         loss = math_ops.reduce_sum(y)
         optimizer = gradient_descent.GradientDescentOptimizer(0.1)
         train = optimizer.minimize(loss)
-        outfeed = outfeed_queue.enqueue([loss])
+        outfeed = outfeed_queue.enqueue(loss)
         with ops.control_dependencies([train]):
           return (array_ops.identity(loss), outfeed)
 
@@ -590,7 +732,7 @@ class InfeedOutfeedTest(test_util.TensorFlowTestCase):
       self.assertTrue(outfed == final_loss)
 
       # Check that a scalar is returned instead of a numpy array
-      self.assertTrue(type(outfed[0]) == np.float32)
+      self.assertTrue(type(outfed) == np.float32)
 
 
 if __name__ == "__main__":

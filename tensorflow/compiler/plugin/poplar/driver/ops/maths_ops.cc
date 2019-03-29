@@ -1,6 +1,7 @@
 #include <algorithm>
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
+#include "tensorflow/compiler/plugin/poplar/driver/ops/dot_graph_caching.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/classification_predicates.h"
@@ -154,18 +155,18 @@ StatusOr<popops::expr::BinaryOpType> LookupBinaryFn(
       StrCat("[Poplar] Invalid opcode lookup ", HloOpcodeString(opcode)));
 }
 
-static std::string GetMatMulPass(const HloInstruction* inst,
-                                 const CompilerAnnotations& annotations) {
+static dot_graph_caching::MatMulPass GetMatMulPass(
+    const HloInstruction* inst, const CompilerAnnotations& annotations) {
   if (IsForward(inst, annotations)) {
-    return "TRAINING_FWD";
+    return dot_graph_caching::MatMulPass::TRAINING_FWD;
   }
   if (IsBackpropInput(inst, annotations)) {
-    return "TRAINING_BWD";
+    return dot_graph_caching::MatMulPass::TRAINING_BWD;
   }
   if (IsBackpropFilter(inst, annotations)) {
-    return "TRAINING_WU";
+    return dot_graph_caching::MatMulPass::TRAINING_WU;
   }
-  return "INFERENCE_FWD";
+  return dot_graph_caching::MatMulPass::INFERENCE_FWD;
 }
 
 StatusOr<poplar::program::Program> CreateUnaryElementwiseOp(
@@ -423,52 +424,88 @@ StatusOr<poplar::program::Program> CreateMatMulForDotOp(
   poplar::Tensor in1;
   TF_ASSIGN_OR_RETURN(in1, FindInstructionInput(tensor_map, res, inst, 1, seq));
 
-  poplar::Tensor out;
-
-  if (in0.rank() > 2 || in1.rank() > 2) {
-    return xla::FailedPrecondition("Unsupported Dot operation on %s",
-                                   inst->name().c_str());
-  }
-
   const DotDimensionNumbers& dot_dims = inst->dot_dimension_numbers();
-  if (dot_dims.lhs_contracting_dimensions_size() != 1 ||
-      dot_dims.rhs_contracting_dimensions_size() != 1) {
-    return xla::FailedPrecondition(
-        "Unsupported Dot with multiple contracting dimensions on %s",
-        inst->name().c_str());
+  auto lhs_reduction_dimensions = dot_dims.lhs_contracting_dimensions();
+  auto rhs_reduction_dimensions = dot_dims.rhs_contracting_dimensions();
+  auto lhs_batch_dimensions = dot_dims.lhs_batch_dimensions();
+  auto rhs_batch_dimensions = dot_dims.rhs_batch_dimensions();
+
+  // DimShuffle the LHS to [Batch..., M..., Contracting...]
+  std::vector<unsigned> lhs_permutation;
+  lhs_permutation.reserve(in0.rank());
+
+  absl::c_copy(lhs_batch_dimensions, std::back_inserter(lhs_permutation));
+  for (int i = 0; i < in0.rank(); ++i) {
+    if (absl::c_find(lhs_reduction_dimensions, i) ==
+            lhs_reduction_dimensions.end() &&
+        absl::c_find(lhs_batch_dimensions, i) == lhs_batch_dimensions.end()) {
+      lhs_permutation.push_back(i);
+    }
   }
+  absl::c_copy(lhs_reduction_dimensions, std::back_inserter(lhs_permutation));
+  in0 = in0.dimShuffle(lhs_permutation);
 
-  int64 lhs_reduction_dimension = dot_dims.lhs_contracting_dimensions(0);
-  int64 rhs_reduction_dimension = dot_dims.rhs_contracting_dimensions(0);
+  // DimShuffle the RHS to [Contracting..., Batch..., N...]
+  std::vector<unsigned> rhs_permutation;
+  rhs_permutation.reserve(in1.rank());
 
-  if (in0.rank() == 1) {
-    in0 = in0.reshape({1, in0.dim(0)});
-    // force the reduction dimension due to reshaping
-    lhs_reduction_dimension = 1;
+  absl::c_copy(rhs_batch_dimensions, std::back_inserter(rhs_permutation));
+  absl::c_copy(rhs_reduction_dimensions, std::back_inserter(rhs_permutation));
+  for (int i = 0; i < in1.rank(); ++i) {
+    if (absl::c_find(rhs_reduction_dimensions, i) ==
+            rhs_reduction_dimensions.end() &&
+        absl::c_find(rhs_batch_dimensions, i) == rhs_batch_dimensions.end()) {
+      rhs_permutation.push_back(i);
+    }
   }
+  in1 = in1.dimShuffle(rhs_permutation);
 
-  if (in1.rank() == 1) {
-    in1 = in1.reshape({in1.dim(0), 1});
-    // force the reduction dimension due to reshaping
-    rhs_reduction_dimension = 0;
-  }
+  // Collapse the LHS dimensions down to [Batch, M, Contracting]
+  const auto lhs_shape = in0.shape();
+  const auto lhs_shape_itr_begin = lhs_shape.begin();
+  const auto lhs_shape_itr_a =
+      lhs_shape_itr_begin + lhs_batch_dimensions.size();
+  const auto lhs_shape_itr_end = lhs_shape.end();
+  const auto lhs_shape_itr_b =
+      lhs_shape_itr_end - lhs_reduction_dimensions.size();
 
-  if (lhs_reduction_dimension != 1) {
-    in0 = in0.transpose();
-  }
+  const auto lhs_b =
+      std::accumulate(lhs_shape_itr_begin, lhs_shape_itr_a, std::size_t(1),
+                      std::multiplies<std::size_t>());
+  const auto lhs_m =
+      std::accumulate(lhs_shape_itr_a, lhs_shape_itr_b, std::size_t(1),
+                      std::multiplies<std::size_t>());
+  const auto lhs_k =
+      std::accumulate(lhs_shape_itr_b, lhs_shape_itr_end, std::size_t(1),
+                      std::multiplies<std::size_t>());
+  in0 = in0.reshape({lhs_b, lhs_m, lhs_k});
 
-  if (rhs_reduction_dimension != 0) {
-    in1 = in1.transpose();
-  }
+  // Collapse the RHS dimensions down to [Batch, Contracting, N]
+  const auto rhs_shape = in1.shape();
+  const auto rhs_shape_itr_begin = rhs_shape.begin();
+  const auto rhs_shape_itr_a =
+      rhs_shape_itr_begin + lhs_batch_dimensions.size();
+  const auto rhs_shape_itr_b =
+      rhs_shape_itr_a + rhs_reduction_dimensions.size();
+  const auto rhs_shape_itr_end = rhs_shape.end();
 
-  poplar::OptionFlags opts;
-  opts.set("fullyConnectedPass", GetMatMulPass(inst, res.annotations));
+  const auto rhs_b =
+      std::accumulate(rhs_shape_itr_begin, rhs_shape_itr_a, std::size_t(1),
+                      std::multiplies<std::size_t>());
+  const auto rhs_k =
+      std::accumulate(rhs_shape_itr_a, rhs_shape_itr_b, std::size_t(1),
+                      std::multiplies<std::size_t>());
+  const auto rhs_n =
+      std::accumulate(rhs_shape_itr_b, rhs_shape_itr_end, std::size_t(1),
+                      std::multiplies<std::size_t>());
+  in1 = in1.reshape({rhs_b, rhs_k, rhs_n});
 
-  out = poplin::matMul(graph, in0, in1, seq, GetDebugName(inst), opts,
-                       &res.dot_cache);
+  poplar::Tensor out = dot_graph_caching::DoCachedDot(
+      graph, res, in0, in1, seq, GetMatMulPass(inst, res.annotations),
+      GetSingleShardingDeviceId(inst), GetDebugName(inst));
 
+  // Reshape to XLA shape
   out = out.reshape(PoplarShapeFromXlaShape(output_shape));
-
   TF_CHECK_OK(AddOutputTensor(tensor_map, inst, 0, out));
 
   return seq;

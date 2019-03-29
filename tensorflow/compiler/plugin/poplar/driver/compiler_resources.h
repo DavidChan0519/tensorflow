@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_annotations.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops/conv_graph_caching.h"
+#include "tensorflow/compiler/plugin/poplar/driver/ops/dot_graph_caching.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops/norm_graph_caching.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/convolution_classifier.h"
 #include "tensorflow/compiler/plugin/poplar/driver/visitors/visitor_subcomputation.h"
@@ -62,6 +63,8 @@ struct CompilerResources {
 
   bool disable_graph_convolution_caching;
 
+  uint32 replication_factor;
+
   std::map<std::string, TensorMap> tensor_maps;
 
   conv_graph_caching::ConvolutionGraphCache conv_graph_cache;
@@ -81,17 +84,21 @@ struct CompilerResources {
 
   norm_graph_caching::NormStatisticsGraphCache norm_statistics_graph_cache;
 
+  dot_graph_caching::DotGraphCache dot_graph_cache;
+
   CompilerResources(const poplar::Device& dev, uint64 seed,
                     poprand::RandomGenMode mode,
                     const poplar::OptionFlags& conv_options,
                     const poplar::OptionFlags& pooling_options,
-                    bool disable_graph_convolution_caching, HloModule* module)
+                    bool disable_graph_convolution_caching,
+                    uint32 replication_factor, HloModule* module)
       : main_graph(dev),
         annotations(module),
         random(mode, seed),
         default_conv_options(conv_options),
         default_pooling_options(pooling_options),
-        disable_graph_convolution_caching(disable_graph_convolution_caching) {}
+        disable_graph_convolution_caching(disable_graph_convolution_caching),
+        replication_factor(replication_factor) {}
 };
 
 }  // namespace poplarplugin

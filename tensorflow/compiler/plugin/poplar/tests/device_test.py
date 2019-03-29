@@ -28,7 +28,6 @@ from tensorflow.python.platform import googletest
 
 
 class IpuXlaDeviceLibTest(test_util.TensorFlowTestCase):
-
   def testLoadDevice(self):
     devices = device_lib.list_local_devices()
 
@@ -45,6 +44,8 @@ class IpuXlaDeviceLibTest(test_util.TensorFlowTestCase):
 
   def testDeviceInSession(self):
 
+    tu.configure_ipu_system()
+
     with tu.ipu_session() as sess:
 
       devices = sess.list_devices()
@@ -53,7 +54,6 @@ class IpuXlaDeviceLibTest(test_util.TensorFlowTestCase):
       self.assertEqual(devices[0].device_type, "CPU")
 
       found_ipu = False
-      found_ipu_rep = False
       for d in devices:
         if d.device_type == "IPU":
           found_ipu = True

@@ -5,6 +5,7 @@ from __future__ import print_function
 import numpy as np
 import re
 
+from tensorflow.compiler.plugin.poplar.driver.config_pb2 import IpuOptions
 from tensorflow.compiler.plugin.poplar.driver.trace_pb2 import IpuTraceEvent
 from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
 from tensorflow.contrib.ipu import ipu_compiler
@@ -24,13 +25,15 @@ from tensorflow.python.platform import googletest
 from tensorflow.contrib import ipu
 from tensorflow.python.training import gradient_descent
 
+
 def count_compile_end_events(events):
-  fn = (lambda x: 1 if x.type==IpuTraceEvent.COMPILE_END and len(x.compile_end.compilation_report) > 10
-                  else 0)
+  fn = (
+      lambda x: 1 if x.type == IpuTraceEvent.COMPILE_END and len(x.compile_end.compilation_report) > 10 else 0
+  )
   return sum(map(fn, events))
 
-class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
+class ContribIpuOpsTest(test_util.TensorFlowTestCase):
   def testSummary(self):
     with ops.device("/device:IPU:0"):
       a = array_ops.placeholder(np.float32, [1], name="a")
@@ -41,10 +44,12 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with sl.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
       fd = {
-        a: [1.0],
-        b: [2.0],
+          a: [1.0],
+          b: [2.0],
       }
       result, s = sess.run([out, summary], fd)
       self.assertAllClose(result, [3.0])
@@ -52,20 +57,20 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
   def testCreateConfig(self):
     cfg = ipu.utils.create_ipu_config()
-    cfg = ipu.utils.auto_select_ipus(cfg, [1,1])
-    self.assertTrue(isinstance(cfg, config_pb2.IPUOptions))
+    cfg = ipu.utils.auto_select_ipus(cfg, [1, 1])
+    self.assertTrue(isinstance(cfg, IpuOptions))
     self.assertTrue(len(cfg.device_config), 2)
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.auto_select_ipus(cfg, [4, 4])
-    self.assertTrue(isinstance(cfg, config_pb2.IPUOptions))
+    self.assertTrue(isinstance(cfg, IpuOptions))
     self.assertTrue(len(cfg.device_config), 2)
     self.assertTrue(cfg.device_config[0].auto_count, 4)
     self.assertTrue(cfg.device_config[1].auto_count, 4)
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.auto_select_ipus(cfg, [4, 4], number_of_replicas=[2, 1])
-    self.assertTrue(isinstance(cfg, config_pb2.IPUOptions))
+    self.assertTrue(isinstance(cfg, IpuOptions))
     self.assertTrue(len(cfg.device_config), 2)
     self.assertTrue(cfg.device_config[0].auto_count, 4)
     self.assertTrue(cfg.device_config[0].num_replicas, 2)
@@ -74,13 +79,13 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.select_ipus(cfg, [2, 3])
-    self.assertTrue(isinstance(cfg, config_pb2.IPUOptions))
+    self.assertTrue(isinstance(cfg, IpuOptions))
     self.assertTrue(len(cfg.device_config), 2)
     self.assertTrue(cfg.device_config[0].cfg_index, 2)
     self.assertTrue(cfg.device_config[1].cfg_index, 3)
 
     cfg = ipu.utils.create_ipu_config()
-    cfg = ipu.utils.set_compilation_options(cfg, {'A':'B', 'C':'D'})
+    cfg = ipu.utils.set_compilation_options(cfg, {'A': 'B', 'C': 'D'})
     self.assertTrue(len(cfg.compilation_options), 2)
     self.assertTrue(cfg.compilation_options[0].option, "A")
     self.assertTrue(cfg.compilation_options[0].value, "B")
@@ -113,13 +118,15 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with sl.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
       # Discard any existing events
       sess.run(events)
 
       fd = {
-        a: [1.0],
-        b: [2.0],
+          a: [1.0],
+          b: [2.0],
       }
       result = sess.run(out, fd)
       self.assertAllClose(result, [3.0])
@@ -128,7 +135,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       e = sess.run(events)
       self.assertEqual(len(e), 4)
 
-      dump = ipu.utils.extract_all_strings_from_event_trace(e);
+      dump = ipu.utils.extract_all_strings_from_event_trace(e)
       self.assertTrue(len(dump) > 100)
 
   def testIpuSimpleScopeAndExecutionReport(self):
@@ -146,11 +153,13 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with sl.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
 
       fd = {
-        a: [1],
-        b: [2],
+          a: [1],
+          b: [2],
       }
 
       sess.run(events)
@@ -162,7 +171,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       evts = ipu.utils.extract_all_events(e)
       self.assertEqual(count_compile_end_events(evts), 1)
 
-      compilation_rep  = ipu.utils.extract_compile_reports(e)
+      compilation_rep = ipu.utils.extract_compile_reports(e)
       self.assertEqual(len(compilation_rep), 1)
       self.assertEqual(type(compilation_rep), list)
       self.assertEqual(type(compilation_rep[0]), tuple)
@@ -170,7 +179,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       self.assertTrue(len(compilation_rep[0][1]) > 1000)
       self.assertTrue(compilation_rep[0][1].startswith('{'))
 
-      execution_rep  = ipu.utils.extract_execute_reports(e)
+      execution_rep = ipu.utils.extract_execute_reports(e)
       self.assertEqual(len(execution_rep), 1)
       self.assertEqual(type(execution_rep), list)
       self.assertEqual(type(execution_rep[0]), tuple)
@@ -192,7 +201,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       logits = outputs[-1] * c
       self.assertEqual(logits.device, "/device:IPU:0")
 
-      res = array_ops.reshape(logits, [1,8,1])
+      res = array_ops.reshape(logits, [1, 8, 1])
 
       l = losses.mean_squared_error(res, b)
 
@@ -202,8 +211,8 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       return [l, train]
 
     with ops.device('cpu'):
-      a = array_ops.placeholder(np.float32, [1,8,1], name="a")
-      b = array_ops.placeholder(np.float32, [1,8,1], name="b")
+      a = array_ops.placeholder(np.float32, [1, 8, 1], name="a")
+      b = array_ops.placeholder(np.float32, [1, 8, 1], name="b")
 
     with ipu.ops.ipu_scope("/device:IPU:0"):
 
@@ -211,13 +220,15 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with sl.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
       # Initialize and then discard events relating to initialization
       sess.run(variables.global_variables_initializer())
 
       fd = {
-        a: [[[1.],[1.],[1.],[1.],[1.],[1.],[1.],[1.]]],
-        b: [[[1.],[1.],[1.],[1.],[1.],[1.],[1.],[1.]]],
+          a: [[[1.], [1.], [1.], [1.], [1.], [1.], [1.], [1.]]],
+          b: [[[1.], [1.], [1.], [1.], [1.], [1.], [1.], [1.]]],
       }
 
       l_initial = sess.run([l], fd)
@@ -231,7 +242,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
   def testInitializerDeviceChange(self):
 
-    inp = array_ops.placeholder(np.float32, [1,8,8,4])
+    inp = array_ops.placeholder(np.float32, [1, 8, 8, 4])
     with ipu.ops.ipu_scope("/device:IPU:0"):
       out = convolutional.conv2d(inp, 8, 1)
 
@@ -241,7 +252,9 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with sl.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
       # Discard any pending events
       sess.run(events)
 
@@ -249,8 +262,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
       sess.run(variables.global_variables_initializer())
 
       e = sess.run(events)
-      self.assertEqual(len(e), 2) # compile begin/end, no load/execute
-
+      self.assertEqual(len(e), 2)  # compile begin/end, no load/execute
 
   def testMultiScopeTest(self):
     with ops.device('cpu'):
@@ -265,9 +277,11 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    with sl.Session(config=config_pb2.ConfigProto(ipu_options=cfg)) as sess:
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
       sess.run(report)
-      result = sess.run(z2, {x: np.ones([2, 2]),  y: np.ones([2, 2])})
+      result = sess.run(z2, {x: np.ones([2, 2]), y: np.ones([2, 2])})
 
       self.assertAllEqual(result, [[4, 4], [4, 4]])
 
@@ -287,4 +301,4 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
 
 if __name__ == "__main__":
-    googletest.main()
+  googletest.main()

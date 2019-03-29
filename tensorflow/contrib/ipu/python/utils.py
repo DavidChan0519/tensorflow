@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =============================================================================
-
 """Utility functions related to the Graphcore IPU."""
 
 from tensorflow.compiler.plugin.poplar.driver.trace_pb2 import IpuTraceEvent
+from tensorflow.compiler.plugin.poplar.driver.config_pb2 import IpuOptions
+from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
 from tensorflow.core.framework import attr_value_pb2
-from tensorflow.core.framework import graph_pb2
-from tensorflow.core.protobuf import config_pb2
+from tensorflow.python.client import session as session_lib
 from tensorflow.python.framework import ops
 from tensorflow.python.platform import tf_logging as logging
 
@@ -26,7 +26,29 @@ import json
 import re
 import time
 
-def create_ipu_config(profiling=False, enable_ipu_events=False,
+
+def configure_ipu_system(config, device="cpu"):
+  """Configure an IPU system.  Passing an IpuOptions protobuf created by the
+  `create_ipu_config` function.
+
+  Args:
+    :param config: An IpuOptions configuration protobuf
+    :param device: The CPU device which is local to the IPU hardware
+  """
+  if not (isinstance(config, IpuOptions)):
+    raise Exception("`config` must be an IpuOptions instance")
+
+  g = ops.Graph()
+  with g.as_default():
+    with ops.device(device):
+      cfg_op = gen_ipu_ops.ipu_configure_hardware(config.SerializeToString())
+
+  with session_lib.Session(graph=g) as sess:
+    sess.run(cfg_op)
+
+
+def create_ipu_config(profiling=False,
+                      enable_ipu_events=False,
                       use_poplar_text_report=False,
                       report_every_nth_execution=0,
                       always_rearrange_copies_on_the_host=False,
@@ -71,14 +93,14 @@ def create_ipu_config(profiling=False, enable_ipu_events=False,
 
   Returns:
 
-    :return: An empty IPUOptions configuration protobuf, suitable for using in
+    :return: An empty IpuOptions configuration protobuf, suitable for using in
              the creation of the ConfigProto session options.
   """
   if profiling and enable_ipu_events:
     raise Exception(
-      "`profiling` and `enable_ipu_events` are mutually exclusive")
+        "`profiling` and `enable_ipu_events` are mutually exclusive")
 
-  opts = config_pb2.IPUOptions()
+  opts = IpuOptions()
   opts.ipu_model_config.enable_ipu_model = True
   opts.ipu_model_config.compile_ipu_code = True
 
@@ -97,6 +119,7 @@ def create_ipu_config(profiling=False, enable_ipu_events=False,
 
   return opts
 
+
 def set_compilation_options(opts, compilation_options=None):
   """Set the IPU compilation options for the session..
 
@@ -106,23 +129,22 @@ def set_compilation_options(opts, compilation_options=None):
     opts = set_compilation_options(opts,
         compilation_options={"debug.executionProfile": "compute_sets",
                              "target.workerStackSizeInBytes": "64"})
-
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
   Args:
-    :param opts: An IPUOptions session control protobuf.
+    :param opts: An IpuOptions session control protobuf.
     :param compilation_options: A dictionary of poplar compilation option flags
                                 to be sent to the executor.
   Returns:
 
-    :return: The IPUOptions configuration protobuf, with engine compilation
+    :return: The IpuOptions configuration protobuf, with engine compilation
              options set.
   """
-  if not(isinstance(compilation_options, dict)):
-    raise Exception(
-      "`compilation_options` must be a dictionary")
+  if not (isinstance(compilation_options, dict)):
+    raise Exception("`compilation_options` must be a dictionary")
 
   if (compilation_options is not None):
     for (option_name, value) in compilation_options.items():
@@ -132,6 +154,7 @@ def set_compilation_options(opts, compilation_options=None):
 
   return opts
 
+
 def set_convolution_options(opts, convolution_options=None):
   """Set the IPU convolution compilation options for the session.
   *** This is an experimental function which might be removed in the future. ***
@@ -140,23 +163,22 @@ def set_convolution_options(opts, convolution_options=None):
     opts = create_ipu_config()
     opts = set_convolution_options(opts,
         convolution_options={"tempMemoryBudget": "1000000"})
-
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
   Args:
-    :param opts: An IPUOptions session control protobuf.
+    :param opts: An IpuOptions session control protobuf.
     :param convolution_options: A dictionary of poplar option flags for the
                                 convolutions.
   Returns:
 
-    :return: The IPUOptions configuration protobuf, with convolution options
+    :return: The IpuOptions configuration protobuf, with convolution options
              set.
   """
-  if not(isinstance(convolution_options, dict)):
-    raise Exception(
-      "`convolution_options` must be a dictionary")
+  if not (isinstance(convolution_options, dict)):
+    raise Exception("`convolution_options` must be a dictionary")
 
   if (convolution_options is not None):
     for (option_name, value) in convolution_options.items():
@@ -166,6 +188,7 @@ def set_convolution_options(opts, convolution_options=None):
 
   return opts
 
+
 def set_pooling_options(opts, pooling_options=None):
   """Set the IPU pooling compilation options for the session.
   *** This is an experimental function which might be removed in the future. ***
@@ -174,23 +197,22 @@ def set_pooling_options(opts, pooling_options=None):
     opts = create_ipu_config()
     opts = set_pooling_options(opts,
         pooling_options={"poolUseIntrospectiveMapping": "false"})
-
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
   Args:
-    :param opts: An IPUOptions session control protobuf.
+    :param opts: An IpuOptions session control protobuf.
     :param pooling_options: A dictionary of poplar option flags for the
                             pooling operation.
   Returns:
 
-    :return: The IPUOptions configuration protobuf, with pooling options
+    :return: The IpuOptions configuration protobuf, with pooling options
              set.
   """
-  if not(isinstance(pooling_options, dict)):
-    raise Exception(
-      "`pooling_options` must be a dictionary")
+  if not (isinstance(pooling_options, dict)):
+    raise Exception("`pooling_options` must be a dictionary")
 
   if (pooling_options is not None):
     for (option_name, value) in pooling_options.items():
@@ -199,6 +221,7 @@ def set_pooling_options(opts, pooling_options=None):
       opt.value = value
 
   return opts
+
 
 def set_report_options(opts, report_options=None):
   """Set the options used to influence Poplar report generation.
@@ -209,23 +232,22 @@ def set_report_options(opts, report_options=None):
     opts = create_ipu_config()
     opts = set_report_options(opts,
         report_options={"reportOption1": "false"})
-
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
   Args:
-    :param opts: An IPUOptions session control protobuf.
+    :param opts: An IpuOptions session control protobuf.
     :param report_options: A dictionary of poplar option flags for the
                            report generation.
   Returns:
 
-    :return: The IPUOptions configuration protobuf, with convolution options
+    :return: The IpuOptions configuration protobuf, with convolution options
              set.
   """
-  if not(isinstance(report_options, dict)):
-    raise Exception(
-      "`report_options` must be a dictionary")
+  if not (isinstance(report_options, dict)):
+    raise Exception("`report_options` must be a dictionary")
 
   if (report_options is not None):
     for (option_name, value) in report_options.items():
@@ -234,6 +256,7 @@ def set_report_options(opts, report_options=None):
       opt.value = value
 
   return opts
+
 
 def set_ipu_model_options(opts, compile_ipu_code=True):
   """Set the IPU Model options.
@@ -244,30 +267,32 @@ def set_ipu_model_options(opts, compile_ipu_code=True):
 
   Returns:
 
-    :return: The IPUOptions configuration protobuf, with IPU model options
+    :return: The IpuOptions configuration protobuf, with IPU model options
              set.
   """
   opts.ipu_model_config.compile_ipu_code = compile_ipu_code
 
   return opts
 
-def set_recomputation_options(opts, recompute_non_linearities=True):
+
+def set_recomputation_options(opts, recompute_norm_inputs=True):
   """Set re-computation options.
 
   Args:
-    :param recompute_non_linearities: Whether or not to re-compute the non
-      linearities during training. Enabling this option can reduce memory
-      usage at the expense of extra computation.
+    :param recompute_norm_inputs: Whether or not to re-compute the norm inputs
+      during training. Enabling this option can reduce memory usage at the
+      expense of extra computation.
 
   Returns:
 
-    :return: The IPUOptions configuration protobuf.
+    :return: The IpuOptions configuration protobuf.
   """
 
-  opts.speed_size_config.recompute_non_linearities = recompute_non_linearities
-  opts.speed_size_config.has_recompute_non_linearities = True
+  opts.speed_size_config.recompute_norm_inputs = recompute_norm_inputs
+  opts.speed_size_config.has_recompute_norm_inputs = True
 
   return opts
+
 
 def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
   """Configure the IPUs to be used by the session.
@@ -286,7 +311,8 @@ def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
     # Create a single device, with one IPU
     opts = create_ipu_config()
     opts = auto_select_ipus(opts, num_ipus=1)
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
@@ -294,7 +320,8 @@ def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
     # Create two devices, with 2 IPUs per device.
     opts = create_ipu_config()
     opts = auto_select_ipus(opts, num_ipus=[2,2])
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
@@ -303,19 +330,20 @@ def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
     # in the second device.
     opts = create_ipu_config()
     opts = auto_select_ipus(opts, num_ipus=[1,2])
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
   Args:
-    :param opts: An IPUOptions session control protobuf.
+    :param opts: An IpuOptions session control protobuf.
     :param num_ipus: List of IPUs per Tensorflow device
     :param sharded: Deprecated.
     :param number_of_replicas: The number of replicas to divide the device into.
                                This should be a divisor of the number of IPUs.
   Returns:
 
-    :return: The IPUOptions configuration protobuf, configured for
+    :return: The IpuOptions configuration protobuf, configured for
              auto-selecting a set of IPU devices.
   """
   if len(opts.device_config) > 0:
@@ -345,6 +373,7 @@ def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
         dev.num_replicas = number_of_replicas[i]
 
   return opts
+
 
 def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
   """Configure the IPUs to be used by the session.
@@ -466,7 +495,8 @@ def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
     # configuration index 0
     opts = create_ipu_config()
     opts = select_ipus(opts, indices=[0])
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
@@ -475,7 +505,8 @@ def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
     # configuration index 8
     opts = create_ipu_config()
     opts = select_ipus(opts, indices=[8])
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
@@ -484,7 +515,8 @@ def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
     # 0 and 1
     opts = create_ipu_config()
     opts = select_ipus(opts, indices=[0, 1])
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
@@ -495,7 +527,8 @@ def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
     # 00:da:00.0)
     opts = create_ipu_config()
     opts = select_ipus(opts, indices=[37, 38])
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
@@ -504,19 +537,20 @@ def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
     # 0000:1a:00.0, 0000:1b:00.0, 0000:1c:00.0, 0000:1d:00.0.
     opts = create_ipu_config()
     opts = select_ipus(opts, indices=[0, 1, 2, 3])
-    with tf.Session(config=tf.ConfigProto(ipu_options=opts)) as s:
+    ipu.utils.configure_ipu_system(cfg)
+    with tf.Session() as s:
       ...
     ```
 
   Args:
-    :param opts: An IPUOptions session control protobuf.
+    :param opts: An IpuOptions session control protobuf.
     :param indicies: List of IPU configuration indicies.
     :param sharded: Deprecated.
     :param number_of_replicas: The number of replicas to divide the device into.
                                This should be a divisor of the number of IPUs.
   Returns:
 
-    :return: The IPUOptions configuration protobuf, with a number of devices
+    :return: The IpuOptions configuration protobuf, with a number of devices
              selected by IPU configuration index.
   """
 
@@ -541,6 +575,7 @@ def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
       dev.num_replicas = number_of_replicas[n]
 
   return opts
+
 
 def extract_all_strings_from_event_trace(events):
   """Extract a concatenation of all data strings from an IPU event trace.
@@ -587,6 +622,7 @@ def extract_all_strings_from_event_trace(events):
 
   return result
 
+
 def extract_all_types_from_event_trace(events):
   """Return a list of the types of each event in an event trace tensor
 
@@ -599,6 +635,7 @@ def extract_all_types_from_event_trace(events):
     result += [evt.type]
   return result
 
+
 def extract_all_events(events):
   """Extract a list containing each event as an event object
   :param events: A tensor containing a list of IPU events as protobuf strings
@@ -610,6 +647,7 @@ def extract_all_events(events):
     result += [evt]
   return result
 
+
 def extract_all_io_events(events):
   """Extract a list of all of the IO events from an IPU event trace tensor
   :param events: A tensor containing a list of IPU events as protobuf strings
@@ -618,8 +656,10 @@ def extract_all_io_events(events):
   result = []
   for e in events:
     evt = IpuTraceEvent.FromString(e)
-    if evt.type in [IpuTraceEvent.HOST_TO_DEVICE_TRANSFER,
-                    IpuTraceEvent.DEVICE_TO_HOST_TRANSFER]:
+    if evt.type in [
+        IpuTraceEvent.HOST_TO_DEVICE_TRANSFER,
+        IpuTraceEvent.DEVICE_TO_HOST_TRANSFER
+    ]:
       try:
         payload = json.loads(evt.data_transfer.data_transfer.decode('utf-8'))
         for t in payload["tensors"]:
@@ -627,6 +667,7 @@ def extract_all_io_events(events):
       except UnicodeDecodeError:
         pass
   return result
+
 
 def extract_compile_reports(events):
   """Get a list of all compiler reports in the event list.
@@ -644,6 +685,7 @@ def extract_compile_reports(events):
         pass
   return result
 
+
 def extract_execute_reports(events):
   """Get a list of all compiler reports in the event list.
   :param events: A list of trace event serialized protobufs
@@ -660,15 +702,16 @@ def extract_execute_reports(events):
         pass
   return result
 
+
 def extract_graphviz_from_compilation_event(evt):
   """Return the final optimized XLA graph from a COMPILE_BEGIN event.
   :param evt: An IpuTraceEvent which is of type COMPILE_BEGIN.
   :return: A DOT file string of the main XLA computation.
   """
   if evt.type != IpuTraceEvent.COMPILE_BEGIN:
-    raise Exception(
-      "`evt` must be a COMPILE_BEGIN event")
+    raise Exception("`evt` must be a COMPILE_BEGIN event")
   return evt.compile_begin.xla_graph
+
 
 def get_memory_size_from_events(events):
   """Get the total memory consumption for the first compilation in the list
@@ -679,16 +722,17 @@ def get_memory_size_from_events(events):
   size = None
   for evt in events:
     if evt.type == IpuTraceEvent.COMPILE_END:
-      in_memory_usage_section=False
+      in_memory_usage_section = False
       try:
-        for l in evt.compile_end.compilation_report.decode('utf-8').split("\n"):
+        for l in evt.compile_end.compilation_report.decode('utf-8').split(
+            "\n"):
           l = l.strip()
           if l.startswith('Memory Usage'):
-            in_memory_usage_section=True
+            in_memory_usage_section = True
           if l.startswith('Including Gaps') and in_memory_usage_section:
-              m = re.match(r'.+:\s+([\d,]+) B', l)
-              if m:
-                return int(m.group(1).replace(',', ''))
+            m = re.match(r'.+:\s+([\d,]+) B', l)
+            if m:
+              return int(m.group(1).replace(',', ''))
       except UnicodeDecodeError:
         pass
   return None
@@ -706,16 +750,17 @@ def move_variable_initialization_to_cpu(graph=None):
     graph = ops.get_default_graph()
 
   init_ops = []
-  dep_ops = list(map(lambda x:x.initializer.inputs[1].op,
-                     graph.get_collection('variables')))
-  visited  = set()
+  dep_ops = list(
+      map(lambda x: x.initializer.inputs[1].op,
+          graph.get_collection('variables')))
+  visited = set()
 
   while len(dep_ops) > 0:
     op = dep_ops.pop()
     if not op in visited:
       visited.add(op)
       init_ops += [op]
-      dep_ops += map(lambda x:x.op, op.inputs)
+      dep_ops += map(lambda x: x.op, op.inputs)
 
   for op in init_ops:
     op._set_device('/device:CPU:0')

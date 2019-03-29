@@ -174,7 +174,10 @@ PoplarExecutor::PoplarExecutor()
       current_engine_(nullptr),
       device_open_(false),
       poplar_device_(poplar::Device::createCPUDevice()),
-      poplar_device_hash_(0) {}
+      poplar_device_hash_(0),
+      hardware_configured_(false),
+      thread_pool_(tensorflow::Env::Default(), "poplar_executor_threadpool",
+                   PoplarExecutor::NUM_THREADS) {}
 
 PoplarExecutor::~PoplarExecutor() {}
 
@@ -216,64 +219,72 @@ void PoplarExecutor::ConnectInfeedsToStreamCallback(
   for (const auto& infeed_info : infeed_infos) {
     const HloInfeedInstruction* inst = infeed_info;
 
-    auto itr = infeed_dataset_iterators.find(inst->infeed_config());
-    if (itr == infeed_dataset_iterators.end()) {
-      LOG(FATAL)
-          << "Trying to access a dataset iterator which has not been created."
-          << " Did you initialize the infeed_queue?";
+    auto itr = infeed_dataset_iterators_.find(inst->infeed_config());
+    if (itr == infeed_dataset_iterators_.end()) {
+      LOG(FATAL) << "Trying to access an infeed dataset iterator which has not "
+                    "been created."
+                 << " Did you initialize the infeed_queue?";
     }
     auto* infeed_dataset_iterator = itr->second.get();
     for (int j = 0; j < infeed_dataset_iterator->shapes.size(); ++j) {
       current_engine_->connectStreamToCallback(
           GetInfeedCopyHandle(inst->name(), j),
-          [j, infeed_dataset_iterator](void* dest) {
-            std::lock_guard<std::recursive_mutex> g(
-                infeed_dataset_iterator->mutex);
-            // We make an assumption that every sub tensor from the infeed is
-            // dequeued every iteration. If all tensors have been used, then get
-            // the next set of tensors.
-            if (absl::c_all_of(infeed_dataset_iterator->used,
-                               [](bool v) { return v; })) {
-              bool end_of_sequence;
-              std::vector<tensorflow::Tensor> outputs;
-              TF_CHECK_OK(infeed_dataset_iterator->iterator->GetNext(
-                  infeed_dataset_iterator->iterator_ctx.get(), &outputs,
-                  &end_of_sequence));
-              infeed_dataset_iterator->tensors = outputs;
-              if (end_of_sequence) {
-                LOG(INFO) << "The dataset iterator has reached the end of the "
-                             "dataset.";
-              }
-              absl::c_fill(infeed_dataset_iterator->used, false);
+          [this, j, infeed_dataset_iterator](void* dest) {
+            auto infeed_queue_manager = GetXfeedManager(ordinal_)->infeed();
+            auto buffer = infeed_queue_manager->BlockingDequeueBuffer();
+
+            const char* data = reinterpret_cast<const char*>(buffer->data());
+            auto length = buffer->length();
+            CHECK_EQ(length,
+                     ShapeUtil::ByteSizeOf(infeed_dataset_iterator->shapes[j]));
+
+            std::memcpy(dest, data, length);
+
+            infeed_queue_manager->ReleaseCurrentBuffer(
+                length, buffer->data(), infeed_dataset_iterator->shapes[j]);
+
+            bool all_tensors_used = false;
+            {
+              std::lock_guard<std::mutex> lock(infeed_dataset_iterator->mutex);
+              infeed_dataset_iterator->used[j] = true;
+              all_tensors_used = infeed_dataset_iterator->all_tensors_used();
             }
-            // Consume the tensor and copy it into the destination.
-            infeed_dataset_iterator->used[j] = true;
-            auto tensor = infeed_dataset_iterator->tensors[j];
-            const auto tensor_data_ptr = tensor.tensor_data().data();
-            std::memcpy(
-                dest, tensor_data_ptr,
-                ShapeUtil::ByteSizeOf(infeed_dataset_iterator->shapes[j]));
+
+            if (all_tensors_used) {
+              infeed_dataset_iterator->tensors_dequeued_cv.notify_one();
+            }
           });
     }
   }
 }
 
+namespace {
+Shape GetOutfeedShape(const Shape& output_shape,
+                      const uint32 replication_factor) {
+  if (replication_factor > 1) {
+    // When the graph is replicated, we expect an extra dimension at the front
+    // of the output.
+    std::vector<int64> dimensions = {replication_factor};
+    absl::c_copy(output_shape.dimensions(), std::back_inserter(dimensions));
+    return ShapeUtil::MakeShape(output_shape.element_type(), dimensions);
+  } else {
+    return output_shape;
+  }
+}
+}  // namespace
+
 void PoplarExecutor::ConnectOutfeedToStreamCallback(
-    se::StreamExecutor* executor, const OutfeedInfos& outfeed_infos) {
+    se::StreamExecutor* executor, const OutfeedInfos& outfeed_infos,
+    const uint32 replication_factor) {
   for (const auto& outfeed_info : outfeed_infos) {
     const auto& operand_shape = outfeed_info->operands()[0]->shape();
+    auto flat_shapes = FlattenedXlaShape(operand_shape);
 
     std::vector<std::pair<Shape, size_t>> shapes_sizes;
-    if (operand_shape.IsTuple()) {
-      for (int64 j = 0; j < operand_shape.tuple_shapes_size(); ++j) {
-        const Shape& tuple_element_shape =
-            ShapeUtil::GetTupleElementShape(operand_shape, j);
-        int64 size = ShapeUtil::ByteSizeOf(tuple_element_shape, sizeof(void*));
-        shapes_sizes.emplace_back(std::make_pair(tuple_element_shape, size));
-      }
-    } else {
-      int64 size = ShapeUtil::ByteSizeOf(operand_shape);
-      shapes_sizes.emplace_back(std::make_pair(operand_shape, size));
+    for (Shape shape : flat_shapes) {
+      Shape output_shape = GetOutfeedShape(shape, replication_factor);
+      int64 size = ShapeUtil::ByteSizeOf(output_shape);
+      shapes_sizes.emplace_back(std::make_pair(output_shape, size));
     }
 
     const bool clear_if_full = outfeed_info->outfeed_config() == "get_last";
@@ -298,6 +309,94 @@ void PoplarExecutor::ConnectOutfeedToStreamCallback(
             outfeed->EnqueueBufferAtomically(buffer, clear_if_full);
           });
     }
+  }
+}
+
+std::function<void()> PoplarExecutor::CreateInfeedIOThreadFunction(
+    se::StreamExecutor* executor, const InfeedInfos& infeed_infos) {
+  infeed_thread_cancelled_ = false;
+
+  std::vector<InfeedDatasetIterator*> infeed_dataset_iterators;
+  infeed_dataset_iterators.reserve(infeed_infos.size());
+  for (const auto& infeed_info : infeed_infos) {
+    const HloInfeedInstruction* inst = infeed_info;
+
+    auto itr = infeed_dataset_iterators_.find(inst->infeed_config());
+    if (itr == infeed_dataset_iterators_.end()) {
+      LOG(FATAL)
+          << "Trying to access an infeed context which has not been created."
+          << " Did you initialize the infeed_queue?";
+    }
+    infeed_dataset_iterators.push_back(itr->second.get());
+  }
+
+  return [this, infeed_dataset_iterators, executor]() {
+    auto platform =
+        se::MultiPlatformManager::PlatformWithName("Poplar").ValueOrDie();
+    auto* transfer_manager = static_cast<PoplarTransferManager*>(
+        xla::TransferManager::GetForPlatform(platform).ValueOrDie());
+
+    while (false == infeed_thread_cancelled_) {
+      for (auto& infeed_dataset_iterator : infeed_dataset_iterators) {
+        {
+          std::unique_lock<std::mutex> lock(infeed_dataset_iterator->mutex);
+
+          // We make an assumption that every sub tensor from the infeed is
+          // dequeued every iteration. If all tensors have been used, then get
+          // the next set of tensors.
+          if (infeed_dataset_iterator->all_tensors_used()) {
+            bool end_of_sequence;
+            std::vector<tensorflow::Tensor> outputs;
+            TF_CHECK_OK(infeed_dataset_iterator->iterator->GetNext(
+                infeed_dataset_iterator->iterator_ctx.get(), &outputs,
+                &end_of_sequence));
+            infeed_dataset_iterator->tensors = outputs;
+            if (end_of_sequence) {
+              LOG(INFO) << "The dataset iterator has reached the end of the "
+                           "dataset.";
+            }
+            absl::c_fill(infeed_dataset_iterator->used, false);
+          }
+        }
+
+        for (int j = 0; j < infeed_dataset_iterator->shapes.size(); ++j) {
+          auto tensor = infeed_dataset_iterator->tensors[j];
+
+          const char* tensor_data = tensor.tensor_data().data();
+          const auto& shape = infeed_dataset_iterator->shapes[j];
+
+          auto literal = MutableBorrowingLiteral(tensor_data, shape);
+          auto status =
+              transfer_manager->TransferLiteralToInfeed(executor, literal);
+
+          if (false == status.ok()) {
+            infeed_thread_cancelled_ = true;
+            return;
+          }
+        }
+
+        std::unique_lock<std::mutex> lock(infeed_dataset_iterator->mutex);
+        infeed_dataset_iterator->tensors_dequeued_cv.wait(lock, [&]() {
+          return infeed_dataset_iterator->all_tensors_used() ||
+                 infeed_thread_cancelled_;
+        });
+      }
+    }
+  };
+}
+
+void PoplarExecutor::LaunchInfeedThread(
+    perftools::gputools::StreamExecutor* executor,
+    const InfeedInfos& infeed_infos) {
+  std::function<void()> infeed_thread_io_fn =
+      CreateInfeedIOThreadFunction(executor, infeed_infos);
+  thread_pool_.Schedule(infeed_thread_io_fn);
+}
+
+void PoplarExecutor::StopThreadPool() {
+  infeed_thread_cancelled_ = true;
+  for (auto& infeed_it : infeed_dataset_iterators_) {
+    infeed_it.second->tensors_dequeued_cv.notify_one();
   }
 }
 
@@ -449,8 +548,8 @@ std::string PoplarExecutor::GetDeviceTargetName() const {
   return poplar::toString(poplar_device_.getTarget().getTargetType());
 }
 
-static bool DeviceConfigurationsEqual(const tensorflow::IPUOptions& a,
-                                      const tensorflow::IPUOptions& b) {
+static bool DeviceConfigurationsEqual(const IpuOptions& a,
+                                      const IpuOptions& b) {
   return google::protobuf::util::MessageDifferencer::Equivalent(a, b);
 }
 
@@ -462,44 +561,83 @@ static absl::optional<int64> GetMaxCompilationThreads() {
   return absl::nullopt;
 }
 
-Status PoplarExecutor::ConfigurePoplarDevice(
-    const tensorflow::IPUOptions& cfg) {
-  if (!DeviceConfigurationsEqual(cfg, current_config_) || !device_open_) {
-    current_config_ = cfg;
-    try {
-      if (device_open_) {
-        VLOG(1) << "Detaching ordinal " << ordinal_
-                << " from poplar device: type " << GetDeviceTargetName();
-        poplar_device_.detach();
-        device_open_ = false;
-      }
+Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
+  if (!DeviceConfigurationsEqual(cfg, current_config_) &&
+      hardware_configured_) {
+    return InternalError("IPU system configuration can only be set once.");
+  }
 
-      option_flags_ = poplar::OptionFlags();
-      option_flags_.set("target.workerStackSizeInBytes", "0x200");
+  current_config_ = cfg;
+  try {
+    if (device_open_) {
+      VLOG(1) << "Detaching ordinal " << ordinal_
+              << " from poplar device: type " << GetDeviceTargetName();
+      poplar_device_.detach();
+      device_open_ = false;
+    }
 
-      bool opened = false;
+    option_flags_ = poplar::OptionFlags();
+    option_flags_.set("target.workerStackSizeInBytes", "0x200");
 
-      bool have_ipu_hardware = false;
+    bool opened = false;
 
-      if (getenv(s_force_ipu_model) == nullptr) {
-        auto device_list = GetDeviceManager().getDevices();
-        for (const auto& d : device_list) {
-          if (d.getTarget().getTargetType() == poplar::TargetType::IPU) {
-            have_ipu_hardware = true;
-            break;
-          }
+    bool have_ipu_hardware = false;
+
+    if (current_config_.device_config_size() > 0) {
+      hardware_configured_ = true;
+    }
+
+    if (getenv(s_force_ipu_model) == nullptr) {
+      auto device_list = GetDeviceManager().getDevices();
+      for (const auto& d : device_list) {
+        if (d.getTarget().getTargetType() == poplar::TargetType::IPU) {
+          have_ipu_hardware = true;
+          break;
         }
       }
+    }
 
-      if (have_ipu_hardware) {
-        // Hardware devices
-        auto device_list = GetDeviceManager().getDevices();
+    if (have_ipu_hardware) {
+      // Hardware devices
+      auto device_list = GetDeviceManager().getDevices();
 
-        if (current_config_.device_config_size() == 0) {
-          // Default case - 1 single TF device with one single IPU
+      if (current_config_.device_config_size() == 0) {
+        // Default case - 1 single TF device with one single IPU
+        for (auto& d : device_list) {
+          if (d.getTarget().getTargetType() == poplar::TargetType::IPU &&
+              d.getTarget().getNumIPUs() == 1) {
+            if (d.attach()) {
+              poplar_device_ = std::move(d);
+              opened = true;
+              break;
+            }
+          }
+        }
+      } else {
+        // User has specified a configuration
+        if (ordinal_ >= current_config_.device_config_size()) {
+          return InternalError(
+              "Device ordinal %d not in device configuration list.", ordinal_);
+        }
+
+        auto device = current_config_.device_config(ordinal_);
+
+        if (device.selection_case() ==
+            IpuOptions::DeviceConfig::SelectionCase::kCfgIndex) {
+          const int32 cfg_index = device.cfg_index();
+
+          poplar_device_ = std::move(device_list.at(cfg_index));
+          if (poplar_device_.attach()) {
+            opened = true;
+          } else {
+            return InternalError(
+                "Could not attach to requested device configuration index %d",
+                cfg_index);
+          }
+        } else {
           for (auto& d : device_list) {
             if (d.getTarget().getTargetType() == poplar::TargetType::IPU &&
-                d.getTarget().getNumIPUs() == 1) {
+                d.getTarget().getNumIPUs() == device.auto_count()) {
               if (d.attach()) {
                 poplar_device_ = std::move(d);
                 opened = true;
@@ -507,159 +645,123 @@ Status PoplarExecutor::ConfigurePoplarDevice(
               }
             }
           }
-        } else {
-          // User has specified a configuration
-          if (ordinal_ >= current_config_.device_config_size()) {
-            return InternalError(
-                "Device ordinal %d not in device configuration list.",
-                ordinal_);
-          }
+        }
+      }
 
+      if (opened) {
+        unsigned mj, mn, pt;
+        poplar_device_.getDriverVersion(mj, mn, pt);
+        VLOG(1) << "Poplar driver: " << mj << "." << mn << "." << pt;
+
+        const auto& ids = poplar_device_.getDriverIDs();
+        LOG(INFO) << "Device /device:IPU:" << ordinal_ << " attached to IPU"
+                  << (ids.size() > 1 ? "s" : "") << ": "
+                  << absl::StrJoin(ids, ",");
+
+        if (current_config_.profiling().enable_execution_trace()) {
+          // Enable getting the cycle counts for each compute set on hardware
+          // when asking for an execution trace
+          option_flags_.set("debug.executionProfile", "compute_sets");
+        }
+      }
+    } else {
+      if (current_config_.ipu_model_config().enable_ipu_model()) {
+        // Poplar IPU Model device
+
+        int num_ipus = 1;
+        if (current_config_.device_config_size() > 0) {
           auto device = current_config_.device_config(ordinal_);
 
           if (device.selection_case() ==
-              tensorflow::IPUOptions::DeviceConfig::SelectionCase::kCfgIndex) {
-            const int32 cfg_index = device.cfg_index();
-
-            poplar_device_ = std::move(device_list.at(cfg_index));
-            if (poplar_device_.attach()) {
-              opened = true;
-            } else {
-              return InternalError(
-                  "Could not attach to requested device configuration index %d",
-                  cfg_index);
-            }
-          } else {
-            for (auto& d : device_list) {
-              if (d.getTarget().getTargetType() == poplar::TargetType::IPU &&
-                  d.getTarget().getNumIPUs() == device.auto_count()) {
-                if (d.attach()) {
-                  poplar_device_ = std::move(d);
-                  opened = true;
-                  break;
-                }
-              }
-            }
+              IpuOptions::DeviceConfig::SelectionCase::kCfgIndex) {
+            return InvalidArgument(
+                "Must specify the number of IPUs using auto_count");
           }
+
+          num_ipus = device.auto_count();
         }
 
-        if (opened) {
-          unsigned mj, mn, pt;
-          poplar_device_.getDriverVersion(mj, mn, pt);
-          VLOG(1) << "Poplar driver: " << mj << "." << mn << "." << pt;
+        poplar::IPUModel model;
+        model.numIPUs = num_ipus;
 
-          const auto& ids = poplar_device_.getDriverIDs();
-          LOG(INFO) << "Device /device:IPU:" << ordinal_ << " attached to IPU"
-                    << (ids.size() > 1 ? "s" : "") << ": "
-                    << absl::StrJoin(ids, ",");
-
-          if (current_config_.profiling().enable_execution_trace()) {
-            // Enable getting the cycle counts for each compute set on hardware
-            // when asking for an execution trace
-            option_flags_.set("debug.executionProfile", "compute_sets");
-          }
+        model.compileIPUCode =
+            current_config_.ipu_model_config().compile_ipu_code();
+        poplar_device_ = model.createDevice();
+        if (poplar_device_.attach()) {
+          opened = true;
         }
       } else {
-        if (current_config_.ipu_model_config().enable_ipu_model()) {
-          // Poplar IPU Model device
-
-          int num_ipus = 1;
-          if (current_config_.device_config_size() > 0) {
-            auto device = current_config_.device_config(ordinal_);
-
-            if (device.selection_case() ==
-                tensorflow::IPUOptions::DeviceConfig::SelectionCase::
-                    kCfgIndex) {
-              return InvalidArgument(
-                  "Must specify the number of IPUs using auto_count");
-            }
-
-            num_ipus = device.auto_count();
-          }
-
-          poplar::IPUModel model;
-          model.numIPUs = num_ipus;
-
-          model.compileIPUCode =
-              current_config_.ipu_model_config().compile_ipu_code();
-          poplar_device_ = model.createDevice();
-          if (poplar_device_.attach()) {
-            opened = true;
-          }
-        } else {
-          // Poplar CPU device
-          poplar_device_ = poplar::Device::createCPUDevice();
-          if (poplar_device_.attach()) {
-            opened = true;
-          }
+        // Poplar CPU device
+        poplar_device_ = poplar::Device::createCPUDevice();
+        if (poplar_device_.attach()) {
+          opened = true;
         }
       }
-
-      if (!opened) {
-        return xla::ResourceExhausted(
-            "Unable to acquire poplar device type for ordinal %d", ordinal_);
-      }
-    } catch (poplar::poplar_error e) {
-      return xla::InternalError(
-          "Unable to open poplar device for ordinal %d: %s", ordinal_,
-          e.what());
     }
 
-    VLOG(1) << "Opened Poplar device type " << GetDeviceTargetName();
-    device_open_ = true;
-
-    for (const auto& opt : current_config_.compilation_options()) {
-      option_flags_.set(opt.option(), opt.value());
+    if (!opened) {
+      return xla::ResourceExhausted(
+          "Unable to acquire poplar device type for ordinal %d", ordinal_);
     }
+  } catch (poplar::poplar_error e) {
+    return xla::InternalError("Unable to open poplar device for ordinal %d: %s",
+                              ordinal_, e.what());
+  }
 
-    for (const auto& opt : current_config_.convolution_options()) {
-      conv_options_.set(opt.option(), opt.value());
-    }
+  VLOG(1) << "Opened Poplar device type " << GetDeviceTargetName();
+  device_open_ = true;
 
-    for (const auto& opt : current_config_.pooling_options()) {
-      pooling_options_.set(opt.option(), opt.value());
-    }
+  for (const auto& opt : current_config_.compilation_options()) {
+    option_flags_.set(opt.option(), opt.value());
+  }
 
-    for (const auto& opt : current_config_.profiling().options()) {
-      report_options_.set(opt.option(), opt.value());
-    }
+  for (const auto& opt : current_config_.convolution_options()) {
+    conv_options_.set(opt.option(), opt.value());
+  }
 
-    auto max_compilation_threads = GetMaxCompilationThreads();
-    if (max_compilation_threads) {
-      option_flags_.set("opt.maxCompilationThreads",
-                        std::to_string(*max_compilation_threads));
-    }
+  for (const auto& opt : current_config_.pooling_options()) {
+    pooling_options_.set(opt.option(), opt.value());
+  }
 
-    for (auto opt : option_flags_) {
-      VLOG(1) << "Engine option: " << opt.first << " = " << opt.second;
-    }
+  for (const auto& opt : current_config_.profiling().options()) {
+    report_options_.set(opt.option(), opt.value());
+  }
 
-    for (auto opt : conv_options_) {
-      VLOG(1) << "Convolution option: " << opt.first << " = " << opt.second;
-    }
+  auto max_compilation_threads = GetMaxCompilationThreads();
+  if (max_compilation_threads) {
+    option_flags_.set("opt.maxCompilationThreads",
+                      std::to_string(*max_compilation_threads));
+  }
 
-    for (auto opt : pooling_options_) {
-      VLOG(1) << "Pooling option: " << opt.first << " = " << opt.second;
-    }
+  for (auto opt : option_flags_) {
+    VLOG(1) << "Engine option: " << opt.first << " = " << opt.second;
+  }
 
-    for (auto opt : report_options_) {
-      VLOG(1) << "Report option: " << opt.first << " = " << opt.second;
-    }
+  for (auto opt : conv_options_) {
+    VLOG(1) << "Convolution option: " << opt.first << " = " << opt.second;
+  }
 
-    // Cache Target hash
-    std::vector<int64> poplar_target;
-    const auto& target = poplar_device_.getTarget();
-    poplar_target.push_back(target.getNumTiles());
-    poplar_target.push_back(target.getDataPathWidth());
-    poplar_target.push_back(target.getBytesPerTile());
-    poplar_target.push_back(target.getNumWorkerContexts());
-    poplar_target.push_back(target.getTilesPerIPU());
-    poplar_target.push_back(target.getNumIPUs());
-    poplar_target.push_back((unsigned)target.getTargetType());
+  for (auto opt : pooling_options_) {
+    VLOG(1) << "Pooling option: " << opt.first << " = " << opt.second;
+  }
 
-    for (int64 h : poplar_target) {
-      poplar_device_hash_ = tensorflow::Hash64Combine(poplar_device_hash_, h);
-    }
+  for (auto opt : report_options_) {
+    VLOG(1) << "Report option: " << opt.first << " = " << opt.second;
+  }
+
+  // Cache Target hash
+  std::vector<int64> poplar_target;
+  const auto& target = poplar_device_.getTarget();
+  poplar_target.push_back(target.getNumTiles());
+  poplar_target.push_back(target.getDataPathWidth());
+  poplar_target.push_back(target.getBytesPerTile());
+  poplar_target.push_back(target.getNumWorkerContexts());
+  poplar_target.push_back(target.getTilesPerIPU());
+  poplar_target.push_back(target.getNumIPUs());
+  poplar_target.push_back((unsigned)target.getTargetType());
+
+  for (int64 h : poplar_target) {
+    poplar_device_hash_ = tensorflow::Hash64Combine(poplar_device_hash_, h);
   }
 
   return Status::OK();
@@ -754,11 +856,11 @@ void PoplarExecutor::AddExecuteEventRecord(const std::string& module_name,
 
 const poprand::RandomGenMode PoplarExecutor::GetRandomGenMode() const {
   switch (current_config_.random_type()) {
-    case tensorflow::IPUOptions::NOT_REPEATABLE:
+    case IpuOptions::NOT_REPEATABLE:
       return poprand::NOT_REPEATABLE;
-    case tensorflow::IPUOptions::SYSTEM_REPEATABLE:
+    case IpuOptions::SYSTEM_REPEATABLE:
       return poprand::SYSTEM_REPEATABLE;
-    case tensorflow::IPUOptions::ALWAYS_REPEATABLE:
+    case IpuOptions::ALWAYS_REPEATABLE:
       return poprand::ALWAYS_REPEATABLE;
     default:
       return poprand::NOT_REPEATABLE;
@@ -1298,7 +1400,7 @@ void PoplarExecutor::CreateInfeedDatasetIterator(
     std::unique_ptr<tensorflow::data::IteratorBase> iterator,
     std::unique_ptr<tensorflow::data::IteratorContext> iterator_ctx,
     const std::vector<xla::Shape>& shapes) {
-  infeed_dataset_iterators[id] = absl::make_unique<InfeedDatasetIterator>(
+  infeed_dataset_iterators_[id] = absl::make_unique<InfeedDatasetIterator>(
       std::move(iterator), std::move(iterator_ctx), shapes);
 }
 
@@ -1393,13 +1495,20 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
       ConnectStreamedVariablesDeviceToHost();
 
       const auto& infeed_infos = executable.GetInfeedInfos();
+      auto infeed_thread_cleanup =
+          tensorflow::gtl::MakeCleanup([this]() { StopThreadPool(); });
       if (!infeed_infos.empty()) {
+        if (!UseSyntheticData()) {
+          LaunchInfeedThread(executor, infeed_infos);
+        }
         ConnectInfeedsToStreamCallback(infeed_infos);
       }
 
       const auto& outfeed_infos = executable.GetOutfeedInfos();
       if (!outfeed_infos.empty()) {
-        ConnectOutfeedToStreamCallback(executor, outfeed_infos);
+        const auto replication_factor = executable.GetReplicationFactor();
+        ConnectOutfeedToStreamCallback(executor, outfeed_infos,
+                                       replication_factor);
       }
 
       // Run the main engine

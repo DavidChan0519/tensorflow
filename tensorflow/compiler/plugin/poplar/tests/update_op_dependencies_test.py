@@ -1,4 +1,3 @@
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -14,8 +13,8 @@ from tensorflow.python.ops import gen_array_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
 
-class UpdateOpDependenciesTest(test_util.TensorFlowTestCase):
 
+class UpdateOpDependenciesTest(test_util.TensorFlowTestCase):
   def testDontOutlineInplaceExpression(self):
     with ops.device("/device:IPU:0"):
       pa = array_ops.placeholder(np.float32, [])
@@ -27,14 +26,11 @@ class UpdateOpDependenciesTest(test_util.TensorFlowTestCase):
     with ops.device('cpu'):
       report = gen_ipu_ops.ipu_event_trace()
 
+    tu.configure_ipu_system()
+
     with tu.ipu_session() as sess:
       sess.run(report)
-      fd = {
-        pa: 1,
-        pb: 2,
-        pc: 3,
-        pd: 4
-      }
+      fd = {pa: 1, pb: 2, pc: 3, pd: 4}
       result = sess.run(e, fd)
       self.assertAllClose(result, 4)
 
@@ -44,9 +40,10 @@ class UpdateOpDependenciesTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['add/add.*/AddTo',
-            'sub/subtract.*/AddTo',
-            'add_1/add.*/AddTo']
+      ok = [
+          '__seed*', 'add/add.*/AddTo', 'sub/subtract.*/AddTo',
+          'add_1/add.*/AddTo'
+      ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def tesInplaceAddCopyWithInplacePeer(self):
@@ -62,26 +59,29 @@ class UpdateOpDependenciesTest(test_util.TensorFlowTestCase):
     with ops.device('cpu'):
       report = gen_ipu_ops.ipu_event_trace()
 
+    tu.configure_ipu_system()
+
     with tu.ipu_session() as sess:
       sess.run(report)
       fd = {
-        pa: data_a,
-        pb: data_b,
+          pa: data_a,
+          pb: data_b,
       }
       result = sess.run(e, fd)
       np_result = np.transpose(data_a) / (data_a + data_b)
       self.assertAllClose(result, np_result)
 
       result = sess.run(report)
-      self.assertTrue(len(result) == 3) #compile_begin, compile_end, execute
+      self.assertTrue(len(result) == 3)  #compile_begin, compile_end, execute
 
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['host-exchange-local-copy-',
-            'Copy_XLA_Args/arg0.*_to_transpose/transpose',
-            'add/add.*/AddTo',
-            'truediv/divide.*/Op/Divide']
+      ok = [
+          '__seed*', 'host-exchange-local-copy-',
+          'Copy_XLA_Args/arg0.*_to_transpose/transpose', 'add/add.*/AddTo',
+          'truediv/divide.*/Op/Divide'
+      ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def tesInplaceAddCopyWithInplacePeer2(self):
@@ -100,30 +100,32 @@ class UpdateOpDependenciesTest(test_util.TensorFlowTestCase):
     with ops.device('cpu'):
       report = gen_ipu_ops.ipu_event_trace()
 
+    tu.configure_ipu_system()
+
     with tu.ipu_session() as sess:
       sess.run(report)
       fd = {
-        pa: data_a,
-        pb: data_b,
-        pc: data_c,
+          pa: data_a,
+          pb: data_b,
+          pc: data_c,
       }
-      np_result = (data_a + data_b * data_c) / (np.transpose(data_a) * data_b +
-                                                data_c)
+      np_result = (data_a + data_b * data_c) / (
+          np.transpose(data_a) * data_b + data_c)
       result = sess.run(d, fd)
       self.assertAllClose(result, np_result)
 
       result = sess.run(report)
-      self.assertTrue(len(result) == 3) #compile_begin, compile_end, execute
+      self.assertTrue(len(result) == 3)  #compile_begin, compile_end, execute
 
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['Copy_XLA_Args/arg0.*_to_transpose/transpose'
-            'mul/multiply.*/Op/Multiply',
-            'add/add.*/AddTo',
-            'mul_1/multiply.*/Op/Multiply',
-            'add_1/add.*/AddTo',
-            'truediv/divide.*/Op/Divide']
+      ok = [
+          '__seed*', 'Copy_XLA_Args/arg0.*_to_transpose/transpose'
+          'mul/multiply.*/Op/Multiply', 'add/add.*/AddTo',
+          'mul_1/multiply.*/Op/Multiply', 'add_1/add.*/AddTo',
+          'truediv/divide.*/Op/Divide'
+      ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testInplaceOpAddCopyWithInplaceParent(self):
@@ -141,12 +143,14 @@ class UpdateOpDependenciesTest(test_util.TensorFlowTestCase):
     with ops.device('cpu'):
       report = gen_ipu_ops.ipu_event_trace()
 
+    tu.configure_ipu_system()
+
     with tu.ipu_session() as sess:
       sess.run(report)
       fd = {
-        pa: [1, 2, 3],
-        pb: [5, 6, 7],
-        pc: 2,
+          pa: [1, 2, 3],
+          pb: [5, 6, 7],
+          pc: 2,
       }
       result = sess.run(h, fd)
       self.assertAllClose(result, [5, 7])
@@ -157,11 +161,12 @@ class UpdateOpDependenciesTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['Copy_XLA_Args/arg*_to_Slice/slice*.clone',
-            'add/add.*/AddTo',
-            'truediv/divide.*/Op/Divide',
-            'add_1/add.*/AddTo']
+      ok = [
+          '__seed*', 'Copy_XLA_Args/arg*_to_Slice/slice*.clone',
+          'add/add.*/AddTo', 'truediv/divide.*/Op/Divide', 'add_1/add.*/AddTo'
+      ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
+
 if __name__ == "__main__":
-    googletest.main()
+  googletest.main()
