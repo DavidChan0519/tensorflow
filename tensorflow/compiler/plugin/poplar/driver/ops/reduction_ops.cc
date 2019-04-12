@@ -70,11 +70,15 @@ bool IsSimpleSelection(const HloComputation* computation) {
     return false;
   }
 
-  switch (root->opcode()) {
-    case HloOpcode::kGe:
-    case HloOpcode::kGt:
-    case HloOpcode::kLe:
-    case HloOpcode::kLt:
+  if (root->opcode() != HloOpcode::kCompare) {
+    return false;
+  }
+
+  switch (root->comparison_direction()) {
+    case ComparisonDirection::kGe:
+    case ComparisonDirection::kGt:
+    case ComparisonDirection::kLe:
+    case ComparisonDirection::kLt:
       return true;
     default:
       return false;
@@ -113,9 +117,9 @@ bool IsPoplibsPool(const HloInstruction* inst,
   return (reduction_count <= 2);
 }
 
-static Literal GetIdentityConstantLiteral(const HloOpcode opcode,
+static Literal GetIdentityConstantLiteral(const HloInstruction* root,
                                           const HloInstruction* reduce) {
-  switch (opcode) {
+  switch (root->opcode()) {
     case HloOpcode::kAdd:
     case HloOpcode::kAnd:
     default:
@@ -124,19 +128,21 @@ static Literal GetIdentityConstantLiteral(const HloOpcode opcode,
     case HloOpcode::kOr:
       return LiteralUtil::One(reduce->shape().element_type());
     case HloOpcode::kMaximum:
-    case HloOpcode::kGe:
-    case HloOpcode::kGt:
       return LiteralUtil::MinValue(reduce->shape().element_type());
     case HloOpcode::kMinimum:
-    case HloOpcode::kLe:
-    case HloOpcode::kLt:
       return LiteralUtil::MaxValue(reduce->shape().element_type());
+    case HloOpcode::kCompare:
+      switch (root->comparison_direction()) {
+        case ComparisonDirection::kGe:
+        case ComparisonDirection::kGt:
+          return LiteralUtil::MinValue(reduce->shape().element_type());
+        case ComparisonDirection::kLe:
+        case ComparisonDirection::kLt:
+          return LiteralUtil::MaxValue(reduce->shape().element_type());
+        default:
+          return LiteralUtil::Zero(reduce->shape().element_type());
+      }
   }
-}
-
-static Literal GetIdentityConstantLiteral(const HloInstruction* root,
-                                          const HloInstruction* reduce) {
-  return GetIdentityConstantLiteral(root->opcode(), reduce);
 }
 
 static popops::Operation PoplibsReductionOperation(const HloInstruction* inst) {
@@ -180,14 +186,14 @@ static const std::string& ReductionVertexBaseName(const HloInstruction* inst) {
 }
 
 static const std::string& SelectionVertexBaseName(const HloInstruction* inst) {
-  switch (inst->opcode()) {
-    case HloOpcode::kGe:
+  switch (inst->comparison_direction()) {
+    case ComparisonDirection::kGe:
       return reduction_ge;
-    case HloOpcode::kGt:
+    case ComparisonDirection::kGt:
       return reduction_gt;
-    case HloOpcode::kLe:
+    case ComparisonDirection::kLe:
       return reduction_le;
-    case HloOpcode::kLt:
+    case ComparisonDirection::kLt:
       return reduction_lt;
     default:
       // Cannot reach here
@@ -271,6 +277,7 @@ static poplar::Type GetReductionType(const popnn::PoolingType& pooling_type,
     default:
       return input_type;
   }
+  return input_type;
 }
 
 static popnn::pooling::PoolParams GetPoplibsPoolParams(
@@ -899,8 +906,6 @@ StatusOr<poplar::program::Program> CreateReplicatedAllReduce(
     const xla::Shape& output, TensorMap& tensor_map) {
   poplar::program::Sequence seq;
 
-  poplar::Graph& graph = GetGraph(res, inst);
-
   // If we aren't part of a replicated graph, then it's just an identity op
   if (!res.replicated_graph) {
     for (int i = 0; i < inst->operand_count(); ++i) {
@@ -910,15 +915,56 @@ StatusOr<poplar::program::Program> CreateReplicatedAllReduce(
       TF_CHECK_OK(AddOutputTensor(tensor_map, inst, i, in));
     }
   } else {
+    // Collect all of the input tensors
+    std::vector<poplar::Tensor> input_tensors(inst->operand_count());
     for (int i = 0; i < inst->operand_count(); ++i) {
-      TF_ASSIGN_OR_RETURN(auto in,
+      TF_ASSIGN_OR_RETURN(input_tensors[i],
                           FindInstructionInput(tensor_map, res, inst, i, seq));
+    }
 
+    // Keep track of the permutation
+    std::vector<unsigned> input_tensors_perm(input_tensors.size());
+    std::iota(input_tensors_perm.begin(), input_tensors_perm.end(), 0);
+
+    // Iteratively partition the tensors by element type
+    //  v itr
+    // [|i32,f16,f32,i32,f16,f32,i32,f16,f32]
+    auto itr = input_tensors_perm.begin();
+    while (itr != input_tensors_perm.end()) {
+      auto pred = [&](unsigned idx) {
+        return input_tensors[*itr].elementType() ==
+               input_tensors[idx].elementType();
+      };
+
+      // Partition the input tensor indices by element type
+      //  v itr       v p
+      // [|i32,i32,i32|f16,f32,f16,f32,f16,f32]
+      auto p = std::partition(itr, input_tensors_perm.end(), pred);
+      // Create a concatenated and flattened tensor of the partitioned inputs
+      std::vector<poplar::Tensor> flat_tensors(std::distance(itr, p));
+      std::transform(itr, p, flat_tensors.begin(), [&](const uint32 idx) {
+        return input_tensors[idx].flatten();
+      });
+      auto t = poplar::concat(flat_tensors);
+
+      // Replicated sum the concatenated tensor
       auto out = popops::replicatedAllReduce(
-          res.replicated_graph.value(), res.main_graph, in,
+          res.replicated_graph.value(), res.main_graph, t,
           popops::Operation::ADD, seq, GetDebugName(inst));
 
-      TF_CHECK_OK(AddOutputTensor(tensor_map, inst, i, out));
+      // Unconcat the result and unflatten
+      for (auto i = itr; i != p; ++i) {
+        auto a = out.slice(0, input_tensors[*i].numElements(), 0);
+        out = out.slice(input_tensors[*i].numElements(), out.numElements(), 0);
+
+        a = a.reshape(input_tensors[*i].shape());
+        TF_CHECK_OK(AddOutputTensor(tensor_map, inst, *i, a));
+      }
+
+      // Continue from the current partition point
+      //             v itr
+      // [i32,i32,i32|f16,f32,f16,f32,f16,f32]
+      itr = p;
     }
   }
 

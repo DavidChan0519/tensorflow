@@ -16,8 +16,8 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/visitors/deferred_allocation_visitor.h"
 
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
-#include "tensorflow/compiler/plugin/poplar/driver/executor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/poplar_executor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
@@ -118,10 +118,12 @@ Status DeferredAllocationVisitor::HandleGetTupleElement(HloInstruction* inst) {
   } else if (defer_any_allocations) {
     // Note that the forward allocation finder makes sure that this is inplace -
     // we therefore don't need to worry about copies.
+    const int64 offset =
+        InsertIntoTuple(inst->operand(0)->shape(), inst->tuple_index(), 0);
     for (int64 i = 0; i < shapes.size(); i++) {
       if (!DeferAllocation(inst, i)) {
         // Get the tensor for this shape and assign it as an output.
-        auto range = std::make_pair(i, i + 1);
+        auto range = std::make_pair(offset + i, offset + i + 1);
         auto outputs = FindInstructionInputsInRange(
             tensor_map, resources_, inst, 0, range, sequence, false);
         CHECK_EQ(outputs.size(), 1);

@@ -18,8 +18,8 @@ limitations under the License.
 
 #include "tensorflow/compiler/plugin/poplar/driver/visitors/visitor_base.h"
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
-#include "tensorflow/compiler/plugin/poplar/driver/executor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
+#include "tensorflow/compiler/plugin/poplar/driver/poplar_executor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 
@@ -55,10 +55,6 @@ typedef StatusOr<poplar::program::Program> (*CustomCallFn)(
     CompilerResources&, const HloInstruction*, const xla::Shape&, TensorMap&);
 
 static std::map<std::string, CustomCallFn> custom_call_map = {
-    {"relu", CreateReluOp},
-    {"relugrad", CreateReluGradOp},
-    {"sigmoid", CreateSigmoidOp},
-    {"sigmoidgrad", CreateSigmoidGradOp},
     {"conv_biasadd", CreateConvBiasAddOp},
     {"matmul_biasadd", CreateMatMulBiasAddOp},
     {"norm_scale_add", RandomNormalScale},
@@ -81,7 +77,8 @@ const Shape& BaseVisitor::GetOutputShape(HloInstruction* inst) const {
 }
 
 Status BaseVisitor::Unimplemented(HloInstruction* inst) {
-  return xla::Unimplemented("%s not implemented", inst->name().c_str());
+  return xla::Unimplemented("%s (%s) not implemented", inst->name().c_str(),
+                            HloOpcodeString(inst->opcode()).c_str());
 }
 
 Status BaseVisitor::HandleElementwiseUnary(HloInstruction* inst) {
@@ -100,6 +97,16 @@ Status BaseVisitor::HandleElementwiseBinary(HloInstruction* inst) {
   TF_ASSIGN_OR_RETURN(
       prog, CreateBinaryElementwiseOp(resources_, inst, GetOutputShape(inst),
                                       tensor_map));
+  sequence.add(prog);
+  return Status::OK();
+}
+
+Status BaseVisitor::HandleCompare(HloInstruction* inst) {
+  VLOG(1) << "Processing " << inst->name();
+  poplar::program::Program prog;
+  TF_ASSIGN_OR_RETURN(
+      prog,
+      CreateComparisonOp(resources_, inst, GetOutputShape(inst), tensor_map));
   sequence.add(prog);
   return Status::OK();
 }
@@ -211,7 +218,7 @@ Status BaseVisitor::HandleRng(HloInstruction* inst) {
   }
   for (auto* op : inst->operands()) {
     if (op->opcode() != HloOpcode::kConstant) {
-      LOG(FATAL) << "Operand " << op->ToString() << " is not a constant.";
+      LOG(FATAL) << "RNG operand " << op->ToString() << " is not a constant.";
     }
   }
   poplar::program::Program prog;
@@ -396,7 +403,8 @@ Status BaseVisitor::HandleWhile(HloInstruction* inst) {
 Status BaseVisitor::HandleConditional(HloInstruction* inst) {
   poplar::program::Program prog;
   TF_ASSIGN_OR_RETURN(
-      prog, CreateIfOp(resources_, inst, GetOutputShape(inst), tensor_map));
+      prog,
+      CreateConditionalOp(resources_, inst, GetOutputShape(inst), tensor_map));
   sequence.add(prog);
 
   return Status::OK();

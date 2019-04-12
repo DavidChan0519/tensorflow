@@ -64,47 +64,6 @@ absl::optional<std::pair<PoplibsOp::Lib, PoplibsOp::Op>> GetPoplibsCustomOp(
   return absl::nullopt;
 }
 
-const bool IsPoplibsCustomOp(const HloInstruction* inst) {
-  return GetPoplibsCustomOp(inst) != absl::nullopt;
-}
-
-const bool IsPoplibsCustomOp(const HloInstruction* inst, PoplibsOp::Lib lib,
-                             PoplibsOp::Op op) {
-  auto ret = GetPoplibsCustomOp(inst);
-  if (!ret) {
-    return false;
-  }
-  return ret->first == lib && ret->second == op;
-}
-
-const bool IsPoplibsCustomOpElementwise(const HloInstruction* inst) {
-  if (!IsPoplibsCustomOp(inst)) {
-    return false;
-  }
-  auto ret = GetPoplibsCustomOp(inst);
-  if (!ret) {
-    return false;
-  }
-
-  switch (ret->first) {
-    case PoplibsOp::Popops: {
-      switch (ret->second) {
-        default: { return false; }
-      }
-      break;
-    }
-    case PoplibsOp::Poprand: {
-      switch (ret->second) {
-        case PoplibsOp::TruncatedNormal: {
-          return true;
-        }
-        default: { return false; }
-      }
-    }
-    default: { return false; }
-  }
-}
-
 namespace IPUCustomKernelsUtil {
 
 AttributeMap::AttributeMap() {}
@@ -191,8 +150,8 @@ void AttributeMap::AddAttribute(const std::string& field_name,
   } else if (tinfo == typeid(Window)) {
     auto casted_val = absl::any_cast<Window>(attr);
     std::string window_proto_str;
-    if (!tensorflow::ProtoToHumanReadableJson(casted_val, &window_proto_str)
-             .ok()) {
+    if (!tensorflow::ProtoToHumanReadableJson(
+        casted_val, &window_proto_str, true).ok()) {
       LOG(FATAL) << "Could not parse the window.";
     }
     attributes_[field_name] = GetAsJsonValue(window_proto_str);

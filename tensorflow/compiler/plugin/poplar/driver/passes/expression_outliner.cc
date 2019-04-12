@@ -51,16 +51,11 @@ bool IsPopopsElementwise(const HloInstruction* inst) {
     // Binary
     case HloOpcode::kAdd:
     case HloOpcode::kAtan2:
+    case HloOpcode::kCompare:
     case HloOpcode::kDivide:
-    case HloOpcode::kEq:
-    case HloOpcode::kGe:
-    case HloOpcode::kGt:
-    case HloOpcode::kLe:
-    case HloOpcode::kLt:
     case HloOpcode::kMaximum:
     case HloOpcode::kMinimum:
     case HloOpcode::kMultiply:
-    case HloOpcode::kNe:
     case HloOpcode::kPower:
     case HloOpcode::kRemainder:
     case HloOpcode::kSubtract:
@@ -190,6 +185,12 @@ StatusOr<bool> ExpressionOutliner::Run(HloModule* module) {
 
         if (annotations_.inplace_instructions.count(op)) {
           ok_to_outline = false;
+        }
+
+        if (inst->has_sharding() && op->has_sharding()) {
+          if (inst->sharding() != op->sharding()) {
+            ok_to_outline = false;
+          }
         }
 
         bool all_users_ok = true;

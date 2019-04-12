@@ -1,4 +1,4 @@
-# Copyright 2017 Graphcore Ltd
+# Copyright 2017, 2018, 2019 Graphcore Ltd
 #
 
 import os
@@ -237,7 +237,7 @@ class IpuXlaVariableTest(test_util.TensorFlowTestCase):
       cs_list = tu.get_compute_sets_from_report(s)
       ok = [
           '__seed*',
-          'vs/z1/Initializer/random_normal/RandomStandardNormal/fusion/Normal'
+          'vs/z1/Initializer/random_normal/RandomStandardNormal/fusion/normal'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -265,7 +265,7 @@ class IpuXlaVariableTest(test_util.TensorFlowTestCase):
       cs_list = tu.get_compute_sets_from_report(s)
       ok = [
           '__seed*',
-          'vs/z1/Initializer/random_normal/RandomStandardNormal/fusion/Normal'
+          'vs/z1/Initializer/random_normal/RandomStandardNormal/fusion/normal'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -304,14 +304,13 @@ class IpuXlaVariableTest(test_util.TensorFlowTestCase):
 
       # Find of the names of compute sets
       r = sess.run(report)
-      self.assertTrue(len(r) == 3)  # compile,load,execute
 
       s = tu.extract_all_strings_from_event_trace(r)
       cs_list = tu.get_compute_sets_from_report(s)
 
       ok = [
           '__seed*',
-          'z1/Initializer/truncated_normal/TruncatedNormal/custom-call.*/TruncatedNormal',
+          'z1/Initializer/truncated_normal/TruncatedNormal/custom-call*/truncatedNormal',
           'z1/Initializer/truncated_normal/mul/multiply.*/Op/Multiply',
           'z1/Initializer/truncated_normal/add.*/AddTo'
       ]
@@ -340,14 +339,13 @@ class IpuXlaVariableTest(test_util.TensorFlowTestCase):
 
       # Find of the names of compute sets
       r = sess.run(report)
-      self.assertTrue(len(r) == 3)  # compile,load,execute
 
       s = tu.extract_all_strings_from_event_trace(r)
       cs_list = tu.get_compute_sets_from_report(s)
 
       ok = [
           '__seed*',
-          'z1/Initializer/truncated_normal/TruncatedNormal/custom-call.*/TruncatedNormal',
+          'z1/Initializer/truncated_normal/TruncatedNormal/custom-call*/truncatedNormal',
           'z1/Initializer/truncated_normal/mul/multiply.*/Op/Multiply',
           'z1/Initializer/truncated_normal/add.*/AddTo'
       ]
@@ -373,14 +371,13 @@ class IpuXlaVariableTest(test_util.TensorFlowTestCase):
 
       # Find of the names of compute sets
       r = sess.run(report)
-      self.assertTrue(len(r) == 3)  # compile,load,execute
 
       s = tu.extract_all_strings_from_event_trace(r)
       cs_list = tu.get_compute_sets_from_report(s)
 
       ok = [
           '__seed*',
-          'z1/Initializer/truncated_normal/TruncatedNormal/custom-call.*/TruncatedNormal'
+          'z1/Initializer/truncated_normal/TruncatedNormal/custom-call*/truncatedNormal'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -404,14 +401,13 @@ class IpuXlaVariableTest(test_util.TensorFlowTestCase):
 
       # Find of the names of compute sets
       r = sess.run(report)
-      self.assertTrue(len(r) == 3)  # compile,load,execute
 
       s = tu.extract_all_strings_from_event_trace(r)
       cs_list = tu.get_compute_sets_from_report(s)
 
       ok = [
           '__seed*',
-          'z1/Initializer/truncated_normal/TruncatedNormal/custom-call.*/TruncatedNormal'
+          'z1/Initializer/truncated_normal/TruncatedNormal/custom-call*/truncatedNormal'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -439,7 +435,7 @@ class IpuXlaVariableTest(test_util.TensorFlowTestCase):
       cs_list = tu.get_compute_sets_from_report(s)
       ok = [
           '__seed*',
-          'vs/z1/Initializer/random_uniform/RandomUniform/fusion/Uniform'
+          'vs/z1/Initializer/random_uniform/RandomUniform/fusion/uniform'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -467,7 +463,7 @@ class IpuXlaVariableTest(test_util.TensorFlowTestCase):
       cs_list = tu.get_compute_sets_from_report(s)
       ok = [
           '__seed*',
-          'vs/z1/Initializer/random_uniform/RandomUniform/fusion/Uniform'
+          'vs/z1/Initializer/random_uniform/RandomUniform/fusion/uniform'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -901,4 +897,6 @@ class IpuXlaVariableTestSyntheticData(test_util.TensorFlowTestCase):
 
 
 if __name__ == "__main__":
+  os.environ['TF_XLA_FLAGS'] = (
+      '--tf_xla_min_cluster_size=1 ' + os.environ.get('TF_XLA_FLAGS', ''))
   googletest.main()

@@ -1709,9 +1709,13 @@ class Slice : public SimpleOperator<SliceOperator> {
   int GetVersion(const OperatorSignature& op_signature) const override {
     const string& input_name = op_signature.op->inputs[0];
     const Array& input_array = op_signature.model->GetArray(input_name);
-    // Version 2 supports signed int8 input types.
     if (input_array.data_type == ArrayDataType::kInt8) {
+      // Version 2 supports signed int8 input types.
       return 2;
+    }
+    if (input_array.data_type == ArrayDataType::kString) {
+      // Version 3 supports string input types.
+      return 3;
     }
     return 1;
   }
@@ -2476,7 +2480,10 @@ std::vector<std::unique_ptr<BaseOperator>> BuildOperatorList(
   ops.push_back(
       MakeUnique<ReverseSequence>(::tflite::BuiltinOperator_REVERSE_SEQUENCE,
                                   OperatorType::kReverseSequence));
-
+  ops.push_back(MakeUnique<SimpleOperator<MatrixDiagOperator>>(
+      "MATRIX_DIAG", OperatorType::kMatrixDiag));
+  ops.push_back(MakeUnique<SimpleOperator<MatrixSetDiagOperator>>(
+      "MATRIX_SET_DIAG", OperatorType::kMatrixSetDiag));
   // Custom Operators.
   ops.push_back(
       MakeUnique<DepthToSpace>("DEPTH_TO_SPACE", OperatorType::kDepthToSpace));

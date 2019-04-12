@@ -1,10 +1,11 @@
-# Copyright 2017 Graphcore Ltd
+# Copyright 2017, 2018, 2019 Graphcore Ltd
 #
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import numpy as np
 import test_utils as tu
 
@@ -260,10 +261,7 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = [
-          '__seed*', 'host-exchange-local-copy-', 'Copy_',
-          'Conv2DBackpropFilter/convolution.*/Conv_8x8'
-      ]
+      ok = ['__seed*', 'Copy_', 'Conv2DBackpropFilter/convolution.*/Conv_8x8']
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testDepthwiseConv3x2(self):
@@ -430,7 +428,10 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['__seed*', 'DepthwiseConv2dNativeBackpropFilter/fusion*/Conv_6x6']
+      ok = [
+          '__seed*', 'Copy_',
+          'DepthwiseConv2dNativeBackpropFilter/fusion*/Conv_6x6'
+      ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testDepthwiseConvBackpropFilter1x1(self):
@@ -458,7 +459,10 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
 
-      ok = ['__seed*', 'DepthwiseConv2dNativeBackpropFilter/fusion*/Conv_6x6']
+      ok = [
+          '__seed*', 'Copy_',
+          'DepthwiseConv2dNativeBackpropFilter/fusion*/Conv_6x6'
+      ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testDepthwiseConvBackpropFilter1x1WithRelu(self):
@@ -488,8 +492,9 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
       cs_list = tu.get_compute_sets_from_report(s)
 
       ok = [
-          '__seed*', 'DepthwiseConv2dNativeBackpropFilter/fusion*/Conv_6x6',
-          'Relu/fusion.*/Nonlinearity'
+          '__seed*', 'Copy_',
+          'DepthwiseConv2dNativeBackpropFilter/fusion*/Conv_6x6',
+          'Relu/custom-call*/Nonlinearity'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -541,4 +546,6 @@ class IpuXlaConvTest(test_util.TensorFlowTestCase):
 
 
 if __name__ == "__main__":
+  os.environ['TF_XLA_FLAGS'] = (
+      '--tf_xla_min_cluster_size=1 ' + os.environ.get('TF_XLA_FLAGS', ''))
   googletest.main()

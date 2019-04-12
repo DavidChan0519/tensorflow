@@ -64,13 +64,14 @@ Status FullVisitor::HandleConcatenate(HloInstruction* inst) {
       ArgVectors inputs,
       GetInplaceOutputTensors(tensor_map, resources_, inst, sequence));
   CHECK_EQ(inputs.size(), inst->operand_count());
-  CHECK_EQ(inputs[0].size(), 1);
-  poplar::Tensor out = inputs[0][0];
-  for (int i = 1; i < inst->operand_count(); i++) {
-    CHECK_EQ(inputs[i].size(), 1);
-    poplar::Tensor t = inputs[i][0];
-    out = poplar::concat(out, t, dimension);
-  }
+
+  std::vector<poplar::Tensor> tensors(inputs.size());
+  absl::c_transform(inputs, tensors.begin(), [](const ArgVector& ts) {
+    CHECK_EQ(ts.size(), 1);
+    return ts[0];
+  });
+  poplar::Tensor out = poplar::concat(tensors, dimension);
+
   TF_CHECK_OK(AddOutputTensor(tensor_map, inst, 0, out));
   return Status::OK();
 }
@@ -259,6 +260,17 @@ Status FullVisitor::HandleReduceWindow(HloInstruction* inst) {
   return Unimplemented(inst);
 }
 
+Status FullVisitor::HandleScatter(HloInstruction* inst) {
+  VLOG(1) << "Processing " << inst->name();
+
+  TF_ASSIGN_OR_RETURN(
+      poplar::program::Program prog,
+      CreateScatter(resources_, Cast<HloScatterInstruction>(inst), tensor_map));
+
+  sequence.add(prog);
+  return Status::OK();
+}
+
 Status FullVisitor::HandleSelectAndScatter(HloInstruction* inst) {
   if (IsSimpleSelection(inst->select()) &&
       IsReducableArtithmetic(inst->scatter())) {
@@ -369,8 +381,8 @@ Status FullVisitor::Postprocess(HloInstruction* inst) {
         return xla::InternalError(
             "Instruction %s has mismatched Poplar (%s) and XLA (%s) type",
             inst->name().c_str(),
-            expected_type.toString().cloneAsString().c_str(),
-            outs[0].elementType().toString().cloneAsString().c_str());
+            outs[0].elementType().toString().cloneAsString().c_str(),
+            expected_type.toString().cloneAsString().c_str());
       }
     }
   }

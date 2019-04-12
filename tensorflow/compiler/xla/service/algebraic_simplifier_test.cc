@@ -490,8 +490,9 @@ TEST_F(AlgebraicSimplifierTest, InlineTrivialMap) {
   HloInstruction* zero = builder.AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(0.0f)));
   builder.AddInstruction(HloInstruction::CreateMap(
-      r2f32, {param0, builder.AddInstruction(
-                          HloInstruction::CreateBroadcast(r2f32, zero, {}))},
+      r2f32,
+      {param0, builder.AddInstruction(
+                   HloInstruction::CreateBroadcast(r2f32, zero, {}))},
       add_computation));
 
   auto computation = m->AddEntryComputation(builder.Build());
@@ -850,6 +851,26 @@ TEST_F(AlgebraicSimplifierTest, DivideByConstant) {
 
   EXPECT_THAT(computation->root_instruction(),
               GmockMatch(m::Multiply(m::Parameter(0), m::Constant())));
+}
+
+// A / Broadcast(Const) => A * Broadcast(InvertedConst)
+TEST_F(AlgebraicSimplifierTest, DivideByBroadcastedConstant) {
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p = f32[4] parameter(0)
+      c = f32[] constant(256.0)
+      b = f32[4] broadcast(c), dimensions={}
+      ROOT d = f32[4] divide(p, b)
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  ASSERT_TRUE(AlgebraicSimplifier(default_options_).Run(m.get()).ValueOrDie());
+
+  EXPECT_THAT(m->entry_computation()->root_instruction(),
+              GmockMatch(m::Multiply(
+                  m::Parameter(0),
+                  m::Broadcast(m::Op().IsConstantScalar(1.0f / 256.0f)))));
 }
 
 // pow(pow(A, X), Y) => pow(A, X*Y)
@@ -3109,8 +3130,9 @@ TEST_P(ConvInputPaddingTest, DoTest) {
       input, pad_value, padding_config));
 
   auto* filter = builder.AddInstruction(HloInstruction::CreateParameter(
-      1, ShapeUtil::MakeShape(
-             F32, {lhs_pad->shape().dimensions(1), 256, 3, 3}),  // io01
+      1,
+      ShapeUtil::MakeShape(
+          F32, {lhs_pad->shape().dimensions(1), 256, 3, 3}),  // io01
       "input"));
 
   ConvolutionDimensionNumbers dnums =
@@ -3216,8 +3238,9 @@ TEST_P(ConvFilterPaddingTest, DoIt) {
       filter, pad_value, padding_config));
 
   auto* input = builder.AddInstruction(HloInstruction::CreateParameter(
-      0, ShapeUtil::MakeShape(
-             F32, {1024, rhs_pad->shape().dimensions(0), 100, 100}),  // bf01
+      0,
+      ShapeUtil::MakeShape(
+          F32, {1024, rhs_pad->shape().dimensions(0), 100, 100}),  // bf01
       "input"));
 
   ConvolutionDimensionNumbers dnums =
@@ -4233,8 +4256,9 @@ TEST_P(PadReduceWindowEffectiveBroadcastTest, DoIt) {
       ShapeInference::InferPadShape(input->shape(),
                                     ShapeUtil::MakeShape(F32, {}), padding));
   HloInstruction* pad = builder.AddInstruction(HloInstruction::CreatePad(
-      pad_shape, input, builder.AddInstruction(HloInstruction::CreateConstant(
-                            LiteralUtil::CreateR0(0.0f))),
+      pad_shape, input,
+      builder.AddInstruction(
+          HloInstruction::CreateConstant(LiteralUtil::CreateR0(0.0f))),
       padding));
 
   HloComputation* add_computation = nullptr;
@@ -4960,6 +4984,26 @@ TEST_F(AlgebraicSimplifierTest, RecipRsqrt) {
   EXPECT_THAT(m->entry_computation()->root_instruction(),
               GmockMatch(m::MultiplyAnyOrder(m::Parameter(1),
                                              m::Sqrt(m::Parameter(0)))));
+}
+
+TEST_F(AlgebraicSimplifierTest, CopyReshape) {
+  const char* kModuleStr = R"(
+    HloModule m
+    test {
+      p0 = f32[168,168,48,48]{3,2,1,0} parameter(0)
+      r0 = f32[1,168,168,2304]{3,2,1,0} reshape(p0)
+      ROOT c0 = f32[1,168,168,2304]{3,0,2,1} copy(r0)
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+  Shape result_shape = m->entry_computation()->root_instruction()->shape();
+  AlgebraicSimplifierOptions options(
+      [](const Shape&, const Shape&) { return false; });
+  options.set_is_layout_sensitive(true);
+  ASSERT_TRUE(AlgebraicSimplifier(options).Run(m.get()).ValueOrDie());
+  LOG(INFO) << "\n" << m->ToString();
+  EXPECT_THAT(
+      m->entry_computation()->root_instruction(),
+      GmockMatch(m::Reshape(m::Parameter(0)).WithShapeEqualTo(&result_shape)));
 }
 
 }  // namespace

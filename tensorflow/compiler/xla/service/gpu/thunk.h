@@ -98,6 +98,11 @@ class Thunk {
                                  se::Stream* stream,
                                  HloExecutionProfiler* profiler) = 0;
 
+ protected:
+  const HloModuleConfig& GetModuleConfig() const {
+    return hlo_instruction()->GetModule()->config();
+  }
+
  private:
   Kind kind_;
   const HloInstruction* hlo_instruction_;
@@ -106,6 +111,7 @@ class Thunk {
 // A sequence of thunks.
 using ThunkSequence = std::vector<std::unique_ptr<Thunk>>;
 
+absl::string_view ThunkKindToString(Thunk::Kind);
 std::ostream& operator<<(std::ostream& os, Thunk::Kind kind);
 
 }  // namespace gpu

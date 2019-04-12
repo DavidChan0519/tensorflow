@@ -14,10 +14,12 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/compiler/plugin/poplar/driver/passes/inplace_util.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/custom_ops/hlo_poplar_instruction.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 
 #include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
 
+#include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_module.h"
 
 namespace xla {
@@ -26,9 +28,8 @@ namespace InplaceUtil {
 namespace {
 // Map from name to the number of the first x operands which are inplace
 static std::map<std::string, uint64> fused_inplace_info_map = {
-    {"relu", 1},           {"sigmoid", 1},    {"conv_biasadd", 1},
-    {"matmul_biasadd", 1}, {"bias_apply", 1}, {"conv_scaled_inplace", 1},
-    {"scaled_inplace", 1},
+    {"conv_biasadd", 1},        {"matmul_biasadd", 1}, {"bias_apply", 1},
+    {"conv_scaled_inplace", 1}, {"scaled_inplace", 1},
 };
 
 bool IsNotDependencyOfPeers(HloInstruction* inplace,
@@ -125,17 +126,12 @@ std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
     // Binary Elementwise ops - inplace on operand 0.
     case HloOpcode::kAdd:
     case HloOpcode::kAtan2:
+    case HloOpcode::kCompare:
     case HloOpcode::kComplex:
     case HloOpcode::kDivide:
-    case HloOpcode::kEq:
-    case HloOpcode::kGe:
-    case HloOpcode::kGt:
-    case HloOpcode::kLe:
-    case HloOpcode::kLt:
     case HloOpcode::kMaximum:
     case HloOpcode::kMinimum:
     case HloOpcode::kMultiply:
-    case HloOpcode::kNe:
     case HloOpcode::kPower:
     case HloOpcode::kRemainder:
     case HloOpcode::kSubtract:
@@ -152,6 +148,7 @@ std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
     case HloOpcode::kDynamicUpdateSlice:
     case HloOpcode::kGetTupleElement:
     case HloOpcode::kReshape:
+    case HloOpcode::kScatter:
     case HloOpcode::kSlice:
     case HloOpcode::kTranspose: {
       // All of the above ops are inplace on operand 0.
@@ -216,19 +213,12 @@ std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
     }
 
     case HloOpcode::kCustomCall: {
-      if (IsPoplibsCustomOp(inst)) {
-        // For custom Poplibs Ops, get num_inplace_operands attribute which
-        // indicates the following:
-        // If num_inplace_operands == 0 then the op is NotInplaceHloInstruction;
-        // Else the op is inplace on the first num_inplace_operands operands.
-        auto attribute_map = IPUCustomKernelsUtil::AttributeMap(inst);
-        auto statusor =
-            attribute_map.GetAttributeAsUInt64("num_inplace_operands");
-        if (!statusor.ok()) {
-          LOG(FATAL) << "Custom Poplibs op " << inst->name()
-                     << " is missing \"num_inplace_operands\" attribute.";
-        }
-        uint64 num_inplace_operands = statusor.ValueOrDie();
+      if (IsPoplibsHloCustomOp(inst)) {
+        auto poplar_inst = Cast<HloPoplarInstruction>(inst);
+
+        const auto num_inplace_operands =
+            poplar_inst->NumberOfInplaceOperands();
+
         if (num_inplace_operands) {
           OperandIndexes indexes(num_inplace_operands);
           std::iota(indexes.begin(), indexes.end(), 0);
@@ -264,7 +254,6 @@ std::unique_ptr<HloInstructionDescription> GetHloInstructionDescription(
     case HloOpcode::kReduce:
     case HloOpcode::kReduceWindow:
     case HloOpcode::kRng:
-    case HloOpcode::kScatter:
     case HloOpcode::kSelect:
     case HloOpcode::kSelectAndScatter:
     case HloOpcode::kTupleSelect: {

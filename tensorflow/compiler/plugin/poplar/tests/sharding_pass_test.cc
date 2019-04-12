@@ -201,6 +201,52 @@ main {
   EXPECT_EQ(inst->sharding().GetUniqueDevice(), 1);
 }
 
+TEST_F(ShardingPassTest, TestIgnoreUnconnectedComputations) {
+  std::string hlo_string = R"(
+HloModule top
+
+subcomp {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  ROOT r1 = f16[4] add(a0, a1)
+}
+
+main {
+  arg0 = f16[4] parameter(0)
+  arg1 = f16[4] parameter(1)
+  arg2 = f16[4] parameter(2)
+  sin0 = f16[4] sine(arg0), sharding={maximal device=0}
+  mul0 = f16[4] multiply(sin0, arg1), sharding={maximal device=0}
+  mul1 = f16[4] multiply(mul0, arg2), sharding={maximal device=0}
+  ROOT add = f16[4] add(mul0, mul1)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  auto insts = module->entry_computation()->instructions();
+  for (auto* inst : insts) {
+    EXPECT_TRUE(inst->has_sharding());
+    const auto& sharding = inst->sharding();
+    EXPECT_TRUE(sharding.HasUniqueDevice());
+  }
+
+  auto subcomp = module->GetComputationWithName("subcomp");
+  insts = subcomp->instructions();
+  for (auto* inst : insts) {
+    EXPECT_FALSE(inst->has_sharding());
+  }
+}
+
 TEST_F(ShardingPassTest, TestAddShardingTuplesBefore) {
   std::string hlo_string = R"(
 HloModule top
@@ -340,28 +386,34 @@ main {
   }
 }
 
-TEST_F(ShardingPassTest, TestAddToCallSiteTupleOutputWhile) {
+TEST_F(ShardingPassTest, TestAddToCallSiteTupleOutputWhileFromBody) {
   std::string hlo_string = R"(
 HloModule top
 
-subcomp {
-  s0 = (f16[4], f16[4], f16[4]) parameter(0)
+cond {
+  c0 = (f16[4], f16[4]) parameter(0)
+  c1 = f16[4] get-tuple-element(c0), index=0
+  c2 = f16[] constant(1.0)
+  c3 = f16[4] broadcast(c2), dimensions={0}
+  ROOT c4 = pred[4] compare(c1, c3), direction=EQ
+}
+
+body {
+  s0 = (f16[4], f16[4]) parameter(0)
   s1 = f16[4] get-tuple-element(s0), index=0
   s2 = f16[4] get-tuple-element(s0), index=1
-  s3 = f16[4] get-tuple-element(s0), index=2
   s4 = f16[4] add(s1, s2), sharding={maximal device=1}
-  s5 = f16[4] add(s3, s2), sharding={maximal device=0}
+  s5 = f16[4] add(s1, s2), sharding={maximal device=0}
   ROOT t = (f16[4], f16[4]) tuple(s4, s5)
 }
 
 main {
   arg0 = f16[4] parameter(0)
   arg1 = f16[4] parameter(1)
-  arg2 = f16[4] parameter(2)
-  tup1 = (f16[4], f16[4], f16[4]) tuple(arg0, arg1, arg2)
-  cal1 = (f16[4], f16[4]) call(tup1), to_apply=subcomp
-  g0 = f16[4] get-tuple-element(cal1), index=0
-  g1 = f16[4] get-tuple-element(cal1), index=1
+  tup1 = (f16[4], f16[4]) tuple(arg0, arg1)
+  whl1 = (f16[4], f16[4]) while(tup1), condition=cond, body=body
+  g0 = f16[4] get-tuple-element(whl1), index=0
+  g1 = f16[4] get-tuple-element(whl1), index=1
   ROOT add = f16[4] add(g0, g1)
 }
   )";
@@ -384,25 +436,34 @@ main {
   }
 }
 
-TEST_F(ShardingPassTest, TestAddToCallSiteTupleOutputWhileFromTupleParameter) {
+TEST_F(ShardingPassTest, TestAddToCallSiteTupleOutputWhileFromCond) {
   std::string hlo_string = R"(
 HloModule top
 
-subcomp {
-  s0 = (f16[4], f16[4], f16[4]) parameter(0)
+cond {
+  c0 = (f16[4], f16[4]) parameter(0)
+  c1 = f16[4] get-tuple-element(c0), index=0
+  c2 = f16[] constant(1.0)
+  c3 = f16[4] broadcast(c2), dimensions={0}, sharding={maximal device=1}
+  ROOT c4 = pred[4] compare(c1, c3), direction=EQ
+}
+
+body {
+  s0 = (f16[4], f16[4]) parameter(0)
   s1 = f16[4] get-tuple-element(s0), index=0
   s2 = f16[4] get-tuple-element(s0), index=1
-  s3 = f16[4] get-tuple-element(s0), index=2
-  s4 = f16[4] add(s1, s2), sharding={maximal device=1}
-  s5 = f16[4] add(s3, s2), sharding={maximal device=0}
+  s4 = f16[4] add(s1, s2)
+  s5 = f16[4] add(s1, s2)
   ROOT t = (f16[4], f16[4]) tuple(s4, s5)
 }
 
 main {
-  arg0 = (f16[4], f16[4], f16[4]) parameter(0)
-  cal1 = (f16[4], f16[4]) call(arg0), to_apply=subcomp
-  g0 = f16[4] get-tuple-element(cal1), index=0
-  g1 = f16[4] get-tuple-element(cal1), index=1
+  arg0 = f16[4] parameter(0)
+  arg1 = f16[4] parameter(1)
+  tup1 = (f16[4], f16[4]) tuple(arg0, arg1)
+  whl1 = (f16[4], f16[4]) while(tup1), condition=cond, body=body
+  g0 = f16[4] get-tuple-element(whl1), index=0
+  g1 = f16[4] get-tuple-element(whl1), index=1
   ROOT add = f16[4] add(g0, g1)
 }
   )";
@@ -552,7 +613,7 @@ cond {
   cp = (s32[], f16[4], f16[4]) parameter(0)
   gte = f16[4] get-tuple-element(cp), index=0
   cc = s32[] constant(10)
-  ROOT lt = pred[] less-than(gte, cc)
+  ROOT lt = pred[] compare(gte, cc), direction=LT
 }
 
 body {
@@ -572,7 +633,7 @@ main {
   a1 = f16[4] parameter(1)
   a2 = f16[4] parameter(2)
   t = (s32[], f16[4], f16[4]) tuple(a0, a1, a2)
-  w = (f16[4], (f16[4], f16[4])) while(t), condition=cond, body=body
+  w = (s32[], f16[4], f16[4]) while(t), condition=cond, body=body
   g = f16[4] get-tuple-element(w), index=1
   ROOT add = f16[4] add(g, g)
 }
@@ -804,7 +865,633 @@ main {
   EXPECT_EQ(gte0->sharding().GetUniqueDevice(), 0);
 }
 
-// computations which are entrely empty
+TEST_F(ShardingPassTest, TestCalledSubcompIsEntirelyEmptyFillFromUsers) {
+  std::string hlo_string = R"(
+HloModule top
+
+subcomp {
+  s0 = f16[4] parameter(0)
+  s1 = f16[4] parameter(1)
+  ROOT s3 = f16[4] add(s0, s1)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  cal1 = f16[4] call(a0, a1), to_apply=subcomp
+  sin1 = f16[4] sine(cal1), sharding={maximal device=1}
+  ROOT t = (f16[4]) tuple(sin1)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+      EXPECT_EQ(inst->sharding().GetUniqueDevice(), 1);
+    }
+  }
+}
+
+TEST_F(ShardingPassTest, TestCalledSubcompIsEntirelyEmptyFillFromParams) {
+  std::string hlo_string = R"(
+HloModule top
+
+subcomp {
+  s0 = f16[4] parameter(0)
+  s1 = f16[4] parameter(1)
+  ROOT s3 = f16[4] add(s0, s1)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  c0 = f16[4] cosine(a0), sharding={maximal device=1}
+  c1 = f16[4] cosine(a1), sharding={maximal device=1}
+  cal1 = f16[4] call(a0, a1), to_apply=subcomp
+  sin1 = f16[4] sine(cal1)
+  ROOT t = (f16[4]) tuple(sin1)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+      EXPECT_EQ(inst->sharding().GetUniqueDevice(), 1);
+    }
+  }
+}
+
+TEST_F(ShardingPassTest, TestCalledSubcompIsEntirelyEmptyFillFromUsersTuple) {
+  std::string hlo_string = R"(
+HloModule top
+
+subcomp {
+  s0 = f16[4] parameter(0)
+  s1 = f16[4] parameter(1)
+  s2 = f16[4] add(s0, s1)
+  s3 = f16[4] add(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  cal1 = (f16[4], f16[4]) call(a0, a1), to_apply=subcomp
+  gte0 = f16[4] get-tuple-element(cal1), index=0
+  gte1 = f16[4] get-tuple-element(cal1), index=1
+  sin1 = f16[4] sine(gte0), sharding={maximal device=1}
+  sin2 = f16[4] sine(gte1), sharding={maximal device=1}
+  ROOT t = (f16[4], f16[4]) tuple(sin1, sin2)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+      EXPECT_EQ(inst->sharding().GetUniqueDevice(), 1);
+    }
+  }
+}
+
+TEST_F(ShardingPassTest, TestCalledSubcompIsEntirelyEmptyFillFromParamsTuple) {
+  std::string hlo_string = R"(
+HloModule top
+
+subcomp {
+  s0 = f16[4] parameter(0)
+  s1 = f16[4] parameter(1)
+  s2 = f16[4] add(s0, s1)
+  s3 = f16[4] add(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  c0 = f16[4] cosine(a0), sharding={maximal device=1}
+  c1 = f16[4] cosine(a1), sharding={maximal device=1}
+  cal1 = (f16[4], f16[4]) call(c0, c1), to_apply=subcomp
+  gte0 = f16[4] get-tuple-element(cal1), index=0
+  gte1 = f16[4] get-tuple-element(cal1), index=1
+  sin1 = f16[4] sine(gte0)
+  sin2 = f16[4] sine(gte1)
+  ROOT t = (f16[4], f16[4]) tuple(sin1, sin2)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+      if (!inst->sharding().IsTuple()) {
+        EXPECT_EQ(inst->sharding().GetUniqueDevice(), 1);
+      }
+    }
+  }
+}
+
+TEST_F(ShardingPassTest, TestEmptyCompInEmptyComp) {
+  std::string hlo_string = R"(
+HloModule top
+
+subsubcomp {
+  s0 = f16[4] parameter(0)
+  s1 = f16[4] parameter(1)
+  s2 = f16[4] add(s0, s1)
+  s3 = f16[4] add(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+
+subcomp {
+  s0 = f16[4] parameter(0)
+  s1 = f16[4] parameter(1)
+  s2 = f16[4] add(s0, s1)
+  s3 = f16[4] add(s0, s1)
+  cl = (f16[4], f16[4]) call(s2, s3), to_apply=subsubcomp
+  g0 = f16[4] get-tuple-element(cl), index=0
+  g1 = f16[4] get-tuple-element(cl), index=1
+  s4 = (f16[4], f16[4]) tuple(g0, g1)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  c0 = f16[4] cosine(a0), sharding={maximal device=1}
+  c1 = f16[4] cosine(a1), sharding={maximal device=1}
+  cal1 = (f16[4], f16[4]) call(c0, c1), to_apply=subcomp
+  gte0 = f16[4] get-tuple-element(cal1), index=0
+  gte1 = f16[4] get-tuple-element(cal1), index=1
+  sin1 = f16[4] sine(gte0)
+  sin2 = f16[4] sine(gte1)
+  ROOT t = (f16[4], f16[4]) tuple(sin1, sin2)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+      if (!inst->sharding().IsTuple()) {
+        EXPECT_EQ(inst->sharding().GetUniqueDevice(), 1);
+      }
+    }
+  }
+}
+
+TEST_F(ShardingPassTest, TestConditionalAsSelect) {
+  std::string hlo_string = R"(
+HloModule top
+
+cond1 {
+  s0 = f16[4] parameter(0)
+  s1 = f16[4] parameter(1)
+  s2 = f16[4] add(s0, s1)
+  s3 = f16[4] add(s0, s1), sharding={maximal device=1}
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+cond2 {
+  s0 = f16[4] parameter(0)
+  s1 = f16[4] parameter(1)
+  s2 = f16[4] add(s0, s1)
+  s3 = f16[4] add(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  lt = pred[] compare(a0, a1), direction=LT
+  con1 = (f16[4], f16[4]) conditional(lt, a0, a1),
+      true_computation=cond1, false_computation=cond2
+  gte0 = f16[4] get-tuple-element(con1), index=0
+  gte1 = f16[4] get-tuple-element(con1), index=1
+  sin1 = f16[4] sine(gte0)
+  sin2 = f16[4] sine(gte1)
+  ROOT t = (f16[4], f16[4]) tuple(sin1, sin2)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+      if (!inst->sharding().IsTuple()) {
+        EXPECT_EQ(inst->sharding().GetUniqueDevice(), 1);
+      }
+    }
+  }
+}
+
+TEST_F(ShardingPassTest, TestConditionalAsSwitch) {
+  std::string hlo_string = R"(
+HloModule top
+
+cond1 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] subtract(s0, s1), sharding={maximal device=0}
+  s3 = f16[4] add(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+cond2 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] add(s0, s1)
+  s3 = f16[4] subtract(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+cond3 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] multiply(s0, s1)
+  s3 = f16[4] divide(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  se = s32[] parameter(2)
+  t0 = (f16[4], f16[4]) tuple(a0, a1)
+  con1 = (f16[4], f16[4]) conditional(se, t0, t0, t0),
+      branch_computations={cond1, cond2, cond3}
+  gte0 = f16[4] get-tuple-element(con1), index=0
+  gte1 = f16[4] get-tuple-element(con1), index=1
+  sin1 = f16[4] sine(gte0)
+  sin2 = f16[4] sine(gte1)
+  ROOT t = (f16[4], f16[4]) tuple(sin1, sin2)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+      if (!inst->sharding().IsTuple()) {
+        EXPECT_EQ(inst->sharding().GetUniqueDevice(), 0);
+      }
+    }
+  }
+}
+
+TEST_F(ShardingPassTest, TestConditionalAsSwitchMismatchingSubcomps) {
+  std::string hlo_string = R"(
+HloModule top
+
+cond1 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] subtract(s0, s1), sharding={maximal device=0}
+  s3 = f16[4] add(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+cond2 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] add(s0, s1), sharding={maximal device=1}
+  s3 = f16[4] subtract(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+cond3 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] multiply(s0, s1), sharding={maximal device=2}
+  s3 = f16[4] divide(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  se = s32[] parameter(2)
+  t0 = (f16[4], f16[4]) tuple(a0, a1)
+  con1 = (f16[4], f16[4]) conditional(se, t0, t0, t0),
+      branch_computations={cond1, cond2, cond3}
+  gte0 = f16[4] get-tuple-element(con1), index=0
+  gte1 = f16[4] get-tuple-element(con1), index=1
+  sin1 = f16[4] sine(gte0)
+  sin2 = f16[4] sine(gte1)
+  ROOT t = (f16[4], f16[4]) tuple(sin1, sin2)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+    }
+  }
+
+  auto* comp1 = module->GetComputationWithName("cond1");
+  auto* comp2 = module->GetComputationWithName("cond2");
+  auto* comp3 = module->GetComputationWithName("cond3");
+  EXPECT_TRUE(comp1->parameter_instruction(0)->has_sharding());
+  EXPECT_TRUE(comp2->parameter_instruction(0)->has_sharding());
+  EXPECT_TRUE(comp3->parameter_instruction(0)->has_sharding());
+  EXPECT_NE(comp1->parameter_instruction(0)->sharding(),
+            comp2->parameter_instruction(0)->sharding());
+  EXPECT_NE(comp1->parameter_instruction(0)->sharding(),
+            comp3->parameter_instruction(0)->sharding());
+  EXPECT_TRUE(comp1->root_instruction()->has_sharding());
+  EXPECT_TRUE(comp2->root_instruction()->has_sharding());
+  EXPECT_TRUE(comp3->root_instruction()->has_sharding());
+  EXPECT_EQ(comp1->root_instruction()->sharding(),
+            comp2->root_instruction()->sharding());
+  EXPECT_EQ(comp1->root_instruction()->sharding(),
+            comp3->root_instruction()->sharding());
+}
+
+TEST_F(ShardingPassTest, TestConditionalAsSwitchCopyToSubcomp) {
+  std::string hlo_string = R"(
+HloModule top
+
+cond1 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] subtract(s0, s1)
+  s3 = f16[4] add(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+cond2 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] add(s0, s1)
+  s3 = f16[4] subtract(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+cond3 {
+  p0 = (f16[4], f16[4]) parameter(0)
+  s0 = f16[4] get-tuple-element(p0), index=0
+  s1 = f16[4] get-tuple-element(p0), index=1
+  s2 = f16[4] multiply(s0, s1)
+  s3 = f16[4] divide(s0, s1)
+  s4 = (f16[4], f16[4]) tuple(s2, s3)
+}
+
+main {
+  a0 = f16[4] parameter(0)
+  a1 = f16[4] parameter(1)
+  se = s32[] parameter(2)
+  t0 = (f16[4], f16[4]) tuple(a0, a1)
+  con1 = (f16[4], f16[4]) conditional(se, t0, t0, t0),
+      branch_computations={cond1, cond2, cond3}
+  gte0 = f16[4] get-tuple-element(con1), index=0
+  gte1 = f16[4] get-tuple-element(con1), index=1
+  sin1 = f16[4] sine(gte0), sharding={maximal device=0}
+  sin2 = f16[4] sine(gte1), sharding={maximal device=0}
+  ROOT t = (f16[4], f16[4]) tuple(sin1, sin2)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  for (auto* comp : module->computations()) {
+    auto insts = comp->instructions();
+    for (auto* inst : insts) {
+      ASSERT_TRUE(inst->has_sharding());
+      if (!inst->sharding().IsTuple()) {
+        EXPECT_EQ(inst->sharding().GetUniqueDevice(), 0);
+      }
+    }
+  }
+}
+
+TEST_F(ShardingPassTest, TestSettingGteFromOperandIsConsideredProgress) {
+  std::string hlo_string = R"(
+HloModule top
+
+main {
+  a0 = f16[] parameter(0), sharding={maximal device=0}
+  a1 = f16[] add(a0, a0), sharding={maximal device=0}
+  a2 = (f16[], f16[]) tuple(a0, a0), sharding={{maximal device=0}, {maximal device=0}}
+  a3 = ((f16[], f16[])) tuple(a2), sharding={{maximal device=0}, {maximal device=0}}
+  a4 = (f16[], f16[]) get-tuple-element(a3), index=0
+  a5 = f16[] get-tuple-element(a4), index=0
+  ROOT tuple = (f16[], f16[]) tuple(a1, a5)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  auto* comp = module->entry_computation();
+  auto insts = comp->instructions();
+  for (auto* inst : insts) {
+    EXPECT_TRUE(inst->has_sharding());
+  }
+}
+
+TEST_F(ShardingPassTest, TestWhileRepeatHasMatchingInputAndOutputSharding) {
+  std::string hlo_string = R"(
+HloModule top
+
+_pop_op_wide_const.1 {
+  c = f16[] constant(0)
+  ROOT b = f16[5,1,512] broadcast(c), dimensions={}
+}
+
+_pop_op_wide_const.2 {
+  c = f16[] constant(0)
+  ROOT b = f16[5,512] broadcast(c), dimensions={}
+}
+
+max_half {
+  x = f16[] parameter(0)
+  y = f16[] parameter(1)
+  ROOT m = f16[] maximum(x, y)
+}
+
+add_float {
+  x = f32[] parameter(0)
+  y = f32[] parameter(1)
+  ROOT a = f32[] add(x, y)
+}
+
+body {
+  arg_tuple.1 = (f16[1,5,1000], s32[1,5], f16[512,1000]) parameter(0)
+  gte.68 = f16[1,5,1000] get-tuple-element(arg_tuple.1), index=0
+  gte.69 = s32[1,5] get-tuple-element(arg_tuple.1), index=1
+  gte.75 = f16[512,1000] get-tuple-element(arg_tuple.1), index=2
+  transpose.1 = f16[1000,512] transpose(gte.75), dimensions={1,0}, sharding={maximal device=0}
+  reshape.29 = s32[5] reshape(gte.69)
+  fusion.11 = f16[5,512] fusion(), kind=kCustom, calls=_pop_op_wide_const.2
+  reshape.30 = f16[1,5,512] reshape(fusion.11), sharding={maximal device=0}
+  transpose.2 = f16[5,1,512]{2,0,1} transpose(reshape.30), dimensions={1,0,2}, sharding={maximal device=1}
+  fusion.12 = f16[5,1,512] fusion(), kind=kCustom, calls=_pop_op_wide_const.1
+  transpose.3 = f16[1,5,512]{2,0,1} transpose(fusion.12), dimensions={1,0,2}, sharding={maximal device=1}
+  reshape.31 = f16[1,1000,512] reshape(transpose.1)
+  transpose.4 = f16[1,512,1000] transpose(reshape.31), dimensions={0,2,1}
+  dot.1 = f16[1,5,1000] dot(transpose.3, transpose.4), lhs_batch_dims={0}, lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={1}
+  constant.48 = f16[] constant(-inf)
+  reduce = f16[1,5] reduce(dot.1, constant.48), dimensions={2}, to_apply=max_half
+  broadcast.15 = f16[1,5,1000] broadcast(reduce), dimensions={0,1}
+  subtract = f16[1,5,1000] subtract(dot.1, broadcast.15)
+  exponential = f16[1,5,1000] exponential(subtract)
+  constant.43 = f16[] constant(0)
+  reduce.1 = f16[1,5] reduce(exponential, constant.43), dimensions={2}, to_apply=add_float
+  broadcast.16 = f16[1,5,1000] broadcast(reduce.1), dimensions={0,1}
+  divide = f16[1,5,1000] divide(exponential, broadcast.16)
+  ROOT tuple.10 = (f16[1,5,1000], s32[1,5], f16[512,1000]) tuple(divide, gte.69, gte.75)
+}
+
+ENTRY main {
+  arg0.1 = f16[1,5,1000] parameter(0)
+  arg1.2 = s32[1,5] parameter(1)
+  arg2.3 = f16[512,1000] parameter(2)
+  tuple.13 = (f16[1,5,1000], s32[1,5], f16[512,1000]) tuple(arg0.1, arg1.2, arg2.3)
+  call.4 = (f16[1,5,1000], s32[1,5], f16[512,1000]) call(tuple.13), to_apply=body, backend_config="{\"repeatConfig\":{\"isRepeatLoop\":true,\"repeatCount\":\"100\"}}"
+  gte.270 = f16[1,5,1000] get-tuple-element(call.4), index=0
+  ROOT tuple.284 = (f16[1,5,1000]) tuple(gte.270)
+}
+  )";
+
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+
+  auto module_or_status = ParseHloString(hlo_string, config);
+  EXPECT_TRUE(module_or_status.ok());
+
+  auto* module = module_or_status.ValueOrDie().get();
+
+  ShardingPass shardingPass;
+  ASSERT_TRUE(shardingPass.Run(module).ValueOrDie());
+
+  auto* comp = module->entry_computation();
+  auto insts = comp->instructions();
+  for (auto* inst : insts) {
+    EXPECT_TRUE(inst->has_sharding());
+  }
+
+  auto* body = module->GetComputationWithName("body");
+  EXPECT_TRUE(body->parameter_instruction(0)->has_sharding());
+  EXPECT_TRUE(body->root_instruction()->has_sharding());
+  EXPECT_EQ(body->parameter_instruction(0)->sharding(),
+            body->root_instruction()->sharding());
+}
 
 }  // namespace
 }  // namespace poplarplugin

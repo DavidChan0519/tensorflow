@@ -22,7 +22,12 @@ from tensorflow.contrib.ipu.python import sharding
 from tensorflow.core.framework import attr_value_pb2
 from tensorflow.python.platform import tf_logging as logging
 
+prohibited_ops = frozenset(["NextIteration", "PopDatastreamInfeedDequeue"])
 
+
+# This is a model for the size of a tensor on a tile.  It could be improved by
+# accepting that tensors generate vertex state associated with the number of
+# operations which consume them.
 def tensor_memory_use(t):
   return t.shape.num_elements() * t.dtype.size
 
@@ -127,11 +132,7 @@ def find_all_subgraphs(graph, splitting_edges, input_node, output_node):
   return subgraphs, edges
 
 
-def automatic_sharding(num_shards,
-                       input_ts,
-                       loss_ts,
-                       train_ops=None,
-                       edge_filter=None):
+def automatic_sharding(num_shards, input_ts, loss_ts, edge_filter=None):
   """Automatically set shards for all connected nodes in graph.
 
   Args:
@@ -147,10 +148,6 @@ def automatic_sharding(num_shards,
 
   loss_op = loss_ts.op
 
-  roots = [loss_op]
-  if train_ops:
-    roots += train_ops
-
   all_ops = loss_op.graph.get_operations()
   op_list = list(filter(lambda o: 'IPU' in o.device, all_ops))
 
@@ -159,17 +156,19 @@ def automatic_sharding(num_shards,
 
   assert len(op_list) > 0
 
-  for op in op_list:
-    op_name = str(op.name.lower())
-    if op.type == "NextIteration" or op.type == "PopDatastreamInfeedDequeue":
-      continue
-    if 'gradient' in op_name:
-      bwd_ops.append(op)
-    else:
-      fwd_ops.append(op)
+  marked_collection = loss_op.graph.get_collection(sharding._IPU_AUTOSHARD)
+
+  if len(marked_collection) > 0:
+    fwd_ops = marked_collection
+  else:
+    for op in op_list:
+      if 'gradient' not in op.name.lower():
+        fwd_ops.append(op)
 
   fwd_ops = list(fwd_ops)
-  bwd_ops = list(bwd_ops)
+  bwd_ops = [o for o in op_list if o not in fwd_ops]
+
+  fwd_ops = [o for o in fwd_ops if o.type not in prohibited_ops]
 
   if input_ts.op not in fwd_ops:
     input_op = [op for op in input_ts.consumers() if op in fwd_ops][0]
@@ -214,6 +213,14 @@ def automatic_sharding(num_shards,
 
   subgraph_mem = [calculate_memory(graph_fwd, g) for g in subgraphs]
 
+  logging.debug('Subgraph memory use ' + str(subgraph_mem))
+
+  # Verify that we have enough subgraphs to fill all of the available shards
+  if len(edges) + 1 < num_shards:
+    raise Exception(
+        "There are fewer subgraphs (%s) than available shards (%s). Reduce the "
+        "number of shards." % (len(edges) + 1, num_shards))
+
   # Split the ordered subgraphs into n groups and calculate the memory for each
   # possible combination
   #
@@ -253,6 +260,9 @@ def automatic_sharding(num_shards,
 
   # if still tied choose the first option in the list
   best_ind = best_ind[0]
+
+  logging.debug('Splitting edges ' +
+                str(list(map(lambda x: str(splitting_edges[x]), best_ind))))
 
   ind_pad = [0] + [i + 1 for i in best_ind] + [len(subgraph_mem)]
   per_shard_subgraphs = [

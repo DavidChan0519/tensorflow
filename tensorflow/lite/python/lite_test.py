@@ -27,13 +27,16 @@ from tensorflow.lite.python import lite_constants
 from tensorflow.lite.python.interpreter import Interpreter
 from tensorflow.python import keras
 from tensorflow.python.client import session
+from tensorflow.python.eager import def_function
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
 from tensorflow.python.ops import variable_scope
+from tensorflow.python.ops import variables
 from tensorflow.python.ops.variables import global_variables_initializer as _global_variables_initializer
 from tensorflow.python.platform import gfile
 from tensorflow.python.platform import resource_loader
@@ -597,6 +600,78 @@ class FromSessionTest(test_util.TensorFlowTestCase):
     interpreter = Interpreter(model_content=tflite_model)
     interpreter.allocate_tensors()
 
+  def testMultipleOutputNodeNames(self):
+    """Tests converting a graph with an op that have multiple outputs."""
+    input_tensor = array_ops.placeholder(shape=[4], dtype=dtypes.float32)
+    out0, out1, out2, out3 = array_ops.split(input_tensor, [1, 1, 1, 1], axis=0)
+    sess = session.Session()
+
+    # Convert model and ensure model is not None.
+    converter = lite.TFLiteConverter.from_session(sess, [input_tensor],
+                                                  [out0, out1, out2, out3])
+    tflite_model = converter.convert()
+    self.assertTrue(tflite_model)
+
+    # Check values from converted model.
+    interpreter = Interpreter(model_content=tflite_model)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    self.assertEqual(1, len(input_details))
+    interpreter.set_tensor(input_details[0]['index'],
+                           np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
+    interpreter.invoke()
+
+    output_details = interpreter.get_output_details()
+    self.assertEqual(4, len(output_details))
+    self.assertEqual(1.0, interpreter.get_tensor(output_details[0]['index']))
+    self.assertEqual(2.0, interpreter.get_tensor(output_details[1]['index']))
+    self.assertEqual(3.0, interpreter.get_tensor(output_details[2]['index']))
+    self.assertEqual(4.0, interpreter.get_tensor(output_details[3]['index']))
+
+  @test_util.run_in_graph_and_eager_modes
+  def testFunctions(self):
+    """Tests tf.function in 1.X."""
+
+    @def_function.function
+    def plus_placeholder(x, placeholder):
+      return x + placeholder
+
+    with ops.Graph().as_default():
+      placeholder = array_ops.placeholder(
+          dtype=dtypes.float32, shape=[1], name='input')
+      variable_node = variables.Variable(1.0, name='variable_node')
+      defun_node = plus_placeholder(variable_node, placeholder)
+      output_node = math_ops.multiply(defun_node, 2.0, name='output_node')
+
+      # Initialize variables in the model.
+      sess = session.Session()
+      sess.run(variables.variables_initializer([variable_node]))
+
+    # Convert model and ensure model is not None.
+    converter = lite.TFLiteConverter.from_session(sess, [placeholder],
+                                                  [output_node])
+    tflite_model = converter.convert()
+    self.assertTrue(tflite_model)
+
+    # Check values from converted model.
+    interpreter = Interpreter(model_content=tflite_model)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    self.assertEqual(1, len(input_details))
+    self.assertEqual('input', input_details[0]['name'])
+    self.assertEqual(np.float32, input_details[0]['dtype'])
+    self.assertTrue(([1] == input_details[0]['shape']).all())
+    self.assertEqual((0., 0.), input_details[0]['quantization'])
+
+    output_details = interpreter.get_output_details()
+    self.assertEqual(1, len(output_details))
+    self.assertEqual('output_node', output_details[0]['name'])
+    self.assertEqual(np.float32, output_details[0]['dtype'])
+    self.assertTrue(([1] == output_details[0]['shape']).all())
+    self.assertEqual((0., 0.), output_details[0]['quantization'])
+
 
 @test_util.run_v1_only('b/120545219')
 class FromFrozenGraphFile(test_util.TensorFlowTestCase):
@@ -991,16 +1066,33 @@ class FromSavedModelTest(test_util.TensorFlowTestCase):
     interpreter.allocate_tensors()
 
 
+class MyAddLayer(keras.layers.Layer):
+
+  def __init__(self, increment, **kwargs):
+    super(MyAddLayer, self).__init__(**kwargs)
+    self._increment = increment
+
+  def call(self, inputs):
+    return inputs + self._increment
+
+  def get_config(self):
+    config = super(MyAddLayer, self).get_config()
+    config['increment'] = self._increment
+    return config
+
+
 @test_util.run_v1_only('b/120545219')
 class FromKerasFile(test_util.TensorFlowTestCase):
 
   def setUp(self):
     keras.backend.clear_session()
 
-  def _getSequentialModel(self):
+  def _getSequentialModel(self, include_custom_layer=False):
     with session.Session().as_default():
       model = keras.models.Sequential()
       model.add(keras.layers.Dense(2, input_shape=(3,)))
+      if include_custom_layer:
+        model.add(MyAddLayer(1.0))
       model.add(keras.layers.RepeatVector(3))
       model.add(keras.layers.TimeDistributed(keras.layers.Dense(3)))
       model.compile(
@@ -1018,6 +1110,10 @@ class FromKerasFile(test_util.TensorFlowTestCase):
         keras.models.save_model(model, keras_file)
       finally:
         os.close(fd)
+
+      if include_custom_layer:
+        custom_objects = {'MyAddLayer': MyAddLayer}
+        return keras_file, custom_objects
       return keras_file
 
   def testSequentialModel(self):
@@ -1053,6 +1149,37 @@ class FromKerasFile(test_util.TensorFlowTestCase):
     tflite_result = interpreter.get_tensor(output_details[0]['index'])
 
     keras_model = keras.models.load_model(keras_file)
+    keras_result = keras_model.predict(input_data)
+
+    np.testing.assert_almost_equal(tflite_result, keras_result, 5)
+    os.remove(keras_file)
+
+  def testCustomLayer(self):
+    """Test a Sequential tf.keras model with default inputs."""
+    keras_file, custom_objects = self._getSequentialModel(
+        include_custom_layer=True)
+
+    converter = lite.TFLiteConverter.from_keras_model_file(
+        keras_file, custom_objects=custom_objects)
+
+    tflite_model = converter.convert()
+    self.assertTrue(tflite_model)
+
+    # Check tensor details of converted model.
+    interpreter = Interpreter(model_content=tflite_model)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    # Check inference of converted model.
+    input_data = np.array([[1, 2, 3]], dtype=np.float32)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    tflite_result = interpreter.get_tensor(output_details[0]['index'])
+
+    keras_model = keras.models.load_model(
+        keras_file, custom_objects=custom_objects)
     keras_result = keras_model.predict(input_data)
 
     np.testing.assert_almost_equal(tflite_result, keras_result, 5)

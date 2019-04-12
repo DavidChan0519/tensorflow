@@ -47,20 +47,25 @@ StatusOr<poplar::Tensor> AddDynamicSliceTensor(
     const xla::Shape& shape_xla, const xla::Shape& slice_shape_xla,
     poplar::Tensor& physical_layout);
 
+StatusOr<poplar::Tensor> AddScatterTensor(poplar::Graph& graph,
+                                          const std::string& debug_name,
+                                          const xla::Shape& shape_xla,
+                                          const xla::Shape& slice_shape_xla);
+
 StatusOr<poplar::Tensor> AddPlainTensor(poplar::Graph& graph,
                                         const std::string& debug_name,
                                         const xla::Shape& shape);
 
 StatusOr<poplar::Tensor> AddNormScaleTensor(
     poplar::Graph& graph, const std::string& debug_name,
-    const HloInstruction* layout, int64 layout_output_idx,
+    const HloInstruction* layout, uint64 layout_output_idx,
     const unsigned feature_dimension,
     std::vector<const HloInstruction*> forward_path,
     const TensorMap& tensor_map);
 
 StatusOr<poplar::Tensor> AddNormOffsetTensor(
     poplar::Graph& graph, const std::string& debug_name,
-    const HloInstruction* layout, int64 layout_output_idx,
+    const HloInstruction* layout, uint64 layout_output_idx,
     const unsigned feature_dimension,
     std::vector<const HloInstruction*> forward_path,
     const TensorMap& tensor_map);
@@ -160,6 +165,9 @@ ArgVector FindInstructionInputs(TensorMap& map, CompilerResources& res,
  * is not parallel writable or because further analysis has shown that the op
  * can no longer be in place. If that's the case, this function will add an
  * extra tensor copy and use that tensor as the input/output tensor.
+ *
+ * The ArgVector contains only those inputs which are listed as inplace inputs
+ * by InplaceUtil::GetHloInstructionDescription.
  */
 StatusOr<ArgVectors> GetInplaceOutputTensors(
     TensorMap& map, CompilerResources& res, const HloInstruction* inst,

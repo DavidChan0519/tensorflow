@@ -1,7 +1,9 @@
 #include "tensorflow/compiler/plugin/poplar/driver/tools/matcher_predicates.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/custom_ops/norm.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
 
+#include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_interface.h"
 #include "tensorflow/compiler/xla/service/hlo_query.h"
 #include "tensorflow/compiler/xla/types.h"
@@ -185,6 +187,12 @@ bool IsTfReluGradOp(const HloInstruction* inst) {
   return tf_core_op == "ReluGrad";
 }
 
+bool IsTfReluGradGeOp(const HloInstruction* inst) {
+  const std::string& tf_core_op = inst->metadata().op_type();
+  return tf_core_op == "ReluGrad" &&
+         inst->comparison_direction() == ComparisonDirection::kGt;
+}
+
 bool IsTrueParameter(const HloInstruction* inst) {
   return inst->opcode() == HloOpcode::kParameter;
 }
@@ -303,8 +311,11 @@ bool IsPopOpsBiasAdd(const HloInstruction* inst) {
 }
 
 bool IsPopOpsElementwise(const HloInstruction* inst) {
+  if (auto* poplar_inst = DynCast<HloPoplarInstruction>(inst)) {
+    return poplar_inst->IsPopOpsElementwise();
+  }
   return IsPopOpsBiasAdd(inst) || IsPopOpsFusion(inst, "scaled_inplace") ||
-         inst->IsElementwise() || IsPoplibsCustomOpElementwise(inst);
+         inst->IsElementwise();
 }
 
 bool IsPopOpsElementwiseBinary(const HloInstruction* inst) {
@@ -316,14 +327,12 @@ bool IsPopOpsElementwiseBinary(const HloInstruction* inst) {
 
 bool IsNormInference(const HloInstruction* inst) {
   return inst->opcode() == HloOpcode::kBatchNormInference ||
-         IsPoplibsCustomOp(inst, PoplibsOp::Popnn,
-                           PoplibsOp::GroupNormInference);
+         DynCast<HloGroupNormInstruction>(inst);
 }
 
 bool IsNormTraining(const HloInstruction* inst) {
   return inst->opcode() == HloOpcode::kBatchNormTraining ||
-         IsPoplibsCustomOp(inst, PoplibsOp::Popnn,
-                           PoplibsOp::GroupNormTraining);
+         DynCast<HloGroupNormTrainInstruction>(inst);
 }
 
 bool IsNormInferenceOrTraining(const HloInstruction* inst) {
@@ -332,7 +341,7 @@ bool IsNormInferenceOrTraining(const HloInstruction* inst) {
 
 bool IsNormGradient(const HloInstruction* inst) {
   return inst->opcode() == HloOpcode::kBatchNormGrad ||
-         IsPoplibsCustomOp(inst, PoplibsOp::Popnn, PoplibsOp::GroupNormGrad);
+         DynCast<HloGroupNormGradInstruction>(inst);
 }
 
 bool IsGTEIndex0(const HloInstruction* inst) {
@@ -358,6 +367,10 @@ bool IsNonLinearity(const HloInstruction* inst) {
 bool IsNonLinearityGradient(const HloInstruction* inst) {
   return IsPopOpsFusion(inst, "relugrad") ||
          IsPopOpsFusion(inst, "sigmoidgrad");
+}
+
+bool IsCompareEqual(const HloInstruction* inst) {
+  return inst->comparison_direction() == ComparisonDirection::kEq;
 }
 
 }  // namespace poplarplugin
