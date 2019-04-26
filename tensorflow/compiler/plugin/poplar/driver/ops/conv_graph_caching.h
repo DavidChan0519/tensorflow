@@ -87,13 +87,12 @@ Status DoCachedConvolutionScaledInplace(
 // The bias apply key is:
 // * Shape of the input (biases) tensor
 // * Shape of the deltas tensor
+// * Shape of the scale tensor
 // * Reduction dimensions.
-// * Whether the learning rate is a constant
-// * Learning rate constant (0 if using a tensor for the learning rate)
 // * sharding device ID
 using BiasApplyCacheKey =
     std::tuple<PoplarTensorSignature, PoplarTensorSignature,
-               std::vector<std::size_t>, bool, double, uint64>;
+               PoplarTensorSignature, std::vector<std::size_t>, uint64>;
 using BiasApplyGraphCache =
     std::map<BiasApplyCacheKey, poputil::graphfn::VoidFunction>;
 

@@ -40,13 +40,12 @@ StatusOr<poplar::program::Program> ConstSliceUpdate(
   poplar::program::Sequence seq;
 
   TF_ASSIGN_OR_RETURN(ArgVectors inputs,
-                      GetInplaceOutputTensors(tensor_map, res, inst, seq));
+                      FindInplaceOutputTensors(tensor_map, res, inst, seq));
   CHECK_EQ(inputs.size(), 1);
   CHECK_EQ(inputs[0].size(), 1);
   poplar::Tensor input = inputs[0][0];
 
-  poplar::Tensor update;
-  TF_ASSIGN_OR_RETURN(update,
+  TF_ASSIGN_OR_RETURN(poplar::Tensor update,
                       FindInstructionInput(tensor_map, res, inst, 1, seq));
 
   std::vector<std::size_t> begin;
@@ -81,17 +80,15 @@ StatusOr<poplar::program::Program> DynamicSliceUpdate(
   poplar::program::Sequence seq;
 
   TF_ASSIGN_OR_RETURN(ArgVectors inputs,
-                      GetInplaceOutputTensors(tensor_map, res, inst, seq));
+                      FindInplaceOutputTensors(tensor_map, res, inst, seq));
   CHECK_EQ(inputs.size(), 1);
   CHECK_EQ(inputs[0].size(), 1);
   poplar::Tensor input = inputs[0][0];
 
-  poplar::Tensor update;
-  TF_ASSIGN_OR_RETURN(update,
+  TF_ASSIGN_OR_RETURN(poplar::Tensor update,
                       FindInstructionInput(tensor_map, res, inst, 1, seq));
 
-  poplar::Tensor indices;
-  TF_ASSIGN_OR_RETURN(indices,
+  TF_ASSIGN_OR_RETURN(poplar::Tensor indices,
                       FindInstructionInput(tensor_map, res, inst, 2, seq));
 
   auto first_index = inst->first_index_operand_number();
@@ -150,8 +147,7 @@ StatusOr<poplar::program::Program> ConstSlice(
 
   poplar::program::Sequence seq;
 
-  poplar::Tensor input;
-  TF_ASSIGN_OR_RETURN(input,
+  TF_ASSIGN_OR_RETURN(poplar::Tensor input,
                       FindInstructionInput(tensor_map, res, inst, 0, seq));
 
   std::vector<std::size_t> begin;
@@ -187,12 +183,10 @@ StatusOr<poplar::program::Program> DynamicSlice(
 
   poplar::program::Sequence seq;
 
-  poplar::Tensor input;
-  TF_ASSIGN_OR_RETURN(input,
+  TF_ASSIGN_OR_RETURN(poplar::Tensor input,
                       FindInstructionInput(tensor_map, res, inst, 0, seq));
 
-  poplar::Tensor indices;
-  TF_ASSIGN_OR_RETURN(indices,
+  TF_ASSIGN_OR_RETURN(poplar::Tensor indices,
                       FindInstructionInput(tensor_map, res, inst, 1, seq));
 
   auto first_index = inst->first_index_operand_number();
@@ -310,8 +304,8 @@ StatusOr<poplar::program::Program> CreateZeroPadOp(CompilerResources& res,
   const HloInstruction* root =
       inst->fused_instructions_computation()->root_instruction();
   const PaddingConfig& cfg(root->padding_config());
-  poplar::Tensor out;
-  TF_ASSIGN_OR_RETURN(out, FindInstructionInput(tensor_map, res, inst, 0, seq));
+  TF_ASSIGN_OR_RETURN(poplar::Tensor out,
+                      FindInstructionInput(tensor_map, res, inst, 0, seq));
 
   std::vector<std::ptrdiff_t> paddingLower;
   std::vector<std::ptrdiff_t> paddingUpper;
@@ -322,46 +316,6 @@ StatusOr<poplar::program::Program> CreateZeroPadOp(CompilerResources& res,
   out = popops::pad(graph, out, paddingLower, paddingUpper);
 
   TF_CHECK_OK(AddOutputTensor(tensor_map, inst, 0, out));
-  return seq;
-}
-
-StatusOr<poplar::program::Program> CreateInterIpuCopy(
-    CompilerResources& res, const HloInstruction* inst,
-    const xla::Shape& output, TensorMap& tensor_map) {
-  poplar::program::Sequence seq;
-
-  poplar::Tensor out;
-  TF_ASSIGN_OR_RETURN(out, FindInstructionInput(tensor_map, res, inst, 0, seq));
-
-  const auto src = inst->operand(0);
-
-  if (!inst->has_sharding()) {
-    return xla::FailedPrecondition("Missing shard information on %s",
-                                   inst->name());
-  }
-  if (!src->has_sharding()) {
-    return xla::FailedPrecondition("Missing shard information on %s",
-                                   src->name());
-  }
-
-  const auto& src_sharding = GetShardingDeviceIdVector(src->sharding());
-  const auto& dst_sharding = GetShardingDeviceIdVector(inst->sharding());
-  if (src_sharding.size() != dst_sharding.size()) {
-    return xla::FailedPrecondition("Mismatched sharding info on %s",
-                                   inst->name());
-  }
-
-  // Should this be done by flattening, concatenating and copying a single
-  // tensor?
-  for (int index = 0; index < src_sharding.size(); index++) {
-    if (src_sharding[index] != dst_sharding[index]) {
-      out = poputil::copyToIpu(
-          res.main_graph, out, seq, dst_sharding[index], GetDebugName(inst),
-          poplar::TensorCloneMethod::PRESERVE_ORDER_AND_ALIASES);
-
-      TF_CHECK_OK(AddOutputTensor(tensor_map, inst, index, out));
-    }
-  }
   return seq;
 }
 

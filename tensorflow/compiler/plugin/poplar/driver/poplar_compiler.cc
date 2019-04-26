@@ -21,6 +21,7 @@ limitations under the License.
 #include <unistd.h>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <random>
 
 #include "absl/strings/str_cat.h"
@@ -57,6 +58,7 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/poplar_platform_id.h"
 #include "tensorflow/compiler/plugin/poplar/driver/schedulers/sync_list_scheduler.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/flags.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/plugin/poplar/driver/visitors/entry_visitor.h"
 
@@ -94,8 +96,11 @@ limitations under the License.
 #include <poplin/codelets.hpp>
 #include <popnn/codelets.hpp>
 #include <popops/codelets.hpp>
-#include <poprand/RandomGen.hpp>
 #include <poprand/codelets.hpp>
+#include <popsys/codelets.hpp>
+
+#include <poprand/RandomGen.hpp>
+#include <popsys/CSRFunctions.hpp>
 
 namespace se = ::stream_executor;
 
@@ -104,6 +109,8 @@ using ::absl::StrCat;
 namespace xla {
 namespace poplarplugin {
 namespace {
+std::once_flag help_flag_printed;
+
 std::string GetPathToGraphProgFile(std::string filename) {
   Dl_info dlInfo;
   static const void* dummy;
@@ -185,9 +192,8 @@ bool AnyComputationHasSideEffects(const HloModule* module) {
 }
 
 bool ShardingEnabled(const HloModule* module) {
-  std::vector<HloComputation*> comps = module->MakeNonfusionComputations();
-  for (const auto* c : comps) {
-    for (const auto* inst : c->instructions()) {
+  for (const auto* comp : module->MakeNonfusionComputations()) {
+    for (const auto* inst : comp->instructions()) {
       if (inst->has_sharding()) {
         auto sharding = inst->sharding();
         if (IsSupportedSharding(sharding)) {
@@ -200,10 +206,9 @@ bool ShardingEnabled(const HloModule* module) {
 }
 
 int64 MaximalShard(const HloModule* module) {
-  std::vector<HloComputation*> comps = module->MakeNonfusionComputations();
   int64 maximal_shard = 0;
-  for (const auto* c : comps) {
-    for (const auto* inst : c->instructions()) {
+  for (const auto* comp : module->MakeNonfusionComputations()) {
+    for (const auto* inst : comp->instructions()) {
       if (inst->has_sharding()) {
         auto sharding = inst->sharding();
         if (IsSupportedSharding(sharding)) {
@@ -216,6 +221,23 @@ int64 MaximalShard(const HloModule* module) {
     }
   }
   return maximal_shard;
+}
+
+bool IsValidReplicatedGraph(const HloModule* module) {
+  // If the graph has an infeed and no all-reduces, then we make an executive
+  // decision for the user that they should use the CrossReplicaOptimizer.
+  bool has_infeed = false;
+  bool has_all_reduce = false;
+  for (const auto* comp : module->MakeNonfusionComputations()) {
+    for (const auto* inst : comp->instructions()) {
+      has_infeed |= inst->opcode() == HloOpcode::kInfeed;
+      has_all_reduce |= inst->opcode() == HloOpcode::kAllReduce;
+    }
+  }
+  // TODO T8122
+  // If the graph has no infeed then we don't mind whether there is an all
+  // reduce or not.
+  return has_infeed ? has_all_reduce : true;
 }
 
 bool AreAllOutputsParameters(
@@ -270,8 +292,7 @@ HloPrintOptions GetPrintOptions() {
 }
 
 std::pair<poplar::program::Program, poplar::DataStream> InitializeSeed(
-    poplar::Graph& master_graph, poplar::Graph& graph, int replication_factor,
-    poplar::program::Program& prog) {
+    poplar::Graph& master_graph, poplar::Graph& graph, int replication_factor) {
   const std::string seed_prefix = "__seed";
 
   auto seed =
@@ -292,8 +313,6 @@ std::pair<poplar::program::Program, poplar::DataStream> InitializeSeed(
 
   poprand::setSeed(graph, seed, 0, seq, seed_prefix + "/set");
 
-  seq.add(prog);
-
   return {seq, data_stream};
 }
 
@@ -313,6 +332,23 @@ void ConnectSeedCallback(poplar::Engine& engine, int replication_factor,
   engine.connectStreamToCallback(stream, callback);
 }
 
+void setFpBehaviour(poplar::Graph& graph,
+                    const IpuOptions::FloatingPointBehaviour& fp_control,
+                    poplar::program::Sequence& seq) {
+  if (graph.getTarget().getTargetType() == poplar::TargetType::IPU) {
+    popsys::FloatingPointBehaviour fp_behaviour(
+        fp_control.inv(), fp_control.div0(), fp_control.oflo(),
+        fp_control.esr(), fp_control.nanoo());
+    popsys::setFloatingPointBehaviour(graph, seq, fp_behaviour,
+                                      "setFpBehaviour");
+  } else {
+    LOG(WARNING) << "Setting IPU floating point behaviour is not supported "
+                    "on IPU__MODEL";
+  }
+}
+
+void PrintHelpString() { LOG(INFO) << tensorflow::GetFlagUsageString(); }
+
 }  // namespace
 
 StatusOr<std::unique_ptr<HloModule>> PoplarCompiler::RunHloPasses(
@@ -329,6 +365,10 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   if (stream_exec == nullptr) {
     return tensorflow::errors::Unknown(
         "NULL stream pointer in poplar compiler");
+  }
+
+  if (tensorflow::GetPoplarXlaFlags().help) {
+    std::call_once(help_flag_printed, &PrintHelpString);
   }
 
   VLOG(1) << "Begin compilation: " << module->name() << " for ordinal  "
@@ -352,8 +392,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     filename = poplarExecutor->CachedExecutableFilename(*module);
 
     if (poplarExecutor->HaveCachedExecutable(filename)) {
-      PoplarExecutable* poplar_executable;
-      TF_ASSIGN_OR_RETURN(poplar_executable,
+      TF_ASSIGN_OR_RETURN(PoplarExecutable * poplar_executable,
                           PoplarExecutable::Deserialize(
                               std::move(module), std::move(profile_printer),
                               std::move(profile_index_map), filename));
@@ -374,6 +413,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   CompilerResources resources(dev, poplarExecutor->GetConvolutionOptions(),
                               poplarExecutor->GetPoolingOptions(),
                               poplarExecutor->DisableGraphConvCaching(),
+                              poplarExecutor->MergeInfeedCopies(),
                               poplarExecutor->GetNumberOfReplicas(),
                               module.get());
 
@@ -382,11 +422,26 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   popnn::addCodelets(resources.main_graph);
   popops::addCodelets(resources.main_graph);
   poprand::addCodelets(resources.main_graph);
+  popsys::addCodelets(resources.main_graph);
 
   poplar::Graph* sharding_main_graph = &resources.main_graph;
 
   const auto replication_factor = resources.replication_factor;
   if (replication_factor > 1) {
+    if (!IsValidReplicatedGraph(module.get())) {
+      if (!tensorflow::GetPoplarXlaFlags().force_replicated_mode) {
+        return xla::FailedPrecondition(
+            "This is not a valid replicated graph because no All-Reduce "
+            "operations were found. Did you use the "
+            "`tensorflow.contrib.ipu.ipu_optimizer.CrossReplicaOptimizer` "
+            "optimizer?\nIf you want the graph to still run in replicated "
+            "mode with no All-Reduce operations use "
+            "`TF_POPLAR_FLAGS=\"--force_replicated_mode\"`.");
+      } else {
+        LOG(INFO) << "A graph is being forced to run in replicated mode.";
+      }
+    }
+
     resources.replicated_graph =
         resources.main_graph.createReplicatedGraph(replication_factor);
     VLOG(1) << "Created " << replication_factor << " replica IPU graphs.";
@@ -519,7 +574,9 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   }
 
   VLOG(1) << "Compiling main computation " << entry->name();
-  XLA_VLOG_LINES(1, module->ToString(GetPrintOptions()));
+  if (VLOG_IS_ON(1)) {
+    XLA_VLOG_LINES(1, module->ToString(GetPrintOptions()));
+  }
 
   std::unique_ptr<poplar::Engine> engine;
   std::vector<poplar::program::Program> progs;
@@ -549,20 +606,32 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       return PoplarExceptionToTensorflowStatus("[Build graph] ", e);
     }
 
+    poplar::program::Sequence main_program;
+
+    // Set up the random seed
     auto seed_setup = InitializeSeed(resources.main_graph, *sharding_main_graph,
-                                     replication_factor, visitor.sequence);
+                                     replication_factor);
+    main_program.add(seed_setup.first);
+
+    // Set up the floating point control register if required
+    const auto& fp_control = poplarExecutor->FloatingPointBehaviour();
+    if (fp_control.flags_set()) {
+      setFpBehaviour(resources.main_graph, fp_control, main_program);
+    }
+
+    // Add the main program sequence
+    main_program.add(visitor.GetSequence());
 
     // =======================================================================
     // DO NOT CHANGE THE ORDER OF THESE WITHOUT UPDATING PoplarProgramType IN
     // exectutor.h
     // =======================================================================
     progs.push_back(visitor.GetHostToDevice());
-    progs.push_back(seed_setup.first);
+    progs.push_back(main_program);
     progs.push_back(visitor.GetDeviceToHost());
 
-    char* vertex_filename = getenv("TF_DUMP_VERTEX_GRAPH");
-    if (vertex_filename) {
-      std::ofstream stream(vertex_filename);
+    if (!tensorflow::GetPoplarXlaFlags().save_vertex_graph.empty()) {
+      std::ofstream stream(tensorflow::GetPoplarXlaFlags().save_vertex_graph);
       resources.main_graph.outputVertexGraph(stream, progs);
     }
 
@@ -606,7 +675,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   }
 
   if (poplarExecutor->IpuTraceEventsEnabled()) {
-    std::stringstream stream;
+    std::stringstream report_stream;
 
     if (poplarExecutor->CompilerReportingEnabled() && engine != nullptr) {
       try {
@@ -614,11 +683,11 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
         if (poplarExecutor->CompilerReportingTextFormat()) {
           auto opts = poplarExecutor->GetReportFlags();
           SetFlagIfNotPresent(opts, "showVarStorage", "true");
-          poplar::printGraphSummary(stream, rep, opts);
+          poplar::printGraphSummary(report_stream, rep, opts);
         } else if (poplarExecutor->CompilerReportingCborFormat()) {
-          poplar::serializeToCBOR(stream, rep);
+          poplar::serializeToCBOR(report_stream, rep);
         } else {
-          poplar::serializeToJSON(stream, rep);
+          poplar::serializeToJSON(report_stream, rep);
         }
       } catch (const std::exception& e) {
         return PoplarExceptionToTensorflowStatus("[Compiler report] ", e);
@@ -627,8 +696,14 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
     uint64 duration = tensorflow::Env::Default()->NowMicros() - start_micros;
 
-    poplarExecutor->AddCompileEndEventRecord(module->name(), stream.str(),
-                                             map_json, duration);
+    if (report_stream.tellp() > poplarExecutor->MaxReportSize()) {
+      LOG(WARNING) << "Dropping Poplar compilation report, size was "
+                   << report_stream.tellp();
+      report_stream.str(std::string());
+    }
+
+    poplarExecutor->AddCompileEndEventRecord(
+        module->name(), report_stream.str(), map_json, duration);
   }
 
   std::unique_ptr<Executable> executable;

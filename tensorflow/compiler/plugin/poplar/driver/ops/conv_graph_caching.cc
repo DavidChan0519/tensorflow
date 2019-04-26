@@ -28,6 +28,7 @@ limitations under the License.
 #include <poplar/Tensor.hpp>
 #include <poplin/ConvUtil.hpp>
 #include <poplin/Convolution.hpp>
+#include <popops/Cast.hpp>
 #include <popops/ElementWise.hpp>
 #include <popops/Reduce.hpp>
 #include <popops/ScaledAdd.hpp>
@@ -122,72 +123,74 @@ ConvolutionScaledInplaceCacheKey GetConvolutionScaledInplaceCacheKey(
 
 BiasApplyCacheKey GetBiasApplyCacheKey(
     const poplar::Tensor& input, const poplar::Tensor& deltas,
-    const std::vector<std::size_t>& reduction_dims,
-    const bool learning_rate_is_constant, const double learning_rate,
+    const poplar::Tensor& scale, const std::vector<std::size_t>& reduction_dims,
     const uint64 device_id) {
   return std::make_tuple(graph_caching_util::GetPoplarTensorSignature(input),
                          graph_caching_util::GetPoplarTensorSignature(deltas),
-                         reduction_dims, learning_rate_is_constant,
-                         learning_rate, device_id);
+                         graph_caching_util::GetPoplarTensorSignature(scale),
+                         reduction_dims, device_id);
 }
 }  // namespace
 
 poplar::Tensor DoCachedConvolution(
     poplar::Graph& graph, CompilerResources& res, const poplar::Tensor& in,
-    const poplar::Tensor& weights, const poplin::ConvParams& params,
-    const ConvClassificationType& conv_type, bool transpose_and_flip_weights,
-    const uint64 device_id, poplar::program::Sequence& prog,
-    const std::string& debug_prefix) {
-  // If this is a pass bwd convolution, try and see if we can turn it into a
+    const poplar::Tensor& input_weights, const poplin::ConvParams& params,
+    const ConvClassificationType& input_conv_type,
+    bool input_transpose_and_flip_weights, const uint64 device_id,
+    poplar::program::Sequence& prog, const std::string& debug_prefix) {
+  // If this is a pass bwd convolution, turn it into a
   // weightsTransposeChansFlipXY and a fwd pass convolution - this allows us to
-  // reause the graph for the convolution and save code space
-  auto fwd_type = ConvClassificationType::FORWARD;
-  auto fwd_key = conv_graph_caching::GetConvolutionCacheKey(
-      params, ConvClassificationType::FORWARD, false, device_id);
-  auto it = res.conv_graph_cache.find(fwd_key);
+  // reuse the graph for the convolution and save code space.
 
-  poplar::OptionFlags opts = res.default_conv_options;
+  ConvClassificationType conv_type = input_conv_type;
+  poplar::Tensor weights = input_weights;
+  bool transpose_and_flip_weights = input_transpose_and_flip_weights;
+  // If this is a backprop input convolution perform the
+  // weightsTransposeChansFlipXY on weights.
   if (conv_type == ConvClassificationType::BACKPROP_INPUT &&
-      it != res.conv_graph_cache.end() &&
       !res.disable_graph_convolution_caching) {
-    // We found a matching convolution in the forward pass. Transform the
-    // weights prior to the convolution so we can reuse the existing
-    // graph.
-    opts.set("pass", ConvClassificationTypeToString(fwd_type));
-    auto bwd_weights = poplin::createWeights(graph, params, "bwd_weights", opts,
-                                             &res.convolution_cache);
+    conv_type = ConvClassificationType::FORWARD;
+    transpose_and_flip_weights = false;
+    auto fwd_opts = res.default_conv_options;
+    fwd_opts.set("pass", ConvClassificationTypeToString(conv_type));
+    auto bwd_weights = poplin::createWeights(graph, params, "bwd_weights",
+                                             fwd_opts, &res.convolution_cache);
     CreateCachedBwdWeights(graph, res, weights, bwd_weights, device_id, prog,
                            debug_prefix);
-    std::vector<poplar::Tensor> args = {in, bwd_weights};
-    // Execute the convolution.
+    weights = bwd_weights;
+  }
+  // Perform the convolution.
+  std::vector<poplar::Tensor> args = {in, weights};
+  auto key =
+      GetConvolutionCacheKey(poplin::canonicalizeParams(params), conv_type,
+                             transpose_and_flip_weights, device_id);
+  auto it = res.conv_graph_cache.find(key);
+  if (it != res.conv_graph_cache.end() &&
+      !res.disable_graph_convolution_caching) {
     auto& f = it->second;
     return f(args, prog);
-  } else {
-    // Otherwise try and get a convolution, if one doesn't exist, then create it
-    // and execute it
-    std::vector<poplar::Tensor> args = {in, weights};
-    auto key =
-        GetConvolutionCacheKey(poplin::canonicalizeParams(params), conv_type,
-                               transpose_and_flip_weights, device_id);
-    auto it = res.conv_graph_cache.find(key);
-    if (it != res.conv_graph_cache.end() &&
-        !res.disable_graph_convolution_caching) {
-      auto& f = it->second;
-      return f(args, prog);
-    }
-    opts.set("pass", ConvClassificationTypeToString(conv_type));
-    using namespace poputil::graphfn;
-    auto f = TensorFunction(graph, {input(in, "in"), input(weights, "weights")},
-                            [&](std::vector<poplar::Tensor>& args,
-                                poplar::program::Sequence& prog) {
-                              return convolution(
-                                  graph, args[0], args[1], params,
-                                  transpose_and_flip_weights, prog,
-                                  debug_prefix, opts, &res.convolution_cache);
-                            });
-    res.conv_graph_cache.emplace(key, f);
-    return f(args, prog);
   }
+  auto opts = res.default_conv_options;
+  opts.set("pass", ConvClassificationTypeToString(conv_type));
+
+  if (VLOG_IS_ON(2)) {
+    std::stringstream stream;
+    poplin::reportPlanInfo(stream, graph, params, opts, &res.convolution_cache);
+    VLOG(2) << "Convolution " << debug_prefix << ". Type "
+            << ConvClassificationTypeToString(conv_type) << ". Plan "
+            << stream.str();
+  }
+
+  using namespace poputil::graphfn;
+  auto f = TensorFunction(
+      graph, {input(in, "in"), input(weights, "weights")},
+      [&](std::vector<poplar::Tensor>& args, poplar::program::Sequence& prog) {
+        return convolution(graph, args[0], args[1], params,
+                           transpose_and_flip_weights, prog, debug_prefix, opts,
+                           &res.convolution_cache);
+      });
+  res.conv_graph_cache.emplace(key, f);
+  return f(args, prog);
 }
 
 namespace {
@@ -205,6 +208,14 @@ poplar::Tensor DoCachedConvolutionScaledInplace(
 
   poplar::OptionFlags opts = res.default_conv_options;
   opts.set("pass", ConvClassificationTypeToString(conv_type));
+
+  if (VLOG_IS_ON(2)) {
+    std::stringstream stream;
+    poplin::reportPlanInfo(stream, graph, params, opts, &res.convolution_cache);
+    VLOG(2) << "Convolution " << GetDebugName(inst) << ". Type "
+            << ConvClassificationTypeToString(conv_type) << ". Plan "
+            << stream.str();
+  }
 
   auto c_out = poplin::convolution(graph, in_shuffled, deltas_shuffled, params,
                                    false, seq, GetDebugName(inst), opts,
@@ -321,47 +332,6 @@ Status DoCachedConvolutionScaledInplace(
 }
 
 namespace {
-Status DoCachedBiasApplyConstLearningRate(
-    poplar::Graph& graph, CompilerResources& res, const poplar::Tensor& in,
-    const poplar::Tensor& deltas,
-    const std::vector<std::size_t>& reduction_dims, const uint64 device_id,
-    poplar::program::Sequence& prog, const HloInstruction* inst,
-    TensorMap& tensor_map) {
-  const auto* root_inst =
-      inst->fused_instructions_computation()->root_instruction();
-
-  // Get the constant learning rate.
-  const auto* const_inst = root_inst->operand(1)->operand(1)->operand(0);
-  CHECK_EQ(const_inst->opcode(), HloOpcode::kConstant);
-
-  TF_ASSIGN_OR_RETURN(float const_lr,
-                      LiteralScalarToNativeType<float>(const_inst->literal()));
-
-  std::vector<poplar::Tensor> args = {in, deltas};
-
-  auto key = GetBiasApplyCacheKey(in, deltas, reduction_dims, true, const_lr,
-                                  device_id);
-  auto it = res.bias_apply_graph_cache.find(key);
-  if (it != res.bias_apply_graph_cache.end() &&
-      !res.disable_graph_convolution_caching) {
-    auto& f = it->second;
-    f(args, prog);
-    return Status::OK();
-  }
-
-  using namespace poputil::graphfn;
-  auto f = VoidFunction(
-      graph, {inout(in, "in"), input(deltas, "deltas")},
-      [&](std::vector<poplar::Tensor>& args, poplar::program::Sequence& seq) {
-        popops::reduceWithOutput(graph, args[1], args[0], reduction_dims,
-                                 {popops::Operation::ADD, -const_lr, true}, seq,
-                                 GetDebugName(inst));
-      });
-  res.bias_apply_graph_cache.emplace(key, f);
-  f(args, prog);
-  return Status::OK();
-}
-
 Status DoCachedBiasApplyVariableLearningRate(
     poplar::Graph& graph, CompilerResources& res, const poplar::Tensor& in,
     const poplar::Tensor& deltas, const poplar::Tensor& scale,
@@ -370,8 +340,7 @@ Status DoCachedBiasApplyVariableLearningRate(
     TensorMap& tensor_map) {
   std::vector<poplar::Tensor> args = {in, deltas, scale};
 
-  auto key =
-      GetBiasApplyCacheKey(in, deltas, reduction_dims, false, 0.0, device_id);
+  auto key = GetBiasApplyCacheKey(in, deltas, scale, reduction_dims, device_id);
   auto it = res.bias_apply_graph_cache.find(key);
   if (it != res.bias_apply_graph_cache.end() &&
       !res.disable_graph_convolution_caching) {
@@ -385,20 +354,45 @@ Status DoCachedBiasApplyVariableLearningRate(
       graph,
       {inout(in, "input"), input(deltas, "deltas"), input(scale, "scale")},
       [&](std::vector<poplar::Tensor>& args, poplar::program::Sequence& seq) {
-        // TODO T6513 - replace this with just a reduceWithOutput
-        // Clone the input layout
-        auto input_clone = graph.clone(args[0]);
-        // Reduce - do not update or scale.
-        popops::reduceWithOutput(graph, args[1], input_clone, reduction_dims,
-                                 {popops::Operation::ADD, 1.0, false}, seq,
-                                 GetDebugName(inst));
-        // Do the scale and apply separately
-        TF_CHECK_OK(ScaledInplaceConstantOrTensor(
-            graph, args[0], input_clone, args[2], seq, HloOpcode::kSubtract,
-            GetDebugName(inst)));
+        auto scale_float = args[2];
+        if (scale_float.elementType() != poplar::FLOAT) {
+          scale_float = popops::cast(graph, scale_float, poplar::FLOAT, seq,
+                                     GetDebugName(inst) + "/ScaleToFloat");
+        }
+        // Reduce with scale and update in place
+        popops::mapInPlace(graph, popops::expr::UnaryOpType::NEGATE,
+                           scale_float, seq, GetDebugName(inst) + "/negate");
+        popops::reduceWithOutput(graph, args[1], args[0], reduction_dims,
+                                 {popops::Operation::ADD, true, scale_float},
+                                 seq, GetDebugName(inst));
       });
   res.bias_apply_graph_cache.emplace(key, f);
   f(args, prog);
+  return Status::OK();
+}
+
+Status DoCachedBiasApplyConstLearningRate(
+    poplar::Graph& graph, CompilerResources& res, const poplar::Tensor& in,
+    const poplar::Tensor& deltas,
+    const std::vector<std::size_t>& reduction_dims, const uint64 device_id,
+    poplar::program::Sequence& prog, const HloInstruction* inst,
+    TensorMap& tensor_map) {
+  // Get the constant learning rate.
+  const auto* root_inst =
+      inst->fused_instructions_computation()->root_instruction();
+  const auto* const_inst = root_inst->operand(1)->operand(1)->operand(0);
+  CHECK_EQ(const_inst->opcode(), HloOpcode::kConstant);
+
+  TF_ASSIGN_OR_RETURN(Literal lit, const_inst->literal().Convert(F32));
+
+  TF_ASSIGN_OR_RETURN(
+      poplar::Tensor scale,
+      AddConstantTensor(graph, {const_inst, 0}, const_inst->shape(), lit, res,
+                        tensor_map));
+
+  DoCachedBiasApplyVariableLearningRate(graph, res, in, deltas, scale,
+                                        reduction_dims, device_id, prog, inst,
+                                        tensor_map);
   return Status::OK();
 }
 }  // namespace

@@ -474,17 +474,19 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
       ok = [
-          '__seed*', 'Copy_', 'host-exchange-local-copy-',
-          'vs/conv2d/Conv2D/convolution*/Conv_1x1/Convolve',
-          'vs/conv2d/BiasAdd/fusion*/addToChannel',
-          'gradients/vs/conv2d_1/Conv2D_grad/Conv2DBackpropFilter/fusion*/Conv_4x4',
-          'gradients/vs/conv2d_1/Conv2D_grad/Conv2DBackpropFilter/fusion*/AddTo',
+          '__seed*',
+          'Copy_',
+          'host-exchange-local-copy-',
+          'gradients/vs/conv2d_1/Conv2D_grad/Conv2DBackpropInput/fusion*/Conv_1x1/',
+          'vs/conv2d/BiasAdd/fusion.1/addToChannel',
           'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/ReduceFinalStage/IntermediateToOutput/Reduce',
-          'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/AddTo',
+          'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/negate/Op/Negate',
+          'gradients/vs/conv2d/Conv2D_grad/Conv2DBackpropFilter/fusion*/Conv_4x4/',
+          'gradients/vs/conv2d/Conv2D_grad/Conv2DBackpropFilter/fusion*/AddTo',
           'GradientDescent/update_vs/conv2d_1/bias/ResourceApplyGradientDescent/multiply*/Op/Multiply',
           'GradientDescent/update_vs/conv2d_1/bias/ResourceApplyGradientDescent/subtract*/AddTo',
           'vs/conv2d_1/BiasAdd/fusion*/addToChannel',
-          'Sum/reduce*/ReduceFinalStage/IntermediateToOutput/Reduce'
+          'Sum/reduce*/ReduceFinalStage/IntermediateToOutput/Reduce',
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -742,8 +744,8 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
     input = np.ones((1, 4, 4, 2))
 
     with ops.device("/device:IPU:0"):
-      x = array_ops.placeholder(np.float32, shape=[1, 4, 4, 2])
-      lr = array_ops.placeholder(np.float32, shape=[])
+      x = array_ops.placeholder(np.float16, shape=[1, 4, 4, 2])
+      lr = array_ops.placeholder(np.float16, shape=[])
       with variable_scope.variable_scope("vs", use_resource=True):
         y = layers.Conv2D(
             2,
@@ -778,7 +780,7 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
       for var, val in zip(tvars, tvars_vals):
         if var.name == "vs/a/bias:0":
           # Value computed using the CPU backend
-          self.assertAllClose(val, [-0.6, -0.6])
+          self.assertAllClose(val, [-0.6, -0.6], atol=0.001)
           found = True
       self.assertTrue(found)
 

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package xla;
+package xla.poplarplugin;
 
 message IpuOptions {
 
@@ -42,6 +42,13 @@ message IpuOptions {
 
     // Set to have the poplar reports in CBOR, not JSON
     bool enable_poplar_reports_cbor = 8;
+
+    // When non-empty, reports will be written into this directory, instead of
+    // into the Tensorboard events
+    string report_directory = 9;
+
+    // Reports over this size (in bytes) will be discarded
+    int64 max_report_size = 10;
   };
   Profiling profiling = 2;
 
@@ -76,6 +83,11 @@ message IpuOptions {
     // Option to enable re-computation of non linearities.
     bool recompute_norm_inputs = 3;
     bool has_recompute_norm_inputs = 4;
+
+    // Merge all streaming reads into a block to reduce the host-sync round-trip
+    // count.  This may decrease the device->host read latency at the expense of
+    // having more live tensors in memory on the device.
+    bool merge_infeed_io_copies = 5;
   }
   SpeedSizeConfig speed_size_config = 5;
 
@@ -90,4 +102,19 @@ message IpuOptions {
 
   // The maximum number of bytes to wait before scheduling an all-reduce
   int64 max_cross_replica_sum_buffer_size = 9;
+
+  message FloatingPointBehaviour {
+    // When set, the flags below will be used to configure the hardware at the
+    // start of program execution.
+    bool flags_set = 1;
+
+    // These flags match the ones provided by the poplar::FloatingPointBehaviour
+    // structure
+    bool inv = 2;
+    bool div0 = 3;
+    bool oflo = 4;
+    bool esr = 5;
+    bool nanoo = 6;
+  }
+  FloatingPointBehaviour floating_point_behaviour = 10;
 };

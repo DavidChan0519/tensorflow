@@ -22,10 +22,9 @@ genrule(
 )
 
 tf_proto_library(
-    name = "protos",
+    name = "config_protos",
     srcs = [
       "driver/config.proto",
-      "driver/poplar_executable.proto",
       "driver/trace.proto",
     ],
     cc_api_version = 2,
@@ -34,8 +33,11 @@ tf_proto_library(
 )
 
 xla_proto_library(
-    name = "backend_config",
-    srcs = ["driver/backend_config.proto"],
+    name = "backend_protos",
+    srcs = [
+      "driver/backend_config.proto",
+      "driver/poplar_executable.proto",
+    ],
     deps = ["//tensorflow/compiler/xla:xla_data_proto"],
 )
 
@@ -102,6 +104,7 @@ cc_library(
         "driver/tools/custom_ops/group_norm_train.cc",
         "driver/tools/custom_ops/group_norm_grad.cc",
         "driver/tools/custom_ops/group_norm_stats.cc",
+        "driver/tools/custom_ops/ipu_inter_copy.cc",
         "driver/tools/custom_ops/lstm.cc",
         "driver/tools/custom_ops/norm.cc",
         "driver/tools/custom_ops/pooling.cc",
@@ -112,6 +115,7 @@ cc_library(
         "driver/tools/custom_ops/tanh.cc",
         "driver/tools/custom_ops/truncated_normal.cc",
         "driver/tools/find_all_users.cc",
+        "driver/tools/flags.cc",
         "driver/tools/hlo_hash.cc",
         "driver/tools/hlo_matcher.cc",
         "driver/tools/input_output_aliasing_map.cc",
@@ -152,6 +156,7 @@ cc_library(
         "driver/passes/wide_const_finder.h",
         "driver/tools/classification_predicates.h",
         "driver/tools/custom_ops/hlo_poplar_instruction.h",
+        "driver/tools/custom_ops/ipu_inter_copy.h",
         "driver/tools/custom_ops/lstm.h",
         "driver/tools/custom_ops/norm.h",
         "driver/tools/custom_ops/pooling.h",
@@ -162,6 +167,7 @@ cc_library(
         "driver/tools/custom_ops/tanh.h",
         "driver/tools/custom_ops/truncated_normal.h",
         "driver/tools/find_all_users.h",
+        "driver/tools/flags.h",
         "driver/tools/hlo_hash.h",
         "driver/tools/hlo_matcher.h",
         "driver/tools/input_output_aliasing_map.h",
@@ -174,7 +180,7 @@ cc_library(
     ],
     deps = [
         ":common",
-        ":backend_config",
+        ":backend_protos",
         ":custom_kernels_util",
         "//tensorflow/compiler/xla:xla_headers_lib",
         "//tensorflow/compiler/xla/service:call_inliner",
@@ -213,6 +219,7 @@ cc_library(
         "driver/ops/custom_ops/popnn/sigmoid.cc",
         "driver/ops/custom_ops/popnn/tanh.cc",
         "driver/ops/custom_ops/poprand/random.cc",
+        "driver/ops/custom_ops/poputil/ipu_inter_copy.cc",
         "driver/ops/custom_ops/poputil/remap.cc",
         "driver/ops/dot_graph_caching.cc",
         "driver/ops/graph_caching_util.cc",
@@ -260,6 +267,7 @@ cc_library(
         "driver/poplar_transfer_manager.h",
         "driver/tensor.h",
         "driver/tools/conversions.h",
+        "driver/tools/spsc_queue.h",
         "driver/vertex_templates.h",
         "driver/visitors/deferred_allocation_visitor.h",
         "driver/visitors/entry_visitor.h",
@@ -277,7 +285,7 @@ cc_library(
         ":common",
         ":custom_kernels_util",
         ":optimizers",
-        ":protos_cc_impl",
+        ":config_protos_cc_impl",
         "//tensorflow/compiler/xla/service/cpu:cpu_runtime",
         "//tensorflow/compiler/tf2xla:common",
         "//tensorflow/compiler/xla:xla_headers_lib",
@@ -485,7 +493,7 @@ cc_library(
     ],
     data = [
         ":tf_graph_program",
-        ":protos_py",
+        ":config_protos_py",
         "@local_config_poplar//poplar:poplar_lib",
     ],
     linkstatic=1,
@@ -950,6 +958,22 @@ py_test(
 )
 
 py_test(
+    name = "topk_onehot_test",
+    size = "small",
+    srcs = ["tests/topk_onehot_test.py"],
+    deps = [
+        ":test_utils_py",
+        ":ipu_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+    ],
+    srcs_version = "PY2AND3",
+)
+
+py_test(
     name = "simple_network_test",
     size = "small",
     srcs = ["tests/simple_network_test.py"],
@@ -1031,6 +1055,28 @@ py_test(
     name = "variable_test",
     size = "small",
     srcs = ["tests/variable_test.py"],
+    deps = [
+        ":test_utils_py",
+        ":ipu_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:init_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:layers",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:random_ops",
+        "//tensorflow/python:resource_variable_ops",
+        "//tensorflow/python:state_ops",
+        "//tensorflow/python:platform",
+        "//tensorflow/python:variables",
+    ],
+    srcs_version = "PY2AND3",
+)
+
+py_test(
+    name = "synthetic_data_test",
+    size = "small",
+    srcs = ["tests/synthetic_data_test.py"],
     deps = [
         ":test_utils_py",
         ":ipu_ops_py",
@@ -1475,7 +1521,9 @@ test_suite(
         "simple_network_test",
         "sort_op_test",
         "sync_list_scheduler_test",
+        "synthetic_data_test",
         "tensor_array_test",
+        "topk_onehot_test",
         "update_op_dependencies_test",
         "variable_test",
         "while_loop_condition_simplify_test",

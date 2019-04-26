@@ -35,54 +35,93 @@ GetWhileAndRepeatAliasingCopies(poplar::Graph& graph,
                                 const ArgVector& body_outputs,
                                 unsigned int param_count,
                                 const std::string& debug_name) {
-  poplar::program::Sequence body_seq;
-  // A body input can be:
-  // - an independent new tensor (0)
-  // - containing an alias for one of the outputs (1)
-  // - a simple passthrough to output (2)
-  // - not required because it is unused (3)
+  enum class AliasType {
+    NO_ALIAS_NOT_USED,
+    NO_ALIAS_USED,
+    PARTIAL_ALIAS_OUTPUT_ONLY,
+    PARTIAL_ALIAS,
+    IDENTICAL_ALIAS,
+  };
 
-  // Find outputs which are aliases of inputs
-  std::vector<int> alias_type(param_count, 0);
+  poplar::program::Sequence body_seq;
+  // A body output at index `i` can:
+  // 1. contain no aliases to any of the inputs and the input `i` is not used in
+  // the computation (NO_ALIAS_NOT_USED).
+  // 2. contain no aliases to any of the inputs and the input `i` is used in the
+  // computation (NO_ALIAS_USED).
+  // 3. contain an alias to one of the inputs and the input `i` is not used in
+  // the computation (PARTIAL_ALIAS_OUTPUT_ONLY).
+  // 4. contain an alias to one of the inputs and the input `i` is used in the
+  // computation (PARTIAL_ALIAS).
+  // 5. be the exact same tensor as input `i` (IDENTICAL_ALIAS).
+
+  // Find all the alias informations.
+  std::vector<AliasType> alias_type(param_count, AliasType::NO_ALIAS_USED);
   for (unsigned int i = 0; i < param_count; i++) {
-    if (visitor.InputIsAllocated(0, i)) {
+    const bool input_i_used = visitor.InputIsAllocated(0, i);
+    if (input_i_used) {
+      if (body_inputs[i] == body_outputs[i]) {
+        alias_type[i] = AliasType::IDENTICAL_ALIAS;
+      }
+      // Check if we need to add a temporary copy.
       for (unsigned int o = 0; o < param_count; o++) {
-        if (visitor.InputIsAllocated(0, o)) {
+        if (i != o && visitor.InputIsAllocated(0, o)) {
           if (body_outputs[o].intersectsWith(body_inputs[i])) {
-            alias_type[i] = 1;
+            alias_type[i] = AliasType::PARTIAL_ALIAS;
           }
         }
       }
-      if (body_inputs[i] == body_outputs[i]) {
-        alias_type[i] = 2;
-      }
     } else {
-      alias_type[i] = 3;
+      // If the input is not used, check that the output at that index does not
+      // alias any of the inputs which might have changed during computation.
+      alias_type[i] = AliasType::NO_ALIAS_NOT_USED;
+      for (unsigned int j = 0; j < param_count; j++) {
+        if (visitor.InputIsAllocated(0, j)) {
+          if (body_outputs[i].intersectsWith(body_inputs[j])) {
+            alias_type[i] = AliasType::PARTIAL_ALIAS_OUTPUT_ONLY;
+          }
+        }
+      }
     }
   }
 
+  // For partial aliasing types, we create temporary tensors from inputs in
+  // order to remove any aliasing.
   ArgVector unaliased_body_outputs(body_outputs);
   ArgVector while_loop_state(body_inputs);
   for (unsigned int i = 0; i < param_count; i++) {
-    if (alias_type[i] == 1) {
-      auto name = StrCat(debug_name, "_bodyout_temp_", i);
-      unaliased_body_outputs[i] = graph.clone(body_outputs[i], name);
-      body_seq.add(
-          poplar::program::Copy(body_outputs[i], unaliased_body_outputs[i]));
-    } else if (alias_type[i] == 3) {
-      while_loop_state[i] = body_outputs[i];
+    switch (alias_type[i]) {
+      case AliasType::PARTIAL_ALIAS_OUTPUT_ONLY:
+      case AliasType::PARTIAL_ALIAS: {
+        auto name = StrCat(debug_name, "_bodyout_temp_", i);
+        unaliased_body_outputs[i] = graph.clone(body_outputs[i], name);
+        body_seq.add(
+            poplar::program::Copy(body_outputs[i], unaliased_body_outputs[i]));
+        break;
+      }
+      default:
+        break;
     }
   }
 
   for (unsigned int i = 0; i < param_count; i++) {
     switch (alias_type[i]) {
-      case 0:
-      case 1:
+      case AliasType::PARTIAL_ALIAS:
+      case AliasType::NO_ALIAS_USED: {
+        // Get the input ready for the next iteration.
         body_seq.add(
             poplar::program::Copy(unaliased_body_outputs[i], body_inputs[i]));
         break;
-      case 2:
-      case 3:
+      }
+      case AliasType::PARTIAL_ALIAS_OUTPUT_ONLY:
+      case AliasType::NO_ALIAS_NOT_USED: {
+        // The input is never used so we don't need a copy - just change the
+        // while loop state as by default it contains the input tensors.
+        while_loop_state[i] = unaliased_body_outputs[i];
+        break;
+      }
+      case AliasType::IDENTICAL_ALIAS:
+      default:
         // nothing required
         break;
     }
@@ -179,7 +218,7 @@ StatusOr<poplar::program::Program> CreateParallelMap(CompilerResources& res,
   VLOG(1) << "Processing " << inst->name();
   poplar::program::Sequence seq;
   TF_ASSIGN_OR_RETURN(ArgVectors inputs,
-                      GetInplaceOutputTensors(tensor_map, res, inst, seq));
+                      FindInplaceOutputTensors(tensor_map, res, inst, seq));
   CHECK_EQ(inputs.size(), inst->operand_count());
   for (int64 op = 0; op < inst->operand_count(); op++) {
     CHECK_EQ(inputs[op].size(), CountShapes(inst->operand(op)->shape()));
@@ -187,7 +226,7 @@ StatusOr<poplar::program::Program> CreateParallelMap(CompilerResources& res,
   MapVisitor visitor(res, inputs, output);
   TF_RETURN_IF_ERROR(inst->to_apply()->Accept(&visitor));
 
-  seq.add(visitor.sequence);
+  seq.add(visitor.GetSequence());
 
   auto outputs = visitor.outputs();
   for (size_t i = 0; i < outputs.size(); i++) {
@@ -213,7 +252,7 @@ StatusOr<poplar::program::Program> CreateCallOp(CompilerResources& res,
     InlineCallVisitor inline_visitor(res, args);
     TF_RETURN_IF_ERROR(comp->Accept(&inline_visitor));
 
-    seq.add(inline_visitor.sequence);
+    seq.add(inline_visitor.GetSequence());
 
     for (size_t i = 0; i < inline_visitor.outputs().size(); i++) {
       poplar::Tensor out;
@@ -225,7 +264,7 @@ StatusOr<poplar::program::Program> CreateCallOp(CompilerResources& res,
     ArithmeticExprVisitor arithmetic_visitor(res, args);
     TF_RETURN_IF_ERROR(comp->Accept(&arithmetic_visitor));
 
-    seq.add(arithmetic_visitor.sequence);
+    seq.add(arithmetic_visitor.GetSequence());
 
     for (size_t i = 0; i < arithmetic_visitor.outputs().size(); i++) {
       TF_CHECK_OK(AddOutputTensor(tensor_map, inst, i,
@@ -250,7 +289,7 @@ StatusOr<poplar::program::Program> CreateCallOp(CompilerResources& res,
       }
     }
 
-    seq.add(subcomp_visitor->sequence);
+    seq.add(subcomp_visitor->GetSequence());
 
     for (size_t i = 0; i < subcomp_visitor->outputs().size(); i++) {
       auto name = StrCat(GetDebugName(inst), "_out_", i);
@@ -271,8 +310,6 @@ StatusOr<poplar::program::Program> CreateCustomCallOp(
     VLOG(1) << "Processing " << inst->custom_call_target()
             << " as Poplibs call";
     return CreatePoplibsOp(graph, res, inst, output, tensor_map);
-  } else if (IsInterIpuCopy(inst)) {
-    return CreateInterIpuCopy(res, inst, output, tensor_map);
   } else {
     return xla::FailedPrecondition("Unrecognised kCustomCall %s.",
                                    inst->ToString().c_str());
@@ -287,7 +324,7 @@ StatusOr<poplar::program::Program> CreateFusionOp(CompilerResources& res,
   HloComputation* comp = inst->fused_instructions_computation();
   poplar::program::Sequence seq;
   TF_ASSIGN_OR_RETURN(ArgVectors inputs,
-                      GetInplaceOutputTensors(tensor_map, res, inst, seq));
+                      FindInplaceOutputTensors(tensor_map, res, inst, seq));
   CHECK_EQ(inputs.size(), inst->operand_count());
   for (int64 op = 0; op < inst->operand_count(); op++) {
     CHECK_EQ(inputs[op].size(), CountShapes(inst->operand(op)->shape()));
@@ -295,7 +332,7 @@ StatusOr<poplar::program::Program> CreateFusionOp(CompilerResources& res,
   InlineCallVisitor inline_visitor(res, inputs);
   TF_RETURN_IF_ERROR(comp->Accept(&inline_visitor));
 
-  seq.add(inline_visitor.sequence);
+  seq.add(inline_visitor.GetSequence());
 
   for (size_t i = 0; i < inline_visitor.outputs().size(); i++) {
     TF_CHECK_OK(
@@ -313,8 +350,8 @@ StatusOr<poplar::program::Program> CreateWhileOp(CompilerResources& res,
   poplar::Graph& graph = GetGraph(res, inst);
 
   poplar::program::Sequence main_seq;
-  TF_ASSIGN_OR_RETURN(ArgVectors inputs,
-                      GetInplaceOutputTensors(tensor_map, res, inst, main_seq));
+  TF_ASSIGN_OR_RETURN(ArgVectors inputs, FindInplaceOutputTensors(
+                                             tensor_map, res, inst, main_seq));
   CHECK_EQ(inputs.size(), 1);
 
   // Conditional should not change the inputs - therefore it's not inplace.
@@ -364,12 +401,12 @@ StatusOr<poplar::program::Program> CreateWhileOp(CompilerResources& res,
       cond_seq.add(poplar::program::Copy(body_inputs[i], cond_inputs[i]));
     }
   }
-  cond_seq.add(cond->sequence);
+  cond_seq.add(cond->GetSequence());
   poplar::Tensor pred =
       popops::allTrue(graph, cond_outputs[0], cond_seq, GetDebugName(inst));
 
   // Body
-  poplar::program::Sequence body_seq(body->sequence);
+  poplar::program::Sequence body_seq(body->GetSequence());
   TF_ASSIGN_OR_RETURN(auto seq_argvector_pair,
                       GetWhileAndRepeatAliasingCopies(
                           graph, *body.get(), body_inputs, body_outputs,
@@ -398,8 +435,8 @@ StatusOr<poplar::program::Program> CreateRepeatOp(CompilerResources& res,
   TF_ASSIGN_OR_RETURN(PoplarBackendConfig cfg,
                       inst->backend_config<PoplarBackendConfig>());
   int64 repeat_count = cfg.repeat_config().repeat_count();
-  TF_ASSIGN_OR_RETURN(ArgVectors inputs,
-                      GetInplaceOutputTensors(tensor_map, res, inst, main_seq));
+  TF_ASSIGN_OR_RETURN(ArgVectors inputs, FindInplaceOutputTensors(
+                                             tensor_map, res, inst, main_seq));
   CHECK_EQ(inputs.size(), 1);
 
   TF_ASSIGN_OR_RETURN(auto body, GetOrCompileSubComputation(
@@ -428,7 +465,7 @@ StatusOr<poplar::program::Program> CreateRepeatOp(CompilerResources& res,
   }
 
   // Body
-  poplar::program::Sequence body_seq(body->sequence);
+  poplar::program::Sequence body_seq(body->GetSequence());
   TF_ASSIGN_OR_RETURN(auto seq_argvector_pair,
                       GetWhileAndRepeatAliasingCopies(
                           graph, *body.get(), body_inputs, body_outputs,
@@ -458,15 +495,20 @@ StatusOr<poplar::program::Program> CreateConditionalOp(
     is_switch = false;
   } else if (inst->operand(0)->shape().element_type() == S32) {
     is_switch = true;
-    return xla::FailedPrecondition("Switch not implemented.");
   } else {
-    return xla::FailedPrecondition("Unsupported condition input type.");
+    return xla::FailedPrecondition(
+        "Conditional %s has unsupported condition input type %s.",
+        PrimitiveType_Name(inst->operand(0)->shape().element_type()));
   }
 
   int n_branches = inst->operand_count() - 1;
+  if (n_branches == 0) {
+    return xla::FailedPrecondition("Conditional %s has no branches.",
+                                   inst->name().c_str());
+  }
 
   TF_ASSIGN_OR_RETURN(ArgVectors inputs,
-                      GetInplaceOutputTensors(tensor_map, res, inst, seq));
+                      FindInplaceOutputTensors(tensor_map, res, inst, seq));
   CHECK_EQ(inputs.size(), inst->operand_count());
   CHECK_EQ(inputs[0].size(), 1);
   poplar::Tensor pred = inputs[0][0];
@@ -511,7 +553,7 @@ StatusOr<poplar::program::Program> CreateConditionalOp(
     }
 
     // Add the actual body
-    seqs[b].add(bodies[b]->sequence);
+    seqs[b].add(bodies[b]->GetSequence());
 
     // Add output copies
     for (unsigned int i = 0; i < output_count; i++) {
@@ -525,7 +567,11 @@ StatusOr<poplar::program::Program> CreateConditionalOp(
 
     seq.add(poplar::program::If(scalar_pred, seqs[0], seqs[1]));
   } else {
-    // Add switch
+    std::vector<std::pair<int32, poplar::program::Program>> cases;
+    for (auto c = 0; c < seqs.size() - 1; c++) {
+      cases.push_back(std::make_pair(c, seqs[c]));
+    }
+    seq.add(poplar::program::Switch(pred, cases, seqs.back()));
   }
 
   return seq;

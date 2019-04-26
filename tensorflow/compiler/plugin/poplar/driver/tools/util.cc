@@ -1,14 +1,16 @@
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/flags.h"
 
+#include "absl/types/optional.h"
 #include "tensorflow/compiler/plugin/poplar/driver/backend_config.pb.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/custom_ops/ipu_inter_copy.h"
 #include "tensorflow/compiler/xla/literal_util.h"
 #include "tensorflow/compiler/xla/primitive_util.h"
+#include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
 #include "tensorflow/compiler/xla/service/hlo_module.h"
 #include "tensorflow/compiler/xla/shape_util.h"
-
-#include "absl/types/optional.h"
 
 namespace xla {
 namespace poplarplugin {
@@ -148,8 +150,7 @@ StatusOr<NativeT> LiteralScalarToNativeType(const xla::Literal& lit) {
     return xla::FailedPrecondition("Literal is not scalar");
   }
 
-  Literal converted_lit;
-  TF_ASSIGN_OR_RETURN(converted_lit, lit.Convert(primitive_type));
+  TF_ASSIGN_OR_RETURN(Literal converted_lit, lit.Convert(primitive_type));
 
   return *static_cast<const NativeT*>(converted_lit.untyped_data());
 }
@@ -162,8 +163,7 @@ StatusOr<std::vector<NativeT>> LiteralVectorToNativeType(
     return xla::FailedPrecondition("Literal rank != 1");
   }
 
-  Literal converted_lit;
-  TF_ASSIGN_OR_RETURN(converted_lit, lit.Convert(primitive_type));
+  TF_ASSIGN_OR_RETURN(Literal converted_lit, lit.Convert(primitive_type));
 
   const NativeT* start =
       static_cast<const NativeT*>(converted_lit.untyped_data());
@@ -248,8 +248,7 @@ bool IsRepeatLoop(const xla::HloInstruction* inst) {
 }
 
 bool IsInterIpuCopy(const HloInstruction* inst) {
-  return inst->opcode() == HloOpcode::kCustomCall &&
-         inst->custom_call_target() == "inter_ipu_copy";
+  return DynCast<HloIpuInterCopy>(inst);
 }
 
 const HloInstruction* GetOperandLookThroughInterIpuCopy(
@@ -259,12 +258,7 @@ const HloInstruction* GetOperandLookThroughInterIpuCopy(
 }
 
 bool UseSyntheticData() {
-  if (const char* env_c = std::getenv("TF_POPLAR_USE_SYNTHETIC_DATA")) {
-    std::string env(env_c);
-    std::transform(env.begin(), env.end(), env.begin(), ::tolower);
-    return env == "true";
-  }
-  return false;
+  return tensorflow::GetPoplarXlaFlags().use_synthetic_data;
 }
 
 std::string GetDebugName(const HloInstruction* inst) {

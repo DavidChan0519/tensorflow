@@ -51,22 +51,33 @@ def create_ipu_config(profiling=False,
                       enable_ipu_events=False,
                       use_poplar_text_report=False,
                       use_poplar_cbor_report=False,
+                      profile_execution=False,
                       report_every_nth_execution=0,
+                      max_report_size=0x10000000,
+                      report_directory="",
                       always_rearrange_copies_on_the_host=False,
+                      merge_infeed_io_copies=False,
                       disable_graph_convolution_caching=False,
                       retain_control_dependencies=False,
                       max_cross_replica_sum_buffer_size=0):
   """Create an empty IPU session configuration structure.
 
   Args:
-    :param profiling: Enable compilation and execution reports,and IPU trace
-                      events.
+    :param profiling: Enable compilation reports, and IPU trace events.
     :param enable_ipu_events: Enable IPU trace events without poplar reports.
     :param use_poplar_text_report: Enable the poplar textual report summary
     :param use_poplar_cbor_report: Enable the poplar CBOR reports
+    :param profile_execution: Include Poplar execution profiles in the execution
+                              events.
     :param report_every_nth_execution: Only produce an execution report on
                                        every Nth execution.  0=One report
                                        only.
+    :param max_report_size: The maximum size of Poplar profiles to include in
+                            the profile events.
+    :param report_directory: When set, reports will be written to files in this
+                             directory, instead of being written into the
+                             events.  The events will contain the full paths of
+                             the report files.
     :param always_rearrange_copies_on_the_host: *** Experimental Flag ***
                                                 The data which is streamed
                                                 to/from the device might be
@@ -78,6 +89,12 @@ def create_ipu_config(profiling=False,
                                                 this option the rearrangment
                                                 will be perfomed on the host at
                                                 the expense of latency.
+    :param merge_infeed_io_copies: When true, this flag will merge the streamed
+                                   host->device input copies into one larger
+                                   copy.  This may reduce the time to copy
+                                   data from the host, at the expense of
+                                   increasing the live tensor memory on the
+                                   device.
     :param disable_graph_convolution_caching: By default, the convolution
                                               operation searches for an
                                               equivalent cached operation, and
@@ -106,6 +123,9 @@ def create_ipu_config(profiling=False,
     raise Exception(
         "`profiling` and `enable_ipu_events` are mutually exclusive")
 
+  if profile_execution and not profiling:
+    raise Exception("`profiling` is required when `profile_execution` is set")
+
   opts = IpuOptions()
   opts.ipu_model_config.enable_ipu_model = True
   opts.ipu_model_config.compile_ipu_code = True
@@ -113,13 +133,15 @@ def create_ipu_config(profiling=False,
   opts.profiling.enable_ipu_trace_events = profiling or enable_ipu_events
   opts.profiling.enable_compilation_trace = profiling
   opts.profiling.enable_io_trace = profiling
-  opts.profiling.enable_execution_trace = profiling
+  opts.profiling.enable_execution_trace = profiling and profile_execution
   opts.profiling.enable_poplar_reports_text = use_poplar_text_report
   opts.profiling.enable_poplar_reports_cbor = use_poplar_cbor_report
   opts.profiling.report_every_nth_execution = report_every_nth_execution
+  opts.profiling.max_report_size = max_report_size
+  opts.profiling.report_directory = report_directory
 
   opts.speed_size_config.always_rearrange_copies_on_the_host = always_rearrange_copies_on_the_host
-
+  opts.speed_size_config.merge_infeed_io_copies = merge_infeed_io_copies
   opts.speed_size_config.disable_graph_convolution_caching = disable_graph_convolution_caching
 
   opts.retain_control_dependencies = retain_control_dependencies
@@ -298,6 +320,35 @@ def set_recomputation_options(opts, recompute_norm_inputs=True):
 
   opts.speed_size_config.recompute_norm_inputs = recompute_norm_inputs
   opts.speed_size_config.has_recompute_norm_inputs = True
+
+  return opts
+
+
+def set_floating_point_behaviour_options(opts,
+                                         inv=True,
+                                         div0=True,
+                                         oflo=True,
+                                         esr=True,
+                                         nanoo=True):
+  """Set the IPU floating point control behaviour bits
+
+  See the Poplar API documentation for poplar::FloatingPointBehaviour.
+
+  Args:
+    :param inv: If true a floating point invalid operation (defined by IEEE 754)
+                will cause an exception.
+    :param div0: If true a floating point divide by zero operation will cause an
+                 exception.
+    :param oflo: If true a floating point overflow will cause an exception.
+    :param esr: Enable stochastic rounding.
+    :param nanoo: Enable Not-a-Number on overflow mode.
+  """
+  opts.floating_point_behaviour.flags_set = True
+  opts.floating_point_behaviour.inv = inv
+  opts.floating_point_behaviour.div0 = div0
+  opts.floating_point_behaviour.oflo = oflo
+  opts.floating_point_behaviour.esr = esr
+  opts.floating_point_behaviour.nanoo = nanoo
 
   return opts
 
@@ -706,7 +757,8 @@ def extract_execute_reports(events):
       try:
         module = evt.execute.module_name.decode('utf-8')
         rep = evt.execute.execution_report.decode('utf-8')
-        result += [(module, rep)]
+        if len(rep) > 0:
+          result += [(module, rep)]
       except UnicodeDecodeError:
         pass
   return result

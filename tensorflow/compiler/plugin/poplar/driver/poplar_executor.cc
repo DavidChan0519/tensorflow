@@ -25,6 +25,7 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/poplar_platform_id.h"
 #include "tensorflow/compiler/plugin/poplar/driver/poplar_transfer_manager.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/conversions.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/flags.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/hlo_hash.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/plugin/poplar/driver/xla_ipu_common.h"
@@ -34,6 +35,8 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/transfer_manager.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 
+#include "tensorflow/core/common_runtime/dma_helper.h"
+#include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
 
 #include "absl/container/flat_hash_map.h"
@@ -111,11 +114,6 @@ namespace se = ::stream_executor;
 namespace xla {
 namespace poplarplugin {
 
-static const char* s_cache_env_variable = "TF_POPLAR_ENGINE_CACHE";
-static const char* s_max_compilation_threads_variable =
-    "TF_POPLAR_MAX_COMPILATION_THREADS";
-static const char* s_force_ipu_model = "TF_POPLAR_FORCE_IPU_MODEL";
-
 std::string GetInputCopyHandle(int64 parameter, int64 index) {
   return tensorflow::strings::Printf("%lld.%lld", parameter, index);
 }
@@ -163,15 +161,15 @@ void ConfigurePoplarXFeedManager(const InfeedInfos& infeed_infos,
                                  int device_ordinal) {
   auto* xfeed_manager = GetXfeedManager(device_ordinal);
   for (const auto& outfeed_info : outfeed_infos) {
-    if (outfeed_info->outfeed_config() == "get_last") {
-      const auto& outfeed_shape = outfeed_info->outfeed_shape();
+    if (outfeed_info.config == "get_last") {
+      const auto& outfeed_shape = outfeed_info.shape;
       if (outfeed_shape.IsTuple()) {
         const auto num_elements = ShapeUtil::TupleElementCount(outfeed_shape);
         xfeed_manager->outfeed()->set_size(num_elements);
       } else {
         xfeed_manager->outfeed()->set_size(1);
       }
-    } else if (outfeed_info->outfeed_config() == "all") {
+    } else if (outfeed_info.config == "all") {
       xfeed_manager->outfeed()->set_size(
           PoplarXfeedQueueManager::DEFAULT_QUEUE_SIZE);
     }
@@ -247,9 +245,7 @@ void PoplarExecutor::ConnectInfeedsToStreamCallback(
   }
 
   for (const auto& infeed_info : infeed_infos) {
-    const HloInfeedInstruction* inst = infeed_info;
-
-    auto itr = infeed_dataset_iterators_.find(inst->infeed_config());
+    auto itr = infeed_dataset_iterators_.find(infeed_info.config);
     if (itr == infeed_dataset_iterators_.end()) {
       LOG(FATAL) << "Trying to access an infeed dataset iterator which has not "
                     "been created."
@@ -258,32 +254,14 @@ void PoplarExecutor::ConnectInfeedsToStreamCallback(
     auto* infeed_dataset_iterator = itr->second.get();
     auto tensor_count = infeed_dataset_iterator->shapes.size();
     for (auto j = 0; j < tensor_count; ++j) {
+      auto& queue = infeed_dataset_iterator->tensor_queues[j];
+      auto length = ShapeUtil::ByteSizeOf(infeed_dataset_iterator->shapes[j]);
       current_engine_->connectStreamToCallback(
-          GetInfeedCopyHandle(inst->name(), j),
-          [this, j, infeed_dataset_iterator](void* dest) {
-            auto infeed_queue_manager = GetXfeedManager(ordinal_)->infeed();
-            auto buffer = infeed_queue_manager->BlockingDequeueBuffer();
-
-            const char* data = reinterpret_cast<const char*>(buffer->data());
-            auto length = buffer->length();
-            CHECK_EQ(length,
-                     ShapeUtil::ByteSizeOf(infeed_dataset_iterator->shapes[j]));
-
-            std::memcpy(dest, data, length);
-
-            infeed_queue_manager->ReleaseCurrentBuffer(
-                length, buffer->data(), infeed_dataset_iterator->shapes[j]);
-
-            bool all_tensors_used = false;
-            {
-              std::lock_guard<std::mutex> lock(infeed_dataset_iterator->mutex);
-              infeed_dataset_iterator->used[j] = true;
-              all_tensors_used = infeed_dataset_iterator->all_tensors_used();
-            }
-
-            if (all_tensors_used) {
-              infeed_dataset_iterator->tensors_dequeued_cv.notify_one();
-            }
+          GetInfeedCopyHandle(infeed_info.stream_prefix, j),
+          [&queue, length](void* dest) {
+            tensorflow::TensorBuffer* buffer;
+            queue->BlockPop(buffer);
+            std::memcpy(dest, buffer->data(), length);
           });
     }
   }
@@ -308,7 +286,7 @@ void PoplarExecutor::ConnectOutfeedToStreamCallback(
     se::StreamExecutor* executor, const OutfeedInfos& outfeed_infos,
     const uint32 replication_factor) {
   for (const auto& outfeed_info : outfeed_infos) {
-    const auto& operand_shape = outfeed_info->operands()[0]->shape();
+    const auto& operand_shape = outfeed_info.shape;
     auto flat_shapes = FlattenedXlaShape(operand_shape);
 
     std::vector<std::pair<Shape, size_t>> shapes_sizes;
@@ -318,14 +296,14 @@ void PoplarExecutor::ConnectOutfeedToStreamCallback(
       shapes_sizes.emplace_back(std::make_pair(output_shape, size));
     }
 
-    const bool clear_if_full = outfeed_info->outfeed_config() == "get_last";
+    const bool clear_if_full = outfeed_info.config == "get_last";
 
     for (unsigned j = 0; j < shapes_sizes.size(); ++j) {
       const Shape shape = std::get<0>(shapes_sizes[j]);
       size_t byte_size = std::get<1>(shapes_sizes[j]);
 
       current_engine_->connectStreamToCallback(
-          GetOutfeedCopyHandle(outfeed_info->name(), j),
+          GetOutfeedCopyHandle(outfeed_info.stream_prefix, j),
           [this, shape, byte_size, clear_if_full](void* src) {
             auto* xfeed_manager = GetXfeedManager(ordinal_);
 
@@ -350,9 +328,7 @@ std::function<void()> PoplarExecutor::CreateInfeedIOThreadFunction(
   std::vector<InfeedDatasetIterator*> infeed_dataset_iterators;
   infeed_dataset_iterators.reserve(infeed_infos.size());
   for (const auto& infeed_info : infeed_infos) {
-    const HloInfeedInstruction* inst = infeed_info;
-
-    auto itr = infeed_dataset_iterators_.find(inst->infeed_config());
+    auto itr = infeed_dataset_iterators_.find(infeed_info.config);
     if (itr == infeed_dataset_iterators_.end()) {
       LOG(FATAL)
           << "Trying to access an infeed context which has not been created."
@@ -361,60 +337,37 @@ std::function<void()> PoplarExecutor::CreateInfeedIOThreadFunction(
     infeed_dataset_iterators.push_back(itr->second.get());
   }
 
-  return [this, infeed_dataset_iterators, executor]() {
-    auto platform =
-        se::MultiPlatformManager::PlatformWithName("Poplar").ValueOrDie();
-    auto* transfer_manager = static_cast<PoplarTransferManager*>(
-        xla::TransferManager::GetForPlatform(platform).ValueOrDie());
-
+  return [this, infeed_dataset_iterators]() {
     while (false == infeed_thread_cancelled_) {
       for (auto& infeed_dataset_iterator : infeed_dataset_iterators) {
-        {
-          std::unique_lock<std::mutex> lock(infeed_dataset_iterator->mutex);
-
-          // We make an assumption that every sub tensor from the infeed is
-          // dequeued every iteration. If all tensors have been used, then get
-          // the next set of tensors.
-          if (infeed_dataset_iterator->all_tensors_used()) {
-            bool end_of_sequence;
-            std::vector<tensorflow::Tensor> outputs;
-            TF_CHECK_OK(infeed_dataset_iterator->iterator->GetNext(
-                infeed_dataset_iterator->iterator_ctx.get(), &outputs,
-                &end_of_sequence));
-            infeed_dataset_iterator->tensors = outputs;
-            if (end_of_sequence) {
-              LOG(INFO) << "The dataset iterator has reached the end of the "
-                           "dataset.";
-              infeed_thread_cancelled_ = true;
-            }
-            absl::c_fill(infeed_dataset_iterator->used, false);
-          }
+        // We do not call GetNext if queues are full.
+        // We make an assumption that all tensors from each queue for an infeed
+        // are dequeued every iteration - we therefore only need to check if the
+        // first queue is full to know whether all the queues are full.
+        if (infeed_dataset_iterator->tensor_queues[0]->IsFull()) {
+          continue;
         }
 
-        if (!infeed_thread_cancelled_) {
-          auto tensor_count = infeed_dataset_iterator->shapes.size();
-          for (auto j = 0; j < tensor_count; ++j) {
-            auto tensor = infeed_dataset_iterator->tensors[j];
+        bool end_of_sequence = false;
+        std::vector<tensorflow::Tensor> outputs;
+        TF_CHECK_OK(infeed_dataset_iterator->iterator->GetNext(
+            infeed_dataset_iterator->iterator_ctx.get(), &outputs,
+            &end_of_sequence));
 
-            const char* tensor_data = tensor.tensor_data().data();
-            const auto& shape = infeed_dataset_iterator->shapes[j];
-
-            auto literal = MutableBorrowingLiteral(tensor_data, shape);
-            auto status =
-                transfer_manager->TransferLiteralToInfeed(executor, literal);
-
-            if (false == status.ok()) {
-              infeed_thread_cancelled_ = true;
-              return;
-            }
+        if (!end_of_sequence) {
+          for (auto j = 0; j < outputs.size(); ++j) {
+            auto& tensor = outputs[j];
+            tensorflow::TensorBuffer* tb =
+                tensorflow::DMAHelper::buffer(&tensor);
+            tb->Ref();
+            auto& queue = infeed_dataset_iterator->tensor_queues[j];
+            queue->Push(tb);
           }
+        } else {
+          infeed_thread_cancelled_ = true;
+          LOG(INFO)
+              << "The dataset iterator has reached the end of the dataset.";
         }
-
-        std::unique_lock<std::mutex> lock(infeed_dataset_iterator->mutex);
-        infeed_dataset_iterator->tensors_dequeued_cv.wait(lock, [&]() {
-          return infeed_dataset_iterator->all_tensors_used() ||
-                 infeed_thread_cancelled_;
-        });
       }
     }
   };
@@ -428,12 +381,7 @@ void PoplarExecutor::LaunchInfeedThread(
   thread_pool_.Schedule(infeed_thread_io_fn);
 }
 
-void PoplarExecutor::StopThreadPool() {
-  infeed_thread_cancelled_ = true;
-  for (auto& infeed_it : infeed_dataset_iterators_) {
-    infeed_it.second->tensors_dequeued_cv.notify_one();
-  }
-}
+void PoplarExecutor::StopThreadPool() { infeed_thread_cancelled_ = true; }
 
 void PoplarExecutor::DeferredDeallocation() {
   std::lock_guard<std::recursive_mutex> g(mutex_);
@@ -588,14 +536,6 @@ static bool DeviceConfigurationsEqual(const IpuOptions& a,
   return google::protobuf::util::MessageDifferencer::Equivalent(a, b);
 }
 
-static absl::optional<int64> GetMaxCompilationThreads() {
-  if (const char* env_c = std::getenv(s_max_compilation_threads_variable)) {
-    std::string env(env_c);
-    return std::stoll(env);
-  }
-  return absl::nullopt;
-}
-
 Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
   if (!DeviceConfigurationsEqual(cfg, current_config_) &&
       hardware_configured_) {
@@ -622,7 +562,7 @@ Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
       hardware_configured_ = true;
     }
 
-    const bool force_ipu_model = getenv(s_force_ipu_model) != nullptr;
+    const bool force_ipu_model = tensorflow::GetPoplarXlaFlags().use_ipu_model;
 
     if (!force_ipu_model) {
       auto device_list = GetDeviceManager().getDevices();
@@ -764,10 +704,11 @@ Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
     report_options_.set(opt.option(), opt.value());
   }
 
-  auto max_compilation_threads = GetMaxCompilationThreads();
-  if (max_compilation_threads) {
+  const auto max_compilation_threads =
+      tensorflow::GetPoplarXlaFlags().max_compilation_threads;
+  if (max_compilation_threads > 0) {
     option_flags_.set("opt.maxCompilationThreads",
-                      std::to_string(*max_compilation_threads));
+                      std::to_string(max_compilation_threads));
   }
 
   for (auto opt : option_flags_) {
@@ -805,7 +746,7 @@ Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
 }
 
 bool PoplarExecutor::HaveExecutableCache() const {
-  return getenv(s_cache_env_variable) != nullptr;
+  return !tensorflow::GetPoplarXlaFlags().executable_cache_path.empty();
 }
 
 std::string PoplarExecutor::CachedExecutableFilename(
@@ -816,9 +757,8 @@ std::string PoplarExecutor::CachedExecutableFilename(
 
   std::string filename = tensorflow::strings::Printf("%0llx.xla_engine", hash);
 
-  const auto& dir = std::string(getenv(s_cache_env_variable));
-
-  return tensorflow::io::JoinPath(dir, filename);
+  return tensorflow::io::JoinPath(
+      tensorflow::GetPoplarXlaFlags().executable_cache_path, filename);
 }
 
 bool PoplarExecutor::HaveCachedExecutable(const std::string& filename) const {
@@ -847,12 +787,34 @@ void PoplarExecutor::AddCompileEndEventRecord(const std::string& module_name,
                                               const std::string& report,
                                               const std::string& tensor_map,
                                               int64 duration) {
+  std::string rep = std::move(report);
+  std::string map = std::move(tensor_map);
+
+  if (ReportDirectory().size() > 0) {
+    std::unique_ptr<tensorflow::WritableFile> file;
+
+    std::string filename = tensorflow::io::JoinPath(
+        ReportDirectory(), module_name + ".compile_report.json");
+
+    TF_CHECK_OK(tensorflow::Env::Default()->NewWritableFile(filename, &file));
+    TF_CHECK_OK(file->Append(rep));
+    TF_CHECK_OK(file->Close());
+    rep = filename;
+
+    filename = tensorflow::io::JoinPath(ReportDirectory(),
+                                        module_name + ".tensor_map.json");
+    TF_CHECK_OK(tensorflow::Env::Default()->NewWritableFile(filename, &file));
+    TF_CHECK_OK(file->Append(map));
+    TF_CHECK_OK(file->Close());
+    map = filename;
+  }
+
   auto evt = NewTraceEvent();
   evt.set_type(tensorflow::IpuTraceEvent::COMPILE_END);
   evt.mutable_compile_end()->set_module_name(std::move(module_name));
-  evt.mutable_compile_end()->set_compilation_report(std::move(report));
+  evt.mutable_compile_end()->set_compilation_report(std::move(rep));
   evt.mutable_compile_end()->set_duration(duration);
-  evt.mutable_compile_end()->set_tensor_map(tensor_map);
+  evt.mutable_compile_end()->set_tensor_map(std::move(map));
 
   reports_.push_back(evt);
 }
@@ -883,10 +845,22 @@ void PoplarExecutor::AddLoadEngineEventRecord(const std::string& module_name) {
 
 void PoplarExecutor::AddExecuteEventRecord(const std::string& module_name,
                                            const std::string& report) {
+  std::string rep = std::move(report);
+  if (ReportDirectory().size() > 0) {
+    std::unique_ptr<tensorflow::WritableFile> file;
+
+    std::string filename = tensorflow::io::JoinPath(
+        ReportDirectory(), module_name + ".execute_report.json");
+    TF_CHECK_OK(tensorflow::Env::Default()->NewWritableFile(filename, &file));
+    TF_CHECK_OK(file->Append(rep));
+    TF_CHECK_OK(file->Close());
+    rep = filename;
+  }
+
   auto evt = NewTraceEvent();
   evt.set_type(tensorflow::IpuTraceEvent::EXECUTE);
   evt.mutable_execute()->set_module_name(std::move(module_name));
-  evt.mutable_execute()->set_execution_report(std::move(report));
+  evt.mutable_execute()->set_execution_report(std::move(rep));
 
   reports_.push_back(evt);
 }
@@ -1563,6 +1537,12 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
 
             current_engine_->resetExecutionProfile();
           }
+        }
+
+        if (report_stream.tellp() > MaxReportSize()) {
+          LOG(WARNING) << "Dropping Poplar execution report, size was "
+                       << report_stream.tellp();
+          report_stream.str(std::string());
         }
 
         AddExecuteEventRecord(executable.module().name(), report_stream.str());
