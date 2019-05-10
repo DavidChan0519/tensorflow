@@ -23,6 +23,7 @@ py_library(
       "python/ops.py",
       "python/popnn_normalization.py",
       "python/popnn_rnn.py",
+      "python/poprand.py",
       "python/sharded_optimizer.py",
       "python/popops_cross_replica_sum.py",
       "python/sharding.py",
@@ -33,6 +34,7 @@ py_library(
         "//tensorflow/compiler/plugin/poplar:ipu_ops_py",
         "//tensorflow/compiler/plugin/poplar:popnn_ops_py",
         "//tensorflow/compiler/plugin/poplar:popops_ops_py",
+        "//tensorflow/compiler/plugin/poplar:poprand_ops_py",
         "//tensorflow/compiler/plugin/poplar:poputil_ops_py",
         "//tensorflow/compiler/xla:xla_data_proto_py",
         "//tensorflow/contrib/compiler:compiler_py",
@@ -114,6 +116,24 @@ tf_py_test(
 )
 
 tf_py_test(
+    name = "dropout_test",
+    size = "small",
+    srcs = ["python/tests/dropout_test.py"],
+    additional_deps = [
+        ":ipu",
+        ":test_util",
+        "//tensorflow/compiler/plugin/poplar:ipu_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:control_flow_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+    ],
+)
+
+tf_py_test(
     name = "remapping_test",
     size = "small",
     srcs = ["python/tests/remapping_test.py"],
@@ -146,6 +166,19 @@ tf_py_test(
         "//tensorflow/python:platform",
         "//tensorflow/python:state_ops",
         "//tensorflow/python:variables",
+    ],
+)
+
+tf_py_test(
+    name = "combined_weights_test",
+    size = "large",
+    srcs = ["size_speed_tests/combined_weights_test.py"],
+    additional_deps = [
+        ":ipu",
+        ":test_util",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:framework_test_lib",
+        "//tensorflow/python:layers",
     ],
 )
 
@@ -357,7 +390,6 @@ tf_py_test(
     ],
 )
 
-
 test_suite(
     name = "all_tests",
     tests = [
@@ -370,6 +402,7 @@ test_suite(
         "ops_test",
         "popnn_normalization_test",
         "popops_cross_replica_sum_test",
+        "dropout_test",
         "remapping_test",
         "replicated_graph_test",
         "sharded_inplace_test",
@@ -383,6 +416,7 @@ test_suite(
 test_suite(
     name = "size_speed_tests",
     tests = [
+        "combined_weights_test",
         "resnet18_nobn_test",
         "lstm_size_test",
     ],

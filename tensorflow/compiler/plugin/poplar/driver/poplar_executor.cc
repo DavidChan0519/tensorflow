@@ -114,6 +114,8 @@ namespace se = ::stream_executor;
 namespace xla {
 namespace poplarplugin {
 
+std::string GetRandomNumberSeedStream() { return "__seed_stream"; }
+
 std::string GetInputCopyHandle(int64 parameter, int64 index) {
   return tensorflow::strings::Printf("%lld.%lld", parameter, index);
 }
@@ -181,6 +183,33 @@ void ConfigurePoplarXFeedManager(const InfeedInfos& infeed_infos,
     auto* p = static_cast<PoplarPlatform*>(platform.ValueOrDie());
     p->ResetXfeedManagers();
   }
+}
+
+Shape GetOutfeedShape(const Shape& output_shape,
+                      const uint32 replication_factor) {
+  if (replication_factor > 1) {
+    // When the graph is replicated, we expect an extra dimension at the front
+    // of the output.
+    std::vector<int64> dimensions = {replication_factor};
+    absl::c_copy(output_shape.dimensions(), std::back_inserter(dimensions));
+    return ShapeUtil::MakeShape(output_shape.element_type(), dimensions);
+  } else {
+    return output_shape;
+  }
+}
+
+void ConnectSeedCallback(poplar::Engine* engine, int replication_factor) {
+  static std::random_device rd;
+  static std::mt19937_64 gen(rd());
+
+  auto callback = [gen, replication_factor](void* ptr) mutable {
+    uint64_t* seedValue = reinterpret_cast<uint64_t*>(ptr);
+    for (int i = 0; i < std::max(replication_factor, 1); ++i) {
+      seedValue[i] = gen();
+    }
+  };
+
+  engine->connectStreamToCallback(GetRandomNumberSeedStream(), callback);
 }
 }  // namespace
 
@@ -266,21 +295,6 @@ void PoplarExecutor::ConnectInfeedsToStreamCallback(
     }
   }
 }
-
-namespace {
-Shape GetOutfeedShape(const Shape& output_shape,
-                      const uint32 replication_factor) {
-  if (replication_factor > 1) {
-    // When the graph is replicated, we expect an extra dimension at the front
-    // of the output.
-    std::vector<int64> dimensions = {replication_factor};
-    absl::c_copy(output_shape.dimensions(), std::back_inserter(dimensions));
-    return ShapeUtil::MakeShape(output_shape.element_type(), dimensions);
-  } else {
-    return output_shape;
-  }
-}
-}  // namespace
 
 void PoplarExecutor::ConnectOutfeedToStreamCallback(
     se::StreamExecutor* executor, const OutfeedInfos& outfeed_infos,
@@ -975,11 +989,11 @@ se::DeviceMemoryBase PoplarExecutor::ConstantOutputAllocation::GetAllocation(
     xla::DeviceMemoryAllocator* allocator, const xla::Shape& shape,
     const int64 output_index, int64& flat_tensor_index, const Args&,
     const InputOutputAliasingMap::OutputInfo&, const ArgsHandleMap&,
-    const int) const {
+    const int ordinal) const {
   const auto& constant = constants_[output_index][flat_tensor_index];
   const int64 size(xla::ShapeUtil::ByteSizeOf(shape));
   se::DeviceMemoryBase allocated =
-      allocator->Allocate(0, size, false).ConsumeValueOrDie().Forget();
+      allocator->Allocate(ordinal, size, false).ConsumeValueOrDie().Forget();
   TensorControl* tc = reinterpret_cast<TensorControl*>(allocated.opaque());
   tc->size = size;
   tc->on_device = false;
@@ -995,7 +1009,7 @@ se::DeviceMemoryBase PoplarExecutor::RemapOutputAllocation::GetAllocation(
     xla::DeviceMemoryAllocator* allocator, const xla::Shape&,
     const int64 output_index, int64& flat_tensor_index, const Args& args,
     const InputOutputAliasingMap::OutputInfo&, const ArgsHandleMap& args_map,
-    const int) const {
+    const int ordinal) const {
   const auto& remap_idx = remap_map_[output_index];
   auto it = args_map.find(GetInputCopyHandle(remap_idx, flat_tensor_index));
   if (it == args_map.end()) {
@@ -1016,7 +1030,9 @@ se::DeviceMemoryBase PoplarExecutor::RemapOutputAllocation::GetAllocation(
   if (make_a_copy) {
     TensorControl* orig = it->second.tc;
     se::DeviceMemoryBase allocated =
-        allocator->Allocate(0, orig->size, false).ConsumeValueOrDie().Forget();
+        allocator->Allocate(ordinal, orig->size, false)
+            .ConsumeValueOrDie()
+            .Forget();
     TensorControl* tc = reinterpret_cast<TensorControl*>(allocated.opaque());
 
     if (orig->on_device) {
@@ -1082,7 +1098,7 @@ se::DeviceMemoryBase PoplarExecutor::HandleOutputBuffer(
   } else {
     int64 size(xla::ShapeUtil::ByteSizeOf(shape, sizeof(void*)));
     se::DeviceMemoryBase allocated =
-        allocator->Allocate(0, size, false).ConsumeValueOrDie().Forget();
+        allocator->Allocate(ordinal_, size, false).ConsumeValueOrDie().Forget();
     TensorControl* tc = reinterpret_cast<TensorControl*>(allocated.opaque());
 
     void** buf = reinterpret_cast<void**>(tc->data);
@@ -1132,7 +1148,7 @@ se::DeviceMemoryBase PoplarExecutor::GetOutputBuffer(
   }
   if (shape.IsTuple()) {
     se::DeviceMemoryBase allocated =
-        allocator->Allocate(0, size, false).ConsumeValueOrDie().Forget();
+        allocator->Allocate(ordinal_, size, false).ConsumeValueOrDie().Forget();
     TensorControl* tc = reinterpret_cast<TensorControl*>(allocated.opaque());
     void** buf = reinterpret_cast<void**>(tc->data);
     for (void* ptr : ptrs) {
@@ -1192,6 +1208,7 @@ StatusOr<bool> PoplarExecutor::CheckMoveHostToDeviceRequired(
   // b) resource is not on the device
   // c) resource is on the device, but in the wrong place
   bool do_host_to_device = false;
+
   for (const auto& arg : args_map_) {
     if (!arg.second.streamed) {
       auto it =
@@ -1389,8 +1406,16 @@ void PoplarExecutor::CreateInfeedDatasetIterator(
     std::unique_ptr<tensorflow::data::IteratorBase> iterator,
     std::unique_ptr<tensorflow::data::IteratorContext> iterator_ctx,
     const std::vector<xla::Shape>& shapes) {
-  infeed_dataset_iterators_[id] = absl::make_unique<InfeedDatasetIterator>(
-      std::move(iterator), std::move(iterator_ctx), shapes);
+  auto itr = infeed_dataset_iterators_.find(id);
+  if (itr != infeed_dataset_iterators_.end()) {
+    LOG(FATAL)
+        << "Feed with id='" << id
+        << "' already exists. Consider renaming the feed. The poplar backend "
+           "requires feed ops to have unique names.";
+  } else {
+    infeed_dataset_iterators_[id] = absl::make_unique<InfeedDatasetIterator>(
+        std::move(iterator), std::move(iterator_ctx), shapes);
+  }
 }
 
 StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
@@ -1441,6 +1466,9 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
     if (engine_changed) {
       try {
         engine->load(poplar_device_);
+
+        const auto replication_factor = executable.GetReplicationFactor();
+        ConnectSeedCallback(engine, replication_factor);
 
         if (current_config_.profiling().enable_ipu_trace_events() &&
             current_config_.profiling().enable_io_trace()) {

@@ -44,6 +44,7 @@ limitations under the License.
 
 #include <poplar/Engine.hpp>
 #include <poplar/OptionFlags.hpp>
+#include <poplar/TensorCloneMethod.hpp>
 #include <poplin/Norms.hpp>
 #include <poputil/TileMapping.hpp>
 
@@ -789,26 +790,28 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
   const auto& name = GetDebugName(src.first);
   poplar::Tensor out;
 
-  auto target = resources.annotations.tensor_allocation_map.find(src);
-  if (target != resources.annotations.tensor_allocation_map.end()) {
-    const auto* tgt = target->second.tgt;
-    auto tshape = tgt->operand(target->second.input_index)->shape();
-    const auto optional_layout = target->second.layout;
-    const auto optional_layout_output_idx = target->second.layout_output_idx;
-    const auto forward_path = target->second.forward_path;
+  auto tensor_target = resources.annotations.tensor_allocation_map.find(src);
+  if (tensor_target != resources.annotations.tensor_allocation_map.end()) {
+    const auto* target = tensor_target->second.tgt;
+    const auto input_index = tensor_target->second.input_index;
+    auto tshape = target->operand(input_index)->shape();
+    const auto optional_layout = tensor_target->second.layout;
+    const auto optional_layout_output_idx =
+        tensor_target->second.layout_output_idx;
+    const auto forward_path = tensor_target->second.forward_path;
 
-    if (IsPopOpsElementwiseBinary(tgt) && !IsPopOpsBiasAdd(tgt)) {
+    if (IsPopOpsElementwiseBinary(target) && !IsPopOpsBiasAdd(target)) {
       TF_ASSIGN_OR_RETURN(
           out, AddElementwiseBinary(graph, name, *optional_layout,
                                     *optional_layout_output_idx, forward_path,
                                     tensor_map));
     } else {
-      switch (tgt->opcode()) {
+      switch (target->opcode()) {
         case HloOpcode::kBatchNormInference:
         case HloOpcode::kBatchNormTraining: {
           const unsigned feature_dimension =
-              Cast<HloBatchNormInstruction>(tgt)->feature_index();
-          switch (target->second.input_index) {
+              Cast<HloBatchNormInstruction>(target)->feature_index();
+          switch (input_index) {
             case 1: {
               TF_ASSIGN_OR_RETURN(
                   out, AddNormScaleTensor(graph, name, *optional_layout,
@@ -833,15 +836,15 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
           break;
         }
         case HloOpcode::kConvolution: {
-          switch (target->second.input_index) {
+          switch (input_index) {
             case 0: {
               TF_ASSIGN_OR_RETURN(
-                  out, AddConvolutionInput(graph, name, tgt, resources));
+                  out, AddConvolutionInput(graph, name, target, resources));
               break;
             }
             case 1: {
               TF_ASSIGN_OR_RETURN(
-                  out, AddConvolutionWeights(graph, name, tgt, resources));
+                  out, AddConvolutionWeights(graph, name, target, resources));
               break;
             }
             default:
@@ -852,15 +855,15 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
           break;
         }
         case HloOpcode::kDot: {
-          switch (target->second.input_index) {
+          switch (input_index) {
             case 0: {
               TF_ASSIGN_OR_RETURN(
-                  out, AddLeftMatMul(graph, name, tshape, tgt, resources));
+                  out, AddLeftMatMul(graph, name, tshape, target, resources));
               break;
             }
             case 1: {
               TF_ASSIGN_OR_RETURN(
-                  out, AddRightMatMul(graph, name, tshape, tgt, resources));
+                  out, AddRightMatMul(graph, name, tshape, target, resources));
               break;
             }
             default:
@@ -871,70 +874,69 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
           break;
         }
         case HloOpcode::kDynamicSlice: {
-          if (target->second.input_index == 0) {
-            TF_ASSIGN_OR_RETURN(
-                out, AddDynamicSliceTensor(graph, name, tshape,
-                                           target->second.tgt->shape()));
+          if (input_index == 0) {
+            TF_ASSIGN_OR_RETURN(out, AddDynamicSliceTensor(graph, name, tshape,
+                                                           target->shape()));
           } else {
             TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
           }
           break;
         }
         case HloOpcode::kDynamicUpdateSlice: {
-          if (target->second.input_index == 0) {
+          if (input_index == 0) {
             TF_ASSIGN_OR_RETURN(
                 out, AddDynamicSliceTensor(graph, name, tshape,
-                                           target->second.tgt->shape()));
+                                           target->operand(1)->shape()));
           } else {
             TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
           }
           break;
         }
         case HloOpcode::kScatter: {
-          auto scatter = Cast<HloScatterInstruction>(tgt);
-          const auto updateWindowDims =
-              scatter->scatter_dimension_numbers().update_window_dims();
-          const auto insertedWindowDims =
-              scatter->scatter_dimension_numbers().inserted_window_dims();
+          auto scatter = Cast<HloScatterInstruction>(target);
 
-          if (target->second.input_index == 0) {
-            xla::Shape sliceShape = tgt->operand(0)->shape();
+          if (input_index == 0) {
+            const auto inserted_window_dims =
+                scatter->scatter_dimension_numbers().inserted_window_dims();
+            xla::Shape slice_shape = target->operand(0)->shape();
             for (int i = 0; i < tshape.rank(); ++i) {
-              if (absl::c_binary_search(insertedWindowDims, i)) {
-                sliceShape.set_dimensions(i, 1);
+              if (absl::c_binary_search(inserted_window_dims, i)) {
+                slice_shape.set_dimensions(i, 1);
               }
             }
 
             TF_ASSIGN_OR_RETURN(
-                out, AddScatterTensor(graph, name, tshape, sliceShape));
-          } else if (target->second.input_index == 2) {
-            xla::Shape sliceShape = tgt->operand(2)->shape();
+                out, AddScatterTensor(graph, name, tshape, slice_shape));
+          } else if (input_index == 2) {
+            const auto update_window_dims =
+                scatter->scatter_dimension_numbers().update_window_dims();
+            xla::Shape slice_shape = target->operand(2)->shape();
             for (int i = 0; i < tshape.rank(); ++i) {
-              if (!absl::c_binary_search(updateWindowDims, i)) {
-                sliceShape.set_dimensions(i, 1);
+              if (!absl::c_binary_search(update_window_dims, i)) {
+                slice_shape.set_dimensions(i, 1);
               }
             }
 
             TF_ASSIGN_OR_RETURN(
-                out, AddScatterTensor(graph, name, tshape, sliceShape));
+                out, AddScatterTensor(graph, name, tshape, slice_shape));
           } else {
             TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
           }
           break;
         }
         case HloOpcode::kFusion: {
-          const HloComputation* comp = tgt->fused_instructions_computation();
+          const HloComputation* comp = target->fused_instructions_computation();
           if (IsPopOpsFusion(comp)) {
             if (IsPopOpsFusion(comp, "depthwise_conv")) {
-              switch (target->second.input_index) {
+              switch (input_index) {
                 case 0: {
                   TF_ASSIGN_OR_RETURN(
-                      out, AddConvolutionInput(graph, name, tgt, resources));
+                      out, AddConvolutionInput(graph, name, target, resources));
                   break;
                 }
                 case 1: {
-                  TF_ASSIGN_OR_RETURN(
-                      out, AddConvolutionWeights(graph, name, tgt, resources));
+                  TF_ASSIGN_OR_RETURN(out, AddConvolutionWeights(
+                                               graph, name, target, resources));
                   break;
                 }
                 default:
@@ -963,24 +965,25 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
           break;
         }
         case HloOpcode::kCustomCall: {
-          if (IsPoplibsHloCustomOp(tgt)) {
-            TF_ASSIGN_OR_RETURN(out, AllocatePoplibsOpTensor(
-                                         graph, resources, name, target->second,
-                                         shape, tensor_map));
+          if (IsPoplibsHloCustomOp(target)) {
+            TF_ASSIGN_OR_RETURN(
+                out, AllocatePoplibsOpTensor(graph, resources, name,
+                                             tensor_target->second, shape,
+                                             tensor_map));
           } else {
-            LOG(FATAL) << "Unsupported custom call " << tgt->name();
+            LOG(FATAL) << "Unsupported custom call " << target->name();
           }
           break;
         }
         default:
           return xla::FailedPrecondition("Unknown tensor target for %s: %s",
                                          src.first->name().c_str(),
-                                         tgt->name().c_str());
+                                         target->name().c_str());
       }
     }
 
     TF_ASSIGN_OR_RETURN(
-        out, PathTransform(graph, out, target->second.backward_path));
+        out, PathTransform(graph, out, tensor_target->second.backward_path));
 
   } else {
     TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, shape));
@@ -1402,33 +1405,19 @@ bool AreInplaceOutputTensorsWritable(TensorMap& map, CompilerResources& res,
     return false;
   }
 
-  // Check that the instruction description is for an inplace operation.
-  auto inst_description = InplaceUtil::GetHloInstructionDescription(inst);
-  if (!inst_description->IsInPlaceType(inst)) {
-    LOG(FATAL) << "Trying to execute " << inst->name()
-               << " as an inplace operation, but it is not.";
+  // Check that the instruction description is for an inplace read/write
+  // operation.
+  auto inplace_description = HloInstructionDescription(inst);
+  if (inplace_description.GetType() != HloInstructionType::kInplaceReadWrite) {
+    return false;
   }
-  auto& inplace_description =
-      *static_cast<InplaceUtil::InplaceHloInstructionDescription*>(
-          inst_description.get());
 
   // Get all the input tensors for all the inplace operands
   auto inplace_indexes = inplace_description.GetInplaceOperandIndexes();
 
   std::vector<TensorVector> tensor_vectors(inplace_indexes.size());
-
-  if (inst->opcode() == HloOpcode::kGetTupleElement) {
-    // For GTEs there is only one input - only get the tensors we need.
-    CHECK_EQ(inplace_indexes.size(), 1);
-    CHECK_EQ(inplace_indexes[0], 0);
-    auto gte_tensors_indecies = FindGetTupleElementTupleIndecies(inst);
-    tensor_vectors[0] =
-        GetTensorsInMap(map, inst->operand(0), gte_tensors_indecies.first,
-                        gte_tensors_indecies.second);
-  } else {
-    for (uint64 i = 0; i < inplace_indexes.size(); i++) {
-      tensor_vectors[i] = GetTensorsInMap(map, inst->operand(i));
-    }
+  for (uint64 i = 0; i < inplace_indexes.size(); i++) {
+    tensor_vectors[i] = GetTensorsInMap(map, inst->operand(i));
   }
   // Go through all the inplace tensors and check they are all parallel
   // writeable.
@@ -1443,20 +1432,45 @@ bool AreInplaceOutputTensorsWritable(TensorMap& map, CompilerResources& res,
   return true;
 }
 
+namespace {
+// TODO T8403 - remove this function when Poplar supports it.
+poplar::Tensor Duplicate(const poplar::Tensor& src,
+                         poplar::program::Sequence& seq, poplar::Graph& graph,
+                         const poplar::TensorCloneMethod clone_method,
+                         std::string name) {
+  poplar::Tensor copy = graph.clone(src, name, clone_method);
+  poplar::Tensor copy_dst = copy;
+  poplar::Tensor copy_src = src;
+  if (clone_method == poplar::TensorCloneMethod::PRESERVE_ORDER_AND_ALIASES) {
+    // Remove all aliased regions in the source and destination tensor.
+    auto copy_flat = copy.flatten();
+    auto src_flat = src.flatten();
+
+    auto src_flat_regions = graph.getSortedContiguousRegions(
+        src_flat, {{0, src_flat.numElements()}}, true);
+    if (src_flat_regions.size()) {
+      copy_dst = poplar::concat(copy_flat.slices(src_flat_regions));
+      copy_src = poplar::concat(src_flat.slices(src_flat_regions));
+    }
+  }
+  seq.add(poplar::program::Copy(copy_src, copy_dst));
+  return copy;
+}
+}  // namespace
+
 StatusOr<ArgVectors> FindInplaceOutputTensors(TensorMap& map,
                                               CompilerResources& res,
                                               const HloInstruction* inst,
                                               poplar::program::Sequence& seq,
                                               const bool expand_constants) {
   // Check that the instruction description is for an inplace operation.
-  auto inst_description = InplaceUtil::GetHloInstructionDescription(inst);
-  if (!inst_description->IsInPlaceType(inst)) {
+  auto inplace_description = HloInstructionDescription(inst);
+  if (!inplace_description.IsInplaceType()) {
     LOG(FATAL) << "Trying to execute " << inst->name()
                << " as an inplace operation, but it is not.";
   }
-  auto& inplace_description =
-      *static_cast<InplaceUtil::InplaceHloInstructionDescription*>(
-          inst_description.get());
+  const bool is_inplace_read_write =
+      inplace_description.GetType() == HloInstructionType::kInplaceReadWrite;
 
   const bool is_still_inplace =
       res.annotations.inplace_instructions.count(inst);
@@ -1486,20 +1500,28 @@ StatusOr<ArgVectors> FindInplaceOutputTensors(TensorMap& map,
       poplar::Tensor t = tensors[i][tuple_idx];
 
       // We need to add a copy before an inplace op if:
-      // 1. t is not ParallelWriteable,
-      // 2. inst is not marked as inplace.
-      bool requires_copy_of_inplace_operand =
-          !t.isParallelWriteable() || !is_still_inplace;
+      // 1. inst is not marked as inplace.
+      // 2. inst is inplace read/write type, but t is not ParallelWriteable.
+      bool requires_copy_of_inplace_operand = !is_still_inplace;
+      if (is_inplace_read_write) {
+        requires_copy_of_inplace_operand |= !t.isParallelWriteable();
+      }
 
       if (requires_copy_of_inplace_operand) {
+        // Preserve aliases for inplace read only ops.
+        auto clone_method =
+            is_inplace_read_write
+                ? poplar::TensorCloneMethod::PRESERVE_ORDER_UNLESS_ALIASES
+                : poplar::TensorCloneMethod::PRESERVE_ORDER_AND_ALIASES;
+
         VLOG(1) << "Adding a copy for operand " << inplace_indexes[i]
                 << ", tuple index " << tuple_idx << ", of inplace op "
-                << inst->name();
+                << inst->name()
+                << " inplace description: " << inplace_description.ToString();
         const auto* operand = inst->operand(inplace_indexes[i]);
         auto& graph = GetGraphWithOutputIndex(res, operand, tuple_idx);
-        poplar::Tensor copy = graph.clone(t, GetDebugName(inst) + ".clone");
-        seq.add(poplar::program::Copy(t, copy));
-        t = copy;
+        t = Duplicate(t, seq, graph, clone_method,
+                      GetDebugName(inst) + ".clone");
       }
       tensors[i][tuple_idx] = t;
     }
@@ -1533,6 +1555,7 @@ std::string GetTensorMappingJson(const poplar::Graph& graph,
       tensor["inst_name"] = Json::Value(pair.first.first);
       tensor["output_index"] = Json::Value::UInt64(pair.first.second);
       tensor["constant"] = Json::Value::UInt64(pop_tensor.containsConstant());
+      tensor["has_aliases"] = Json::Value::UInt64(pop_tensor.containsAliases());
       tensor["tiles"] = Json::Value(Json::arrayValue);
 
       const auto& mapping = graph.getTileMapping(pop_tensor);

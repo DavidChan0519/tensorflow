@@ -28,7 +28,7 @@ def compile(computation, inputs=None):
 
   Args:
     computation: A Python function that builds a computation to apply to the
-      input. If the function takes n inputs, 'inputs' should be a list of n
+      input. If the function takes n inputs, `inputs` should be a list of n
       tensors.
 
       `computation` may return a list of operations and tensors.  Tensors must
@@ -46,13 +46,15 @@ def compile(computation, inputs=None):
       tensors with `tf.convert_to_tensor`.
 
   Returns:
-    Same data structure as if computation(*inputs) is called directly with some
-    exceptions for correctness. Exceptions include:
-      1) None output: a NoOp would be returned which control-depends on
-         computation.
-      2) Single value output: A tuple containing the value would be returned.
-      3) Operation-only outputs: a NoOp would be returned which
-         control-depends on computation.
+    Same data structure as if computation(inputs) is called directly with some
+    exceptions for correctness.
+
+    1. None output. a NoOp would be returned which control-depends on
+       computation.
+    2. Single value output. A tuple containing the value would be returned.
+    3. Operation-only outputs. a NoOp would be returned which
+       control-depends on computation.
+
   Raises:
     Exception: If the computation was not compiled for an IPU device.
   """
