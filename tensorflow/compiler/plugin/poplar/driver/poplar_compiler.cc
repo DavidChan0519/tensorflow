@@ -45,9 +45,10 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/passes/fuse_wide_const.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/hlo_computation_name_uniquify.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/inter_ipu_copy_inserter.h"
-#include "tensorflow/compiler/plugin/poplar/driver/passes/norm_input_recomputation.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/not_supported_gather_expander.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/not_supported_scatter_expander.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/recompute_instructions.h"
+#include "tensorflow/compiler/plugin/poplar/driver/passes/replication_factor_to_constant.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/root_token_replacer.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/sharding_pass.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/while_loop_condition_simplify.h"
@@ -56,6 +57,7 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/poplar_executable.h"
 #include "tensorflow/compiler/plugin/poplar/driver/poplar_executor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/poplar_platform_id.h"
+#include "tensorflow/compiler/plugin/poplar/driver/schedulers/look_ahead_scheduler.h"
 #include "tensorflow/compiler/plugin/poplar/driver/schedulers/sync_list_scheduler.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/flags.h"
@@ -71,7 +73,6 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/hlo_dce.h"
 #include "tensorflow/compiler/xla/service/hlo_get_dimension_size_rewriter.h"
 #include "tensorflow/compiler/xla/service/hlo_graph_dumper.h"
-#include "tensorflow/compiler/xla/service/hlo_memory_scheduler.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_fix.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_pipeline.h"
 #include "tensorflow/compiler/xla/service/hlo_subcomputation_unification.h"
@@ -372,35 +373,64 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
         CreateHloProfilePrinterData(*profile_index_map, cost_analysis, name);
   }
 
-  std::string filename;
+  std::string cache_filename;
   if (poplarExecutor->HaveExecutableCache()) {
-    filename = poplarExecutor->CachedExecutableFilename(*module);
+    cache_filename = poplarExecutor->CachedExecutableFilename(*module);
 
-    if (poplarExecutor->HaveCachedExecutable(filename)) {
+    if (poplarExecutor->HaveCachedExecutable(cache_filename)) {
       TF_ASSIGN_OR_RETURN(PoplarExecutable * poplar_executable,
                           PoplarExecutable::Deserialize(
                               std::move(module), std::move(profile_printer),
-                              std::move(profile_index_map), filename));
+                              std::move(profile_index_map), cache_filename));
+      // When restoring the executable we still need to make sure all the
+      // outfeeds are unique.
+      TF_RETURN_IF_ERROR(poplarExecutor->RegisterOutfeeds(
+          poplar_executable->GetOutfeedInfos()));
 
       std::unique_ptr<Executable> executable;
       executable.reset(poplar_executable);
 
+      VLOG(1) << "Loaded " << executable->module().name() << " from "
+              << cache_filename;
+
       return std::move(executable);
+    } else {
+      VLOG(1) << "Couldn't find " << cache_filename << " in executable cache";
     }
   }
 
+  if (!poplarExecutor->HasPoplarDevice()) {
+    return xla::FailedPrecondition(
+        "No device has been configured. Did you configure the IPU devices by "
+        "running `tensorflow.contrib.ipu.configure_ipu_system(ipu_options)`?");
+  }
   const poplar::Device& dev = poplarExecutor->GetPoplarDevice();
 
   std::lock_guard<std::mutex> g(static_mu_);
 
   uint64 start_micros = tensorflow::Env::Default()->NowMicros();
 
+  // Work out the IPU division for this IPU.
+  // Given device with `num_ipus` IPU chips, we get the number of shards
+  // `num_shards` and the replication factor is `num_ipus`/`num_shards` (and
+  // we also make sure `num_ipus` % `num_shards` == 0).
+  const auto num_ipus = dev.getTarget().getNumIPUs();
+  const auto num_shards = MaximalShard(module.get()) + 1;
+  const auto replication_factor = num_ipus / num_shards;
+  // Check that it's divisible.
+  if (num_ipus % num_shards) {
+    return xla::ResourceExhaustedStrCat(
+        "Trying to compile a graph for an IPU device with ", num_ipus,
+        " IPUs and ", num_shards,
+        " shards. The number of shards needs to "
+        " divide the number of IPUs.");
+  }
+
   CompilerResources resources(dev, poplarExecutor->GetConvolutionOptions(),
                               poplarExecutor->GetPoolingOptions(),
                               poplarExecutor->DisableGraphConvCaching(),
                               poplarExecutor->MergeInfeedCopies(),
-                              poplarExecutor->GetNumberOfReplicas(),
-                              module.get());
+                              replication_factor, module.get());
 
   resources.main_graph.addCodelets(GetPathToGraphProgFile("tf.gp"));
   poplin::addCodelets(resources.main_graph);
@@ -411,7 +441,6 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
   poplar::Graph* sharding_main_graph = &resources.main_graph;
 
-  const auto replication_factor = resources.replication_factor;
   if (replication_factor > 1) {
     if (!IsValidReplicatedGraph(module.get())) {
       if (!tensorflow::GetPoplarXlaFlags().force_replicated_mode) {
@@ -436,14 +465,6 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   if (ShardingEnabled(module.get())) {
     auto num_ipus = sharding_main_graph->getTarget().getNumIPUs();
     // Check that we have enough IPUs for this sharding configuration.
-    auto maximal_shard = MaximalShard(module.get());
-    if (maximal_shard >= num_ipus) {
-      return xla::ResourceExhaustedStrCat(
-          "Trying to compile a graph for ", maximal_shard + 1,
-          " shards, however the Multi-IPU device ordinal ",
-          stream_exec->device_ordinal(), " is a configuration which has ",
-          num_ipus, " IPU", (num_ipus > 1 ? "s." : "."));
-    }
     auto tiles_per_ipu = sharding_main_graph->getTarget().getTilesPerIPU();
     for (unsigned ipu = 0; ipu < num_ipus; ++ipu) {
       resources.shard_graphs.emplace_back(
@@ -467,6 +488,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     }
     pipeline.AddPass<HloGetDimensionSizeRewriter>();
     pipeline.AddPass<CustomOpReplacer>();
+    pipeline.AddPass<ReplicationFactorToConstant>(resources.replication_factor);
     pipeline.AddPass<HloComputationNameUniquify>();
     pipeline.AddPass<CholeskyExpander>();
     pipeline.AddPass<TriangularSolveExpander>();
@@ -504,11 +526,13 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       pass.AddPass<FuseWideConst>(resources.annotations);
       pass.AddPass<HloDCE>();
       pass.AddPass<WhileLoopConditionSimplify>();
-      pass.AddPass<WhileLoopToRepeatSimplify>();
+      pass.AddPass<HloPassFix<WhileLoopToRepeatSimplify>>();
     }
     pipeline.AddPass<HloSubcomputationUnification>();
-    pipeline.AddPass<NormInputRecomputation>(
-        poplarExecutor->NormInputRecomputationEnabled());
+    pipeline.AddPass<ConvolutionClassifier>(resources.annotations);
+    pipeline.AddPass<RecomputeInstructions>(
+        poplarExecutor->InstructionRecomputationEnabled(),
+        resources.annotations);
     pipeline.AddPass<HloDCE>();
     pipeline.AddPass<DependencyReplacer>(true);
     pipeline.AddPass<InplaceFinder>(resources.annotations);
@@ -526,12 +550,17 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
     auto size_function = [](const BufferValue& buffer) {
       return ShapeUtil::ByteSizeOf(buffer.shape(), 1);
     };
-    if (poplarExecutor->GetMaxAllReduceBufferSize() == 0) {
-      pipeline.AddPass<HloMemoryScheduler>(size_function,
-                                           DefaultMemoryScheduler);
-    } else {
+
+    // If user has specified to use the fallback scheduler use that, else use
+    // the default look ahead scheduler.
+    if (tensorflow::GetPoplarXlaFlags().fallback_scheduler) {
       pipeline.AddPass<HloMemoryScheduler>(
           size_function, CreateSyncListMemoryScheduler(
+                             poplarExecutor->GetMaxAllReduceBufferSize()));
+    } else {
+      // The default scheduler.
+      pipeline.AddPass<HloMemoryScheduler>(
+          size_function, CreateLookAheadMemoryScheduler(
                              poplarExecutor->GetMaxAllReduceBufferSize()));
     }
     pipeline.AddPass<CombineAllReduce>();
@@ -542,12 +571,7 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
   HloComputation* entry = module->entry_computation();
 
   if (poplarExecutor->IpuTraceEventsEnabled()) {
-    std::string dot_graph;
-    auto status = SerializeComputationToGraphDef(*entry);
-    if (status.ok()) {
-      dot_graph = status.ValueOrDie();
-    }
-    poplarExecutor->AddCompileBeginEventRecord(module->name(), dot_graph);
+    poplarExecutor->AddCompileBeginEventRecord(module->name());
   }
 
   // Set layout if there isn't one
@@ -598,6 +622,9 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
     poplar::program::Sequence main_program;
 
+    // Register the outfeeds which this executable creates.
+    TF_RETURN_IF_ERROR(
+        poplarExecutor->RegisterOutfeeds(resources.annotations.outfeed_infos));
     // Set up the random seed
     auto seed_setup = InitializeSeed(resources.main_graph, *sharding_main_graph,
                                      replication_factor);
@@ -637,10 +664,9 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       try {
         VLOG(1) << "Compile engine " << module->name();
 
-        // Generate this JSON early so that the VLOG trace can contain the
-        // output whether the engine compilation completes or not.
-        map_json = GetTensorMappingJson(GetReplicatedGraph(resources),
-                                        resources.tensor_maps);
+        map_json =
+            GetTensorMappingJson(module->name(), GetReplicatedGraph(resources),
+                                 resources.tensor_maps);
 
         auto& opts = poplarExecutor->GetOptionsFlags();
         auto progress_logging = [](int progress, int total) {
@@ -652,6 +678,15 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
 
         poplar::Executable exec = poplar::compileGraph(
             resources.main_graph, progs, opts, progress_logging);
+
+        if (poplarExecutor->HaveExecutableCache()) {
+          if (!poplarExecutor->HaveCachedExecutable(cache_filename)) {
+            TF_RETURN_IF_ERROR(PoplarExecutable::Serialize(
+                cache_filename, exec, resources.annotations.infeed_infos,
+                resources.annotations.outfeed_infos, replication_factor,
+                poplarExecutor->GetReportFlags()));
+          }
+        }
 
         engine.reset(new poplar::Engine(std::move(exec), opts));
 
@@ -708,13 +743,6 @@ StatusOr<std::unique_ptr<Executable>> PoplarCompiler::RunBackend(
       std::move(resources.annotations.outfeed_infos));
 
   executable.reset(poplar_executable);
-
-  if (poplarExecutor->HaveExecutableCache()) {
-    if (!poplarExecutor->HaveCachedExecutable(filename)) {
-      TF_RETURN_IF_ERROR(PoplarExecutable::Serialize(
-          *poplar_executable, filename, poplarExecutor->GetReportFlags()));
-    }
-  }
 
   return std::move(executable);
 }

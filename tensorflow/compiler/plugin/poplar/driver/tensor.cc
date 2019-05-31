@@ -23,6 +23,8 @@ limitations under the License.
 #include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/conversions.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/custom_ops/hlo_poplar_instruction.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/flags.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/mapping_helper.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/matcher_predicates.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
@@ -46,6 +48,7 @@ limitations under the License.
 #include <poplar/OptionFlags.hpp>
 #include <poplar/TensorCloneMethod.hpp>
 #include <poplin/Norms.hpp>
+#include <popops/DynamicSlice.hpp>
 #include <poputil/TileMapping.hpp>
 
 #include <functional>
@@ -58,6 +61,31 @@ namespace xla {
 namespace poplarplugin {
 namespace {
 using TensorVector = std::vector<std::pair<TensorKey, poplar::Tensor>>;
+
+// Adds a tensor which is linearly mapped across the tiles.
+poplar::Tensor AddLinearlyMappedTensor(poplar::Graph& graph,
+                                       const poplar::Type poplar_type,
+                                       const std::vector<std::size_t>& shape,
+                                       const std::string& debug_name) {
+  VLOG(1) << "Allocating a linearly mapped tensor " << debug_name << " "
+          << absl::StrJoin(shape, ", ");
+  poplar::Tensor out = graph.addVariable(poplar_type, shape, debug_name);
+  poputil::mapTensorLinearly(graph, out);
+  return out;
+}
+
+// Adds a tensor which is linearly mapped across the tiles, however the starting
+// tile depends on previous allocations.
+poplar::Tensor AddLinearlyMappedTensorWithOffset(
+    poplar::Graph& graph, const poplar::Type poplar_type,
+    const std::vector<std::size_t>& shape, const std::string& debug_name,
+    CompilerResources& resources) {
+  VLOG(1) << "Allocating a linearly mapped tensor with an offset " << debug_name
+          << " " << absl::StrJoin(shape, ", ");
+  poplar::Tensor out = graph.addVariable(poplar_type, shape, debug_name);
+  MappingHelper::MapTensorLinearly(resources.linear_mapping_state, graph, out);
+  return out;
+}
 
 TensorVector GetTensorsInMap(
     const TensorMap& map, const HloInstruction* inst,
@@ -105,9 +133,8 @@ ArgVector GetTensorsMaybeExpand(
                           std::multiplies<std::size_t>());
 
       if (tiles_used == 1 && num_elements > 1) {
-        poplar::Tensor expanded_tensor = graph.addVariable(
-            tensor.elementType(), tensor_shape, "wide_constant");
-        poputil::mapTensorLinearly(graph, expanded_tensor);
+        auto expanded_tensor = AddLinearlyMappedTensorWithOffset(
+            graph, tensor.elementType(), tensor_shape, "wide_constant", res);
         seq.add(poplar::program::Copy(tensor, expanded_tensor));
         tensor = expanded_tensor;
       }
@@ -204,30 +231,17 @@ poplar::Tensor ConvertFromDeviceLayout(const Shape& shape,
 
 StatusOr<poplar::Tensor> AddPlainTensor(poplar::Graph& graph,
                                         const std::string& debug_name,
-                                        const xla::Shape& shape) {
-  poplar::Tensor out;
+                                        const xla::Shape& shape,
+                                        CompilerResources& resources,
+                                        bool offset) {
   std::vector<std::size_t> dim = PoplarShapeFromXlaShape(shape);
   TF_ASSIGN_OR_RETURN(poplar::Type poplar_type, PoplarDataType(shape));
-
-  out = graph.addVariable(poplar_type, dim, debug_name);
-  poputil::mapTensorLinearly(graph, out);
-  return out;
-}
-
-StatusOr<poplar::Tensor> AddRnnSequence(poplar::Graph& graph,
-                                        const std::string& debug_name,
-                                        const xla::Shape& shape) {
-  poplar::Tensor out;
-  std::vector<std::size_t> dim = PoplarShapeFromXlaShape(shape);
-  TF_ASSIGN_OR_RETURN(poplar::Type poplar_type, PoplarDataType(shape));
-
-  out = graph.addVariable(poplar_type, dim, debug_name);
-
-  for (auto i = 0; i != dim[0]; ++i) {
-    poputil::mapTensorLinearly(graph, out[i]);
+  if (offset) {
+    return AddLinearlyMappedTensorWithOffset(graph, poplar_type, dim,
+                                             debug_name, resources);
+  } else {
+    return AddLinearlyMappedTensor(graph, poplar_type, dim, debug_name);
   }
-
-  return out;
 }
 
 template <typename IIter1, typename IIter2, typename OIter, typename Zipper>
@@ -365,9 +379,31 @@ static StatusOr<poplar::Tensor> ReversePathTransform(
 StatusOr<poplar::Tensor> AddDynamicSliceTensor(
     poplar::Graph& graph, const std::string& debug_name,
     const xla::Shape& shape_xla, const xla::Shape& slice_shape_xla) {
-  poplar::Tensor unused;
-  return AddDynamicSliceTensor(graph, debug_name, shape_xla, slice_shape_xla,
-                               unused);
+  auto input_shape = PoplarShapeFromXlaShape(shape_xla);
+  // Get the dimensions we slice in and the slice sizes.
+  std::vector<size_t> sliced_dims;
+  std::vector<size_t> slice_sizes;
+  for (int i = 0; i < slice_shape_xla.dimensions_size(); i++) {
+    auto slice_dim = slice_shape_xla.dimensions(i);
+    if (slice_dim != input_shape[i]) {
+      sliced_dims.push_back(i);
+      slice_sizes.push_back(slice_dim);
+    }
+  }
+
+  if (sliced_dims.size() == slice_shape_xla.rank()) {
+    // Use the old dynamic slice allocator when we are slicing in all
+    // dimensions.
+    // TODO Remove this special case once T8594 is fixed.
+    poplar::Tensor unused;
+    return AddDynamicSliceTensor(graph, debug_name, shape_xla, slice_shape_xla,
+                                 unused);
+  } else {
+    TF_ASSIGN_OR_RETURN(auto poplar_type, PoplarDataType(shape_xla));
+    return popops::createSliceableTensor(graph, poplar_type, input_shape,
+                                         sliced_dims, slice_sizes, 0,
+                                         debug_name);
+  }
 }
 
 StatusOr<poplar::Tensor> AddDynamicSliceTensor(
@@ -375,6 +411,7 @@ StatusOr<poplar::Tensor> AddDynamicSliceTensor(
     const xla::Shape& shape_xla, const xla::Shape& slice_shape_xla,
     poplar::Tensor& physical_layout) {
   const auto shape = PoplarShapeFromXlaShape(shape_xla);
+  TF_ASSIGN_OR_RETURN(poplar::Type poplar_type, PoplarDataType(shape_xla));
   const auto volume =
       std::accumulate(shape.begin(), shape.end(), std::size_t(1),
                       std::multiplies<std::size_t>());
@@ -382,8 +419,8 @@ StatusOr<poplar::Tensor> AddDynamicSliceTensor(
   // If we are able to compute the sequence_dimension
   const auto sequence_dimension_status = FindSeqDim(shape_xla, slice_shape_xla);
   if (!sequence_dimension_status.ok()) {
-    TF_ASSIGN_OR_RETURN(physical_layout,
-                        AddPlainTensor(graph, debug_name, shape_xla));
+    physical_layout =
+        AddLinearlyMappedTensor(graph, poplar_type, shape, debug_name);
     return physical_layout;
   }
 
@@ -398,21 +435,19 @@ StatusOr<poplar::Tensor> AddDynamicSliceTensor(
   const auto S = shape[sequence_dimension];
   const auto G_status = FindG(D, T);
   if (!G_status.ok()) {
-    TF_ASSIGN_OR_RETURN(physical_layout,
-                        AddPlainTensor(graph, debug_name, shape_xla));
+    physical_layout =
+        AddLinearlyMappedTensor(graph, poplar_type, shape, debug_name);
     return physical_layout;
   }
 
   const auto G = G_status.ValueOrDie();
   if (D == G) {
-    TF_ASSIGN_OR_RETURN(physical_layout,
-                        AddPlainTensor(graph, debug_name, shape_xla));
+    physical_layout =
+        AddLinearlyMappedTensor(graph, poplar_type, shape, debug_name);
     return physical_layout;
   }
 
   // If a value for G was found
-  TF_ASSIGN_OR_RETURN(poplar::Type poplar_type, PoplarDataType(shape_xla));
-
   poplar::Tensor out =
       graph.addVariable(poplar_type, {D / G, S, G}, debug_name);
   physical_layout = out;
@@ -451,7 +486,10 @@ static StatusOr<poplar::Tensor> AddConvolutionInput(
                       GetConvolutionParameters(target, 0, 1));
 
   auto name = StrCat(debug_name, "_input");
-  poplar::OptionFlags opts;
+  poplar::OptionFlags opts = resources.default_conv_options;
+  opts.set("pass",
+           ConvClassificationTypeToString(target, resources.annotations));
+
   poplar::Tensor out = poplin::createInput(graph, params, name, opts,
                                            &resources.convolution_cache);
   return ShuffleConvolutionInputToTensorflow(target, out);
@@ -464,7 +502,10 @@ static StatusOr<poplar::Tensor> AddConvolutionWeights(
                       GetConvolutionParameters(target, 0, 1));
 
   auto name = StrCat(debug_name, "_weights");
-  poplar::OptionFlags opts;
+  poplar::OptionFlags opts = resources.default_conv_options;
+  opts.set("pass",
+           ConvClassificationTypeToString(target, resources.annotations));
+
   poplar::Tensor out = poplin::createWeights(graph, params, name, opts,
                                              &resources.convolution_cache);
 
@@ -634,9 +675,11 @@ static StatusOr<poplar::Tensor> AddLeftMatMul(poplar::Graph& graph,
   b_shape = PoplarRightMatMulShape(b_shape, target->dot_dimension_numbers());
   auto name = StrCat(debug_name, "_lhs");
   poplar::OptionFlags opts;
+  opts.set("fullyConnectedPass",
+           ConvClassificationTypeToString(target, resources.annotations));
 
   auto result = poplin::createMatMulGroupedInputLHS(
-      graph, type, a_shape, b_shape, name, opts, &resources.dot_cache);
+      graph, type, type, a_shape, b_shape, name, opts, &resources.dot_cache);
 
   return BackShapeLeftMatMul(o_shape, result, target->dot_dimension_numbers());
 }
@@ -700,9 +743,11 @@ static StatusOr<poplar::Tensor> AddRightMatMul(poplar::Graph& graph,
   b_shape = PoplarRightMatMulShape(b_shape, target->dot_dimension_numbers());
   auto name = StrCat(debug_name, "_rhs");
   poplar::OptionFlags opts;
+  opts.set("fullyConnectedPass",
+           ConvClassificationTypeToString(target, resources.annotations));
 
   auto result = poplin::createMatMulGroupedInputRHS(
-      graph, type, a_shape, b_shape, name, opts, &resources.dot_cache);
+      graph, type, type, a_shape, b_shape, name, opts, &resources.dot_cache);
   result =
       BackShapeRightMatMul(o_shape, result, target->dot_dimension_numbers());
 
@@ -878,7 +923,8 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
             TF_ASSIGN_OR_RETURN(out, AddDynamicSliceTensor(graph, name, tshape,
                                                            target->shape()));
           } else {
-            TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
+            TF_ASSIGN_OR_RETURN(
+                out, AddPlainTensor(graph, name, tshape, resources, false));
           }
           break;
         }
@@ -888,7 +934,8 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
                 out, AddDynamicSliceTensor(graph, name, tshape,
                                            target->operand(1)->shape()));
           } else {
-            TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
+            TF_ASSIGN_OR_RETURN(
+                out, AddPlainTensor(graph, name, tshape, resources, false));
           }
           break;
         }
@@ -920,7 +967,8 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
             TF_ASSIGN_OR_RETURN(
                 out, AddScatterTensor(graph, name, tshape, slice_shape));
           } else {
-            TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
+            TF_ASSIGN_OR_RETURN(
+                out, AddPlainTensor(graph, name, tshape, resources, false));
           }
           break;
         }
@@ -960,7 +1008,8 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
                   src.first->name().c_str(), name.c_str());
             }
           } else {
-            TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, tshape));
+            TF_ASSIGN_OR_RETURN(out,
+                                AddPlainTensor(graph, name, tshape, resources));
           }
           break;
         }
@@ -986,7 +1035,7 @@ StatusOr<poplar::Tensor> AddTensor(poplar::Graph& graph,
         out, PathTransform(graph, out, tensor_target->second.backward_path));
 
   } else {
-    TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, shape));
+    TF_ASSIGN_OR_RETURN(out, AddPlainTensor(graph, name, shape, resources));
   }
   return out;
 }
@@ -1092,8 +1141,8 @@ StatusOr<poplar::Tensor> AddConstantTensor(poplar::Graph& graph,
   poplar::Tensor tensor;
 
   TF_ASSIGN_OR_RETURN(poplar::Type type, PoplarDataType(literal.shape()));
-
-  if (ShapeUtil::ElementsIn(literal.shape()) > 32) {
+  const bool has_tensor_target = HasTensorAllocationTarget(src, resources);
+  if (has_tensor_target || ShapeUtil::ElementsIn(literal.shape()) > 32) {
     TF_ASSIGN_OR_RETURN(tensor,
                         AddTensor(graph, src, shape, resources, tensor_map));
     switch (literal.shape().element_type()) {
@@ -1479,7 +1528,6 @@ StatusOr<ArgVectors> FindInplaceOutputTensors(TensorMap& map,
   auto inplace_indexes = inplace_description.GetInplaceOperandIndexes();
 
   ArgVectors tensors(inplace_indexes.size());
-
   if (inst->opcode() == HloOpcode::kGetTupleElement) {
     // For GTEs there is only one input, and it is always inplace
     CHECK_EQ(inplace_indexes.size(), 1);
@@ -1494,15 +1542,54 @@ StatusOr<ArgVectors> FindInplaceOutputTensors(TensorMap& map,
     }
   }
 
+  // For tuples, we allow the same instruction to be used as multiple inplace
+  // operands.
+  //
+  // For example:
+  // t = tuple(x, y, x, x, z)
+  // Here x is used thrice, at indices 0, 2 and 3. We therefore allow the first
+  // occurrence (index 0) to be inplace and we add copies for all other
+  // occurrences (index 2 and 3).
+  //
+  // We keep a vector which keeps track whether the tuple inplace
+  // operand at index `i` is used at some other inplace index `j` and therefore
+  // requires a copy.
+  std::vector<bool> tuple_repeated_use(inplace_indexes.size(), false);
+  if (inst->opcode() == HloOpcode::kTuple) {
+    // Go through all the indices, and for operand and index `i`, find all other
+    // occurrences of that operand (set K).
+    // Then we need to do a copy for all operands indices K - {i}.
+
+    // Keep a set of indices which we have already made the decision for.
+    absl::flat_hash_set<int64> visited_indices;
+
+    for (uint64 i = 0; i < inplace_indexes.size(); i++) {
+      if (visited_indices.contains(i)) {
+        continue;
+      }
+      const auto* operand = inst->operand(i);
+      auto indices = inst->OperandIndices(operand);
+      // Add copies for  all operands indices indices - {indices[0]}.
+      for (auto i = 1; i < indices.size(); i++) {
+        tuple_repeated_use[indices[i]] = true;
+      }
+      // Add all the indices to the visited set.
+      absl::c_copy(indices,
+                   std::inserter(visited_indices, visited_indices.end()));
+    }
+  }
+
   // Go through all the inplace tensors and check if we need to add copies.
   for (uint64 i = 0; i < inplace_indexes.size(); i++) {
     for (uint64 tuple_idx = 0; tuple_idx < tensors[i].size(); tuple_idx++) {
       poplar::Tensor t = tensors[i][tuple_idx];
 
       // We need to add a copy before an inplace op if:
-      // 1. inst is not marked as inplace.
-      // 2. inst is inplace read/write type, but t is not ParallelWriteable.
-      bool requires_copy_of_inplace_operand = !is_still_inplace;
+      // 1. inst is not marked as inplace, or
+      // 2. this is a repeated use of the same operand, or
+      // 3. inst is inplace read/write type, but t is not ParallelWriteable.
+      bool requires_copy_of_inplace_operand =
+          !is_still_inplace || tuple_repeated_use[i];
       if (is_inplace_read_write) {
         requires_copy_of_inplace_operand |= !t.isParallelWriteable();
       }
@@ -1541,7 +1628,8 @@ Status AddOutputTensor(TensorMap& map, const HloInstruction* inst, int64 n,
   return Status::OK();
 }
 
-std::string GetTensorMappingJson(const poplar::Graph& graph,
+std::string GetTensorMappingJson(const std::string& module_name,
+                                 const poplar::Graph& graph,
                                  const TensorMaps& tensor_maps) {
   Json::Value mappings;
 
@@ -1550,41 +1638,40 @@ std::string GetTensorMappingJson(const poplar::Graph& graph,
 
     for (auto pair : tm.second) {
       const auto& pop_tensor = pair.second;
-
-      Json::Value tensor;
-      tensor["inst_name"] = Json::Value(pair.first.first);
-      tensor["output_index"] = Json::Value::UInt64(pair.first.second);
-      tensor["constant"] = Json::Value::UInt64(pop_tensor.containsConstant());
-      tensor["has_aliases"] = Json::Value::UInt64(pop_tensor.containsAliases());
-      tensor["tiles"] = Json::Value(Json::arrayValue);
-
       const auto& mapping = graph.getTileMapping(pop_tensor);
-      unsigned tiles_used = 0;
-      size_t total_elements = 0;
+      Json::Value tiles = Json::Value(Json::arrayValue);
 
+      size_t total_elements = 0;
       for (size_t tile_idx = 0; tile_idx < mapping.size(); tile_idx++) {
         const auto& tile = mapping[tile_idx];
-        if (tile.size() != 0) {
-          tiles_used++;
-          size_t tile_element_count = 0;
+        if (tile.size() > 0) {
+          size_t element_count = 0;
           for (const auto& interval : tile) {
-            tile_element_count += interval.size();
+            element_count += interval.size();
           }
+          Json::Value tile_info(Json::arrayValue);
+          tile_info.append(Json::Value::UInt64(tile_idx));
+          tile_info.append(Json::Value::UInt64(element_count));
+          tiles.append(tile_info);
 
-          Json::Value tile;
-          tile["tile_id"] = Json::Value::UInt64(tile_idx);
-          tile["num_intervals"] = Json::Value::UInt64(tile.size());
-          tile["num_elements"] = Json::Value::UInt64(tile_element_count);
-          tile["element_type"] =
-              Json::Value(pop_tensor.elementType().toString());
-          tensor["tiles"].append(tile);
-
-          total_elements += tile_element_count;
+          total_elements += element_count;
         }
       }
 
-      tensor["tiles_used"] = Json::Value::UInt64(tiles_used);
-      tensor["total_elements"] = Json::Value::UInt64(total_elements);
+      Json::Value tensor_shape(Json::arrayValue);
+      for (auto d : pop_tensor.shape()) {
+        tensor_shape.append(Json::Value::UInt64(d));
+      }
+
+      Json::Value tensor(Json::arrayValue);
+      tensor.append(Json::Value(pair.first.first));
+      tensor.append(Json::Value::UInt64(pair.first.second));
+      tensor.append(tensor_shape);
+      tensor.append(Json::Value(pop_tensor.elementType().toString()));
+      tensor.append(Json::Value::UInt64(pop_tensor.containsConstant()));
+      tensor.append(Json::Value::UInt64(pop_tensor.containsAliases()));
+      tensor.append(Json::Value::UInt64(total_elements));
+      tensor.append(tiles);
 
       mappings[tm.first].append(tensor);
     }
@@ -1598,9 +1685,15 @@ std::string GetTensorMappingJson(const poplar::Graph& graph,
   json_builder["commentStyle"] = "None";
   std::string json_msg = Json::writeString(json_builder, root);
 
-  if (VLOG_IS_ON(2)) {
+  if (tensorflow::GetPoplarXlaFlags().executable_cache_path.size() > 0) {
     VLOG(2) << "[Poplar] Dumping tensor mapping";
-    VLOG(2) << json_msg;
+    auto path = tensorflow::GetPoplarXlaFlags().executable_cache_path;
+    auto filename =
+        tensorflow::io::JoinPath(path, module_name + ".tensor_map.json");
+    std::unique_ptr<tensorflow::WritableFile> file;
+    TF_CHECK_OK(tensorflow::Env::Default()->NewWritableFile(filename, &file));
+    TF_CHECK_OK(file->Append(json_msg));
+    TF_CHECK_OK(file->Close());
   }
 
   return json_msg;

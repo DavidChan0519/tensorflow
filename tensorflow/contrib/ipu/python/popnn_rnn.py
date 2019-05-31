@@ -25,6 +25,7 @@ from tensorflow.python.framework import tensor_shape
 from tensorflow.python.layers import base as base_layer
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import init_ops
+from tensorflow.python.ops import rnn_cell
 from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.platform import tf_logging as logging
 
@@ -59,6 +60,7 @@ class PopnnLSTM(base_layer.Layer):
                num_units,
                dtype=dtypes.float32,
                partials_dtype=dtypes.float32,
+               seed=None,
                weights_initializer=None,
                bias_initializer=None,
                name=None):
@@ -69,6 +71,8 @@ class PopnnLSTM(base_layer.Layer):
       dtype: tf.float16 or tf.float32
       partials_dtype: the type used by Popnn to perform partial calculations.
         Either tf.float16 or tf.float32.
+      seed: A Python integer. Used to create the default Glorot uniform
+        initializer weights_initializer.
       weights_initializer: starting value to initialize the weight
         (default is all zeros).
       bias_initializer: starting value to initialize the bias
@@ -88,6 +92,7 @@ class PopnnLSTM(base_layer.Layer):
     self._num_units = num_units
     self._weights_initializer = weights_initializer
     self._bias_initializer = bias_initializer
+    self._seed = seed
     # Init input_size to None, which will be set after build().
     self._input_size = None
     self._saveable = None
@@ -157,8 +162,8 @@ class PopnnLSTM(base_layer.Layer):
     # Create the variables
     with vs.variable_scope(self._scope, reuse=self.built):
       if self._weights_initializer is None:
-        self._weights_initializer = init_ops.constant_initializer(
-            0.0, dtype=self._plain_dtype)
+        self._weights_initializer = init_ops.glorot_uniform_initializer(
+            self._seed, dtype=self._plain_dtype)
       if self._bias_initializer is None:
         self._bias_initializer = init_ops.constant_initializer(
             0.0, dtype=self._plain_dtype)
@@ -180,33 +185,57 @@ class PopnnLSTM(base_layer.Layer):
 
     Args:
       inputs: 3-D tensor with shape [time_len, batch_size, input_size].
-      initial_state: a tuple of tensor of shape [batch_size, num_units]. If
-        not provided, the state is initialized to zeros.
+      initial_state: An `LSTMStateTuple` of state tensors, each shaped
+        `[batch_size, num_units]`. If not provided, the state is
+        initialized to zeros.
+        DEPRECATED a tuple of tensor (input_h_state, input_c_state)
+        each of shape [batch_size, num_units].
       training: whether this operation will be used in training or inference.
 
     Returns:
       output: a tensor of shape [time_len, batch_size, num_units].
-      output_states: a tuple of tensor of the same shape and structure as
-        initial_state.
+      output_states: An `LSTMStateTuple` of the same shape and structure as
+        initial_state. If the initial state used the deprecated behaviour of
+        not passing `LSTMStateTuple`, then a tuple
+        (output_h_state, output_c_state) is returned.
 
     Raises:
-      ValueError: initial_state is not a tuple.
+      ValueError: if initial_state is not valid.
 
     """
-    if initial_state is not None and not isinstance(initial_state, tuple):
-      raise ValueError("Invalid initial_state type: %s, expecting tuple.",
-                       type(initial_state))
+
     dtype = self.dtype
     inputs = ops.convert_to_tensor(inputs, dtype=dtype)
 
     batch_size = array_ops.shape(inputs)[1]
+
+    uses_old_api = False
+    if initial_state is not None and not isinstance(initial_state,
+                                                    rnn_cell.LSTMStateTuple):
+      if isinstance(initial_state, tuple):
+        logging.warning(
+            "Passing a tuple as a `initial_state` to PopnnLSTM is "
+            "deprecated and will be removed in the future. Pass an "
+            "`LSTMStateTuple` instead.")
+        initial_state = rnn_cell.LSTMStateTuple(initial_state[1],
+                                                initial_state[0])
+        uses_old_api = True
+      else:
+        raise ValueError(
+            "Invalid initial_state type: `%s`, expecting "
+            "`LSTMStateTuple`.", type(initial_state))
+
     if initial_state is None:
+      # Create a zero state.
       initial_state = self._zero_state(batch_size)
-    h, c = initial_state
+
+    c, h = initial_state
     h = ops.convert_to_tensor(h, dtype=dtype)
     c = ops.convert_to_tensor(c, dtype=dtype)
     outputs, state = self._forward(inputs, h, c, self.kernel, self.biases,
                                    training)
+    if uses_old_api:
+      state = (state.h, state.c)
     return outputs, state
 
   def state_shape(self, batch_size):
@@ -226,7 +255,7 @@ class PopnnLSTM(base_layer.Layer):
     res = []
     for sp in self.state_shape(batch_size):
       res.append(array_ops.zeros(sp, dtype=self.dtype))
-    return tuple(res)
+    return rnn_cell.LSTMStateTuple(*res)
 
   def _canonical_weight_shape(self, layer):
     """Shapes of Popnn canonical weight tensors for given layer."""
@@ -265,4 +294,4 @@ class PopnnLSTM(base_layer.Layer):
         is_training=training,
         partials_dtype=self._partials_dtype,
         name=self._name)
-    return output, (output_h, output_c)
+    return output, rnn_cell.LSTMStateTuple(output_c, output_h)

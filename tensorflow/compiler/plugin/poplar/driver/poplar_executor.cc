@@ -37,7 +37,9 @@ limitations under the License.
 
 #include "tensorflow/core/common_runtime/dma_helper.h"
 #include "tensorflow/core/lib/io/path.h"
+#include "tensorflow/core/lib/strings/proto_serialization.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
+#include "tensorflow/core/public/version.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/synchronization/mutex.h"
@@ -158,12 +160,11 @@ void ResetXfeedManager(int device_ordinal) {
 }
 
 namespace {
-void ConfigurePoplarXFeedManager(const InfeedInfos& infeed_infos,
-                                 const OutfeedInfos& outfeed_infos,
+void ConfigurePoplarXFeedManager(const OutfeedInfos& outfeed_infos,
                                  int device_ordinal) {
   auto* xfeed_manager = GetXfeedManager(device_ordinal);
   for (const auto& outfeed_info : outfeed_infos) {
-    if (outfeed_info.config == "get_last") {
+    if (outfeed_info.config.mode() == "get_last") {
       const auto& outfeed_shape = outfeed_info.shape;
       if (outfeed_shape.IsTuple()) {
         const auto num_elements = ShapeUtil::TupleElementCount(outfeed_shape);
@@ -171,10 +172,11 @@ void ConfigurePoplarXFeedManager(const InfeedInfos& infeed_infos,
       } else {
         xfeed_manager->outfeed()->set_size(1);
       }
-    } else if (outfeed_info.config == "all") {
+    } else if (outfeed_info.config.mode() == "all") {
       xfeed_manager->outfeed()->set_size(
           PoplarXfeedQueueManager::DEFAULT_QUEUE_SIZE);
     }
+    xfeed_manager->outfeed()->set_queue_name(outfeed_info.config.feed_id());
   }
 
   auto platform =
@@ -198,19 +200,6 @@ Shape GetOutfeedShape(const Shape& output_shape,
   }
 }
 
-void ConnectSeedCallback(poplar::Engine* engine, int replication_factor) {
-  static std::random_device rd;
-  static std::mt19937_64 gen(rd());
-
-  auto callback = [gen, replication_factor](void* ptr) mutable {
-    uint64_t* seedValue = reinterpret_cast<uint64_t*>(ptr);
-    for (int i = 0; i < std::max(replication_factor, 1); ++i) {
-      seedValue[i] = gen();
-    }
-  };
-
-  engine->connectStreamToCallback(GetRandomNumberSeedStream(), callback);
-}
 }  // namespace
 
 PoplarExecutor::TensorControl::TensorControl(size_t size_) {
@@ -230,11 +219,14 @@ PoplarExecutor::PoplarExecutor()
     : ordinal_(0),
       current_engine_(nullptr),
       device_open_(false),
-      poplar_device_(poplar::Device::createCPUDevice()),
       poplar_device_hash_(0),
       hardware_configured_(false),
       thread_pool_(tensorflow::Env::Default(), "poplar_executor_threadpool",
-                   PoplarExecutor::NUM_THREADS) {}
+                   PoplarExecutor::NUM_THREADS) {
+  // TODO should this use the time/ms?
+  static std::random_device rd;
+  seed_gen.seed(rd());
+}
 
 PoplarExecutor::~PoplarExecutor() {}
 
@@ -274,7 +266,7 @@ void PoplarExecutor::ConnectInfeedsToStreamCallback(
   }
 
   for (const auto& infeed_info : infeed_infos) {
-    auto itr = infeed_dataset_iterators_.find(infeed_info.config);
+    auto itr = infeed_dataset_iterators_.find(infeed_info.config.feed_id());
     if (itr == infeed_dataset_iterators_.end()) {
       LOG(FATAL) << "Trying to access an infeed dataset iterator which has not "
                     "been created."
@@ -297,24 +289,16 @@ void PoplarExecutor::ConnectInfeedsToStreamCallback(
 }
 
 void PoplarExecutor::ConnectOutfeedToStreamCallback(
-    se::StreamExecutor* executor, const OutfeedInfos& outfeed_infos,
-    const uint32 replication_factor) {
+    const OutfeedInfos& outfeed_infos, const uint32 replication_factor) {
   for (const auto& outfeed_info : outfeed_infos) {
     const auto& operand_shape = outfeed_info.shape;
     auto flat_shapes = FlattenedXlaShape(operand_shape);
 
-    std::vector<std::pair<Shape, size_t>> shapes_sizes;
-    for (Shape shape : flat_shapes) {
-      Shape output_shape = GetOutfeedShape(shape, replication_factor);
-      int64 size = ShapeUtil::ByteSizeOf(output_shape);
-      shapes_sizes.emplace_back(std::make_pair(output_shape, size));
-    }
+    const bool clear_if_full = outfeed_info.config.mode() == "get_last";
 
-    const bool clear_if_full = outfeed_info.config == "get_last";
-
-    for (unsigned j = 0; j < shapes_sizes.size(); ++j) {
-      const Shape shape = std::get<0>(shapes_sizes[j]);
-      size_t byte_size = std::get<1>(shapes_sizes[j]);
+    for (unsigned j = 0; j < flat_shapes.size(); ++j) {
+      const Shape shape = GetOutfeedShape(flat_shapes[j], replication_factor);
+      size_t byte_size = ShapeUtil::ByteSizeOf(shape);
 
       current_engine_->connectStreamToCallback(
           GetOutfeedCopyHandle(outfeed_info.stream_prefix, j),
@@ -336,13 +320,13 @@ void PoplarExecutor::ConnectOutfeedToStreamCallback(
 }
 
 std::function<void()> PoplarExecutor::CreateInfeedIOThreadFunction(
-    se::StreamExecutor* executor, const InfeedInfos& infeed_infos) {
+    const InfeedInfos& infeed_infos) {
   infeed_thread_cancelled_ = false;
 
   std::vector<InfeedDatasetIterator*> infeed_dataset_iterators;
   infeed_dataset_iterators.reserve(infeed_infos.size());
   for (const auto& infeed_info : infeed_infos) {
-    auto itr = infeed_dataset_iterators_.find(infeed_info.config);
+    auto itr = infeed_dataset_iterators_.find(infeed_info.config.feed_id());
     if (itr == infeed_dataset_iterators_.end()) {
       LOG(FATAL)
           << "Trying to access an infeed context which has not been created."
@@ -387,11 +371,9 @@ std::function<void()> PoplarExecutor::CreateInfeedIOThreadFunction(
   };
 }
 
-void PoplarExecutor::LaunchInfeedThread(
-    perftools::gputools::StreamExecutor* executor,
-    const InfeedInfos& infeed_infos) {
+void PoplarExecutor::LaunchInfeedThread(const InfeedInfos& infeed_infos) {
   std::function<void()> infeed_thread_io_fn =
-      CreateInfeedIOThreadFunction(executor, infeed_infos);
+      CreateInfeedIOThreadFunction(infeed_infos);
   thread_pool_.Schedule(infeed_thread_io_fn);
 }
 
@@ -550,6 +532,20 @@ static bool DeviceConfigurationsEqual(const IpuOptions& a,
   return google::protobuf::util::MessageDifferencer::Equivalent(a, b);
 }
 
+bool PoplarExecutor::HasPoplarDevice() {
+  const bool force_ipu_model = tensorflow::GetPoplarXlaFlags().use_ipu_model;
+  // If the device has not been configured via configure_ipu_system, but we have
+  // requested an IPU model, then we create a CPU device.
+  if (!device_open_ && force_ipu_model) {
+    // Poplar CPU device
+    poplar_device_ = poplar::Device::createCPUDevice();
+    if (poplar_device_.attach()) {
+      device_open_ = true;
+    }
+  }
+  return device_open_;
+}
+
 Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
   if (!DeviceConfigurationsEqual(cfg, current_config_) &&
       hardware_configured_) {
@@ -681,12 +677,6 @@ Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
         if (poplar_device_.attach()) {
           opened = true;
         }
-      } else {
-        // Poplar CPU device
-        poplar_device_ = poplar::Device::createCPUDevice();
-        if (poplar_device_.attach()) {
-          opened = true;
-        }
       }
     }
 
@@ -741,7 +731,7 @@ Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
     VLOG(1) << "Report option: " << opt.first << " = " << opt.second;
   }
 
-  // Cache Target hash
+  // Generate Target hash
   std::vector<int64> poplar_target;
   const auto& target = poplar_device_.getTarget();
   poplar_target.push_back(target.getNumTiles());
@@ -751,6 +741,20 @@ Status PoplarExecutor::ConfigurePoplarDevice(const IpuOptions& cfg) {
   poplar_target.push_back(target.getTilesPerIPU());
   poplar_target.push_back(target.getNumIPUs());
   poplar_target.push_back((unsigned)target.getTargetType());
+
+  // Generate Options hash
+  std::string config_proto_str;
+  tensorflow::SerializeToStringDeterministic(current_config_,
+                                             &config_proto_str);
+  poplar_target.push_back(std::hash<string>()(config_proto_str));
+
+  // Generate compiler hashes
+  poplar_target.push_back(std::hash<string>()(tf_git_version()));
+  poplar_target.push_back(std::hash<string>()(poplar::packageHash()));
+
+  // Get envionment flag hash
+  const auto& flag_string = tensorflow::GetPoplarXlaFlags().as_string;
+  poplar_target.push_back(std::hash<string>()(flag_string));
 
   for (int64 h : poplar_target) {
     poplar_device_hash_ = tensorflow::Hash64Combine(poplar_device_hash_, h);
@@ -776,7 +780,7 @@ std::string PoplarExecutor::CachedExecutableFilename(
 }
 
 bool PoplarExecutor::HaveCachedExecutable(const std::string& filename) const {
-  return false;
+  return tensorflow::Env::Default()->FileExists(filename).ok();
 }
 
 tensorflow::IpuTraceEvent PoplarExecutor::NewTraceEvent() {
@@ -787,12 +791,11 @@ tensorflow::IpuTraceEvent PoplarExecutor::NewTraceEvent() {
   return evt;
 }
 
-void PoplarExecutor::AddCompileBeginEventRecord(const std::string& module_name,
-                                                const std::string& xla_graph) {
+void PoplarExecutor::AddCompileBeginEventRecord(
+    const std::string& module_name) {
   auto evt = NewTraceEvent();
   evt.set_type(tensorflow::IpuTraceEvent::COMPILE_BEGIN);
   evt.mutable_compile_begin()->set_module_name(std::move(module_name));
-  evt.mutable_compile_begin()->set_xla_graph(std::move(xla_graph));
 
   reports_.push_back(evt);
 };
@@ -1406,17 +1409,47 @@ void PoplarExecutor::CreateInfeedDatasetIterator(
     std::unique_ptr<tensorflow::data::IteratorBase> iterator,
     std::unique_ptr<tensorflow::data::IteratorContext> iterator_ctx,
     const std::vector<xla::Shape>& shapes) {
-  auto itr = infeed_dataset_iterators_.find(id);
-  if (itr != infeed_dataset_iterators_.end()) {
-    LOG(FATAL)
-        << "Feed with id='" << id
-        << "' already exists. Consider renaming the feed. The poplar backend "
-           "requires feed ops to have unique names.";
+  if (infeed_dataset_iterators_.contains(id)) {
+    LOG(FATAL) << "Infeed with id='" << id
+               << "' already exists. Consider changing the `feed_name` in "
+                  "IPUInfeedQueue. The Poplar backend requires all infeeds in "
+                  "the same TensorFlow device to have unique names.";
   } else {
     infeed_dataset_iterators_[id] = absl::make_unique<InfeedDatasetIterator>(
         std::move(iterator), std::move(iterator_ctx), shapes);
   }
 }
+
+Status PoplarExecutor::RegisterOutfeeds(const OutfeedInfos& outfeed_infos) {
+  for (auto& outfeed_info : outfeed_infos) {
+    auto outfeed_id = outfeed_info.config.feed_id();
+    if (registered_outfeeds_.contains(outfeed_id)) {
+      return xla::FailedPrecondition(
+          "Outfeed with id='%s' already exists. Consider changing the "
+          "`feed_name` in IPUOutfeedQueue. The Poplar backend requires all "
+          "outfeeds in the same TensorFlow device to have unique names.",
+          outfeed_id.c_str());
+    } else {
+      registered_outfeeds_.insert(outfeed_id);
+    }
+  }
+  return Status::OK();
+}
+
+void PoplarExecutor::ConnectSeedCallback(poplar::Engine* engine,
+                                         int replication_factor) {
+  auto& gen = seed_gen;
+  auto callback = [&gen, replication_factor](void* ptr) mutable {
+    uint64_t* seedValue = reinterpret_cast<uint64_t*>(ptr);
+    for (int i = 0; i < std::max(replication_factor, 1); ++i) {
+      seedValue[i] = gen();
+    }
+  };
+
+  engine->connectStreamToCallback(GetRandomNumberSeedStream(), callback);
+}
+
+void PoplarExecutor::ResetSeed(int seed) { seed_gen.seed(seed); }
 
 StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
     perftools::gputools::StreamExecutor* executor,
@@ -1478,8 +1511,7 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
         executable.OnEngineLoaded();
         current_engine_ = engine;
 
-        ConfigurePoplarXFeedManager(executable.GetInfeedInfos(),
-                                    executable.GetOutfeedInfos(), ordinal_);
+        ConfigurePoplarXFeedManager(executable.GetOutfeedInfos(), ordinal_);
 
       } catch (const std::exception& e) {
         return PoplarExceptionToTensorflowStatus("[Load engine ]", e);
@@ -1519,7 +1551,7 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
           tensorflow::gtl::MakeCleanup([this]() { StopThreadPool(); });
       if (!infeed_infos.empty()) {
         if (!UseSyntheticData()) {
-          LaunchInfeedThread(executor, infeed_infos);
+          LaunchInfeedThread(infeed_infos);
         }
         ConnectInfeedsToStreamCallback(infeed_infos);
       }
@@ -1527,8 +1559,7 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
       const auto& outfeed_infos = executable.GetOutfeedInfos();
       if (!outfeed_infos.empty()) {
         const auto replication_factor = executable.GetReplicationFactor();
-        ConnectOutfeedToStreamCallback(executor, outfeed_infos,
-                                       replication_factor);
+        ConnectOutfeedToStreamCallback(outfeed_infos, replication_factor);
       }
 
       // Run the main engine
@@ -1547,7 +1578,8 @@ StatusOr<se::DeviceMemoryBase> PoplarExecutor::ExecuteEngine(
       if (current_config_.profiling().enable_ipu_trace_events()) {
         std::stringstream report_stream;
         if (current_config_.profiling().enable_execution_trace() > 0) {
-          if (executable.ExecutionCount() == 0) {
+          if (executable.ExecutionCount() == 0 &&
+              !executable.IsLoadedFromCache()) {
             auto graph_profile = current_engine_->getGraphProfile();
             auto exec_profile = current_engine_->getExecutionProfile();
 

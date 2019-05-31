@@ -54,7 +54,9 @@ StatusOr<poplar::Tensor> AddScatterTensor(poplar::Graph& graph,
 
 StatusOr<poplar::Tensor> AddPlainTensor(poplar::Graph& graph,
                                         const std::string& debug_name,
-                                        const xla::Shape& shape);
+                                        const xla::Shape& shape,
+                                        CompilerResources& resources,
+                                        bool offset = true);
 
 StatusOr<poplar::Tensor> AddNormScaleTensor(
     poplar::Graph& graph, const std::string& debug_name,
@@ -167,7 +169,8 @@ OutVector FindExpandedInstructionOutputs(TensorMap& map, CompilerResources& res,
 
 /* Generate a JSON struture describing the tensor mappings
  */
-std::string GetTensorMappingJson(const poplar::Graph& graph,
+std::string GetTensorMappingJson(const std::string& module_name,
+                                 const poplar::Graph& graph,
                                  const TensorMaps& tensor_map);
 
 }  // namespace poplarplugin

@@ -68,13 +68,11 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
     self.assertTrue(cfg.device_config[1].auto_count, 4)
 
     cfg = ipu.utils.create_ipu_config()
-    cfg = ipu.utils.auto_select_ipus(cfg, [4, 4], number_of_replicas=[2, 1])
+    cfg = ipu.utils.auto_select_ipus(cfg, [4, 4])
     self.assertTrue(isinstance(cfg, IpuOptions))
     self.assertTrue(len(cfg.device_config), 2)
     self.assertTrue(cfg.device_config[0].auto_count, 4)
-    self.assertTrue(cfg.device_config[0].num_replicas, 2)
     self.assertTrue(cfg.device_config[1].auto_count, 4)
-    self.assertTrue(cfg.device_config[1].num_replicas, 1)
 
     cfg = ipu.utils.create_ipu_config()
     cfg = ipu.utils.select_ipus(cfg, [2, 3])
@@ -93,16 +91,7 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
     with self.assertRaises(Exception):
       cfg = ipu.utils.create_ipu_config()
-      cfg = ipu.utils.auto_select_ipus(cfg, [4, 4])
       cfg = ipu.utils.select_ipus(cfg, [4, 4])
-
-    with self.assertRaises(Exception):
-      cfg = ipu.utils.create_ipu_config()
-      cfg = ipu.utils.auto_select_ipus(cfg, [4, 4], number_of_replicas=1)
-
-    with self.assertRaises(Exception):
-      cfg = ipu.utils.create_ipu_config()
-      cfg = ipu.utils.select_ipus(cfg, [4, 4], number_of_replicas=1)
 
     with self.assertRaises(Exception):
       cfg = ipu.utils.create_ipu_config(profiling=True, enable_ipu_events=True)
@@ -423,6 +412,28 @@ class ContribIpuOpsTest(test_util.TensorFlowTestCase):
 
       self.assertEqual(num_compiles, 1)
       self.assertEqual(num_executions, 1)
+
+  def testResetSeedTest(self):
+    # This tests that the API can be called - full testing must be performed
+    # on hardware because the IPU_MODEL doesn't have full random number support.
+    with ops.device('cpu'):
+      x = array_ops.placeholder(np.float32, [2, 2])
+
+    with ipu.ops.ipu_scope('/device:IPU:0'):
+      z = math_ops.cast(x, dtype=np.float16)
+
+    cfg = ipu.utils.create_ipu_config(profiling=True)
+    cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
+      result = sess.run(z, {x: [[1., 1.], [1., 1.]]})
+      self.assertAllEqual(result, [[1., 1.], [1., 1.]])
+
+      ipu.utils.reset_ipu_seed(1)
+
+      result = sess.run(z, {x: [[2., 2.], [2., 2.]]})
+      self.assertAllEqual(result, [[2., 2.], [2., 2.]])
 
 
 if __name__ == "__main__":

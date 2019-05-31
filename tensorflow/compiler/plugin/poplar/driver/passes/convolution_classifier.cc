@@ -125,7 +125,7 @@ StatusOr<bool> ConvolutionClassifier::Run(HloModule* module) {
       module->entry_computation()->parameter_instructions().end());
 
   for (const auto& comp : module->computations()) {
-    if (!tensorflow::str_util::StartsWith(comp->name(), "_")) {
+    if (!IsPopOpsFusion(comp)) {
       for (const auto* inst : comp->instructions()) {
         switch (inst->opcode()) {
           case HloOpcode::kConvolution: {
@@ -217,6 +217,13 @@ StatusOr<bool> ConvolutionClassifier::Run(HloModule* module) {
           it.second = ConvClassificationType::BACKPROP_INPUT;
         }
       }
+    }
+  }
+
+  if (VLOG_IS_ON(2)) {
+    for (const auto& it : classification_) {
+      VLOG(2) << it.first->name() << " : "
+              << ConvClassificationTypeToString(it.second);
     }
   }
 

@@ -13,34 +13,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_PASSES_NORM_INPUT_RECOMPUTATION_H_
-#define TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_PASSES_NORM_INPUT_RECOMPUTATION_H_
+#ifndef TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_PASSES_REPLICATION_FACTOR_TO_CONSTANT_H_
+#define TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_PASSES_REPLICATION_FACTOR_TO_CONSTANT_H_
 
 #include "tensorflow/compiler/xla/service/hlo_pass_interface.h"
 
 namespace xla {
-
-class HloModule;
-class HloInstruction;
-
 namespace poplarplugin {
 
-// HLO pass which attempts to find (Group/Batch) Training Norms and the matching
-// inputs to both.
-class NormInputRecomputation : public HloModulePass {
+/**
+ * A Hlo module pass to replace any poplar replication factor custom ops with a
+ * constant. This allows our replication factor to take part in algebriac and
+ * constant optimisations.
+ */
+class ReplicationFactorToConstant : public HloModulePass {
  public:
-  NormInputRecomputation(bool recompute_norm_inputs);
-
-  ~NormInputRecomputation() override = default;
+  ReplicationFactorToConstant(int32 replication_factor);
 
   absl::string_view name() const override {
-    return "non-linearity-recomputation";
-  }
+    return "replication-factor-to-constant";
+  };
 
+  // Run the pass on the given HLO module.  Returns whether it modified the
+  // module.
   StatusOr<bool> Run(HloModule* module) override;
 
  private:
-  bool recompute_norm_inputs_;
+  int32 replication_factor_;
 };
 
 }  // namespace poplarplugin

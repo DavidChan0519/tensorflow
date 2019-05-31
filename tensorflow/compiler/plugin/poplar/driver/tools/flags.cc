@@ -60,7 +60,13 @@ absl::flat_hash_map<std::string, std::string> GetFlagUsage() {
        "Path to a file where the Poplar vertex graph should be saved to. "
        "(path)"},
       {"executable_cache_path", "Path to the executable cache. (path)"},
-  };
+      {"dump_schedule_as_dot", "Dumps the scheduler graph as a dot file."},
+      {"tensor_map_file_path", "Directory for tensor map dump files."},
+      {"fallback_scheduler",
+       "Use the sync list scheduler rather than the default one."},
+      {"add_all_reduce_copies",
+       "EXPERIMENTAL Adds extra copies before performing an all reduce "
+       "operation - can improve compiler performance."}};
   return flag_usage;
 }
 
@@ -100,6 +106,19 @@ void AllocateAndParseFlags() {
   // Path to the executable cache.
   poplar_xla_flags->executable_cache_path = "";
 
+  // Path for tensormap files
+  poplar_xla_flags->tensor_map_file_path = "";
+
+  // Dump the schedule graph as a dot to VLOG.
+  poplar_xla_flags->dump_schedule_as_dot = false;
+
+  // Use the fallback scheduler instead of the default one.
+  poplar_xla_flags->fallback_scheduler = false;
+
+  // TODO T8856 - remove this flag.
+  // Indicates whether to add the copies before the all reduce.
+  poplar_xla_flags->add_all_reduce_copies = false;
+
   auto flag_usage = GetFlagUsage();
 
   std::vector<Flag> flag_list = {
@@ -115,10 +134,21 @@ void AllocateAndParseFlags() {
     ADD_FLAG(save_oom_profiler)
     ADD_FLAG(save_vertex_graph)
     ADD_FLAG(executable_cache_path)
+    ADD_FLAG(dump_schedule_as_dot)
+    ADD_FLAG(tensor_map_file_path)
+    ADD_FLAG(fallback_scheduler)
+    ADD_FLAG(add_all_reduce_copies)
+
 // clang-format on
 #undef ADD_FLAG
   };
   xla::ParseFlagsFromEnvAndDieIfUnknown("TF_POPLAR_FLAGS", flag_list);
+
+  // Store all the flags as a string.
+  poplar_xla_flags->as_string = "";
+  if (const char* flag_buffer = std::getenv("TF_POPLAR_FLAGS")) {
+    poplar_xla_flags->as_string = flag_buffer;
+  }
 }
 
 }  // namespace

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "tensorflow/compiler/plugin/poplar/driver/visitors/deferred_allocation_visitor.h"
 
+#include "google/protobuf/util/message_differencer.h"
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/poplar_executor.h"
@@ -27,7 +28,7 @@ namespace xla {
 namespace poplarplugin {
 
 Status DeferredAllocationVisitor::AllocateInput(const HloInstruction* inst,
-                                                int64 flat_tuple_index,
+                                                const int64 flat_tuple_index,
                                                 const Shape& shape) {
   poplar::Graph& graph =
       GetGraphWithOutputIndex(resources_, inst, flat_tuple_index);
@@ -105,7 +106,7 @@ Status DeferredAllocationVisitor::HandleGetTupleElement(HloInstruction* inst) {
   // First check if there are any deferred allocation - if not we can call the
   // parent class to deal with it.
   for (int64 i = 0; i < shapes.size(); i++) {
-    defer_any_allocations |= DeferAllocation(inst, i);
+    defer_any_allocations |= IsInDeferredAllocationPath(inst, i);
     allocate |= IsDeferredAllocation(inst, i);
   }
 
@@ -121,7 +122,7 @@ Status DeferredAllocationVisitor::HandleGetTupleElement(HloInstruction* inst) {
     const int64 offset =
         InsertIntoTuple(inst->operand(0)->shape(), inst->tuple_index(), 0);
     for (int64 i = 0; i < shapes.size(); i++) {
-      if (!DeferAllocation(inst, i)) {
+      if (!IsInDeferredAllocationPath(inst, i)) {
         // Get the tensor for this shape and assign it as an output.
         auto range = std::make_pair(offset + i, offset + i + 1);
         auto outputs = FindInstructionInputsInRange(
@@ -147,30 +148,46 @@ Status DeferredAllocationVisitor::HandleInfeed(HloInstruction* inst) {
   }
 
   HloInfeedInstruction* infeed = Cast<HloInfeedInstruction>(inst);
+
+  xla::poplarplugin::PoplarFeedConfig infeed_config;
+  infeed_config.ParseFromString(infeed->infeed_config());
   // We allow the same infeed queue to be dequeued multiple times, however
   // we don't support multiple infeed queues in the same program.
   if (absl::c_any_of(resources_.annotations.infeed_infos,
                      [&](const FeedInfo& info) {
-                       return info.config != infeed->infeed_config();
+                       return info.config.feed_id() != infeed_config.feed_id();
                      })) {
     return xla::FailedPrecondition(
         "Currently multiple IPUInfeedQueue in the same program are not "
         "supported.");
   }
+
+  // Check that the replication factor matches.
+  if (resources_.replication_factor != infeed_config.replication_factor()) {
+    return xla::FailedPrecondition(
+        "Current program has been created with replication_factor %d, however "
+        "the IPUInfeedQueue has been configured with replication_factor %d. "
+        "Either reduce the number of IPUs in your TensorFlow device, or set "
+        "the `replication_factor` to %d when creating IPUInfeedQueue.",
+        resources_.replication_factor, infeed_config.replication_factor(),
+        resources_.replication_factor);
+  }
+
   std::vector<Shape> shapes = FlattenedXlaShape(infeed->infeed_shape());
   for (int64 i = 0; i < shapes.size(); i++) {
-    if (!DeferAllocation(inst, i)) {
-      TF_RETURN_IF_ERROR(AllocateInput(inst, i, shapes[i]));
-    } else {
+    if (CanDeferAllocation(inst, i)) {
       VLOG(1) << "Deferring allocation of " << inst->name() << " sub tensor "
               << i << ".";
+      DeferAllocation(inst, i);
+    } else {
+      TF_RETURN_IF_ERROR(AllocateInput(inst, i, shapes[i]));
     }
   }
   has_infeed_ = true;
 
   FeedInfo info;
   info.stream_prefix = infeed->name();
-  info.config = infeed->infeed_config();
+  info.config = infeed_config;
   info.shape = infeed->shape();
 
   resources_.annotations.infeed_infos.push_back(info);
@@ -179,7 +196,8 @@ Status DeferredAllocationVisitor::HandleInfeed(HloInstruction* inst) {
 }
 
 StatusOr<poplar::Tensor> DeferredAllocationVisitor::PostProcessInfeedAllocation(
-    const HloInstruction* inst, int64 flat_tuple_index, poplar::Tensor tensor) {
+    const HloInstruction* inst, const int64 flat_tuple_index,
+    poplar::Tensor tensor) {
   poplar::Graph& master_graph = GetMasterGraph(resources_);
   if (!UseSyntheticData()) {
     poplar::Tensor master_tensor = tensor;
@@ -202,20 +220,40 @@ StatusOr<poplar::Tensor> DeferredAllocationVisitor::PostProcessInfeedAllocation(
   return tensor;
 }
 
-bool DeferredAllocationVisitor::DeferAllocation(const HloInstruction* inst,
-                                                int64 flat_tuple_index) {
-  return resources_.annotations.deferred_allocations.contains(
+bool DeferredAllocationVisitor::CanDeferAllocation(
+    const HloInstruction* inst, const int64 flat_tuple_index) {
+  auto deferred_allocations = resources_.annotations.deferred_allocations;
+  return deferred_allocations[inst->parent()].contains(
       std::make_pair(inst, flat_tuple_index));
 }
 
-bool DeferredAllocationVisitor::IsDeferredAllocation(const HloInstruction* inst,
-                                                     int64 flat_tuple_index) {
+void DeferredAllocationVisitor::DeferAllocation(const HloInstruction* inst,
+                                                const int64 flat_tuple_index) {
+  auto& deferred_allocations = resources_.annotations.deferred_allocations;
   auto& tensor_allocation_map = resources_.annotations.tensor_allocation_map;
-  auto itr = tensor_allocation_map.find(std::make_pair(inst, flat_tuple_index));
-  if (itr != tensor_allocation_map.end()) {
-    return itr->second.deferred_allocations_path.size() > 0;
-  }
-  return false;
+
+  // Get the source and target for the allocation.
+  auto deferred_allocation_source = deferred_allocations[inst->parent()].at(
+      std::make_pair(inst, flat_tuple_index));
+  auto& tensor_target = tensor_allocation_map.at(deferred_allocation_source);
+  // Add the path so that we don't try to access the tensor which has not yet
+  // been allocated.
+  instructions_in_deferred_allocation_paths.insert(
+      tensor_target.deferred_allocations_path.begin(),
+      tensor_target.deferred_allocations_path.end());
+  deferred_allocation_sources.insert(deferred_allocation_source);
+}
+
+bool DeferredAllocationVisitor::IsInDeferredAllocationPath(
+    const HloInstruction* inst, const int64 flat_tuple_index) {
+  return instructions_in_deferred_allocation_paths.contains(
+      std::make_pair(inst, flat_tuple_index));
+}
+
+bool DeferredAllocationVisitor::IsDeferredAllocation(
+    const HloInstruction* inst, const int64 flat_tuple_index) {
+  return deferred_allocation_sources.contains(
+      std::make_pair(inst, flat_tuple_index));
 }
 
 }  // namespace poplarplugin

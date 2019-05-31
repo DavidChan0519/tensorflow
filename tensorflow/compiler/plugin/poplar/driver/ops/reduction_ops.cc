@@ -6,6 +6,7 @@
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/flags.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/plugin/poplar/driver/vertex_templates.h"
 
@@ -14,6 +15,7 @@
 #include "tensorflow/compiler/xla/service/hlo_query.h"
 #include "tensorflow/compiler/xla/window_util.h"
 
+#include <poplar/TensorCloneMethod.hpp>
 #include <popnn/Pooling.hpp>
 #include <popnn/PoolingDef.hpp>
 #include <popops/Cast.hpp>
@@ -21,6 +23,7 @@
 #include <popops/ElementWise.hpp>
 #include <popops/Pad.hpp>
 #include <popops/Reduce.hpp>
+#include <poputil/TileMapping.hpp>
 
 using ::absl::StrCat;
 
@@ -336,8 +339,23 @@ StatusOr<poplar::program::Program> CreateSimpleReduction(
       reduction_dims.push_back(d);
     }
 
-    poplar::Tensor out = popops::reduce(graph, to_reduce, reduction_dims, op,
-                                        seq, GetDebugName(inst));
+    TF_ASSIGN_OR_RETURN(auto type, PoplarDataType(inst->shape()));
+    const auto shape = PoplarShapeFromXlaShape(inst->shape());
+    out = graph.addVariable(type, shape, GetDebugName(inst) + "/out");
+
+    const auto to_reduce_mapping = graph.getTileMapping(to_reduce);
+    std::vector<unsigned> tiles;
+    for (auto i = 0ul; i < to_reduce_mapping.size(); ++i) {
+      if (!to_reduce_mapping[i].empty()) {
+        tiles.push_back(i);
+      }
+    }
+
+    // Map the reduce output to the same number of tiles
+    poputil::mapTensorLinearly(
+        graph, out, 0, std::max<unsigned>(1, out.numElements() / tiles.size()));
+    popops::reduceWithOutput(graph, to_reduce, out, reduction_dims, op, seq,
+                             GetDebugName(inst));
 
     // Apply initial value
     Literal identity_literal = GetIdentityConstantLiteral(root, inst);
@@ -931,6 +949,14 @@ StatusOr<poplar::program::Program> CreateReplicatedAllReduce(
         return input_tensors[idx].flatten();
       });
       auto t = poplar::concat(flat_tensors);
+      if (tensorflow::GetPoplarXlaFlags().add_all_reduce_copies) {
+        // TODO T8856 - remove this flag.
+        auto t_cloned = res.replicated_graph->clone(
+            t, GetDebugName(inst) + "/Copy",
+            poplar::TensorCloneMethod::CREATE_NEW_ORDER);
+        seq.add(poplar::program::Copy(t, t_cloned));
+        t = t_cloned;
+      }
 
       // Replicated sum the concatenated tensor
       auto out = popops::replicatedAllReduce(
