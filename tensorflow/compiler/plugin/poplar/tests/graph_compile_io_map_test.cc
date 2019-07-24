@@ -73,7 +73,6 @@ main {
 
   IpuOptions opts;
   auto* p = static_cast<PoplarPlatform*>(platform);
-  EXPECT_TRUE(p->ConfigurePoplarDevices(opts).ok());
 
   PoplarCompiler compiler;
 
@@ -123,7 +122,6 @@ main {
 
   IpuOptions opts;
   auto* p = static_cast<PoplarPlatform*>(platform);
-  EXPECT_TRUE(p->ConfigurePoplarDevices(opts).ok());
 
   PoplarCompiler compiler;
 
@@ -174,7 +172,6 @@ main {
 
   IpuOptions opts;
   auto* p = static_cast<PoplarPlatform*>(platform);
-  EXPECT_TRUE(p->ConfigurePoplarDevices(opts).ok());
 
   PoplarCompiler compiler;
 
@@ -235,7 +232,6 @@ main {
 
   IpuOptions opts;
   auto* p = static_cast<PoplarPlatform*>(platform);
-  EXPECT_TRUE(p->ConfigurePoplarDevices(opts).ok());
 
   PoplarCompiler compiler;
 
@@ -300,7 +296,6 @@ main {
 
   IpuOptions opts;
   auto* p = static_cast<PoplarPlatform*>(platform);
-  EXPECT_TRUE(p->ConfigurePoplarDevices(opts).ok());
 
   PoplarCompiler compiler;
 
@@ -357,7 +352,6 @@ main {
 
   IpuOptions opts;
   auto* p = static_cast<PoplarPlatform*>(platform);
-  EXPECT_TRUE(p->ConfigurePoplarDevices(opts).ok());
 
   PoplarCompiler compiler;
 
@@ -415,7 +409,6 @@ main {
 
   IpuOptions opts;
   auto* p = static_cast<PoplarPlatform*>(platform);
-  EXPECT_TRUE(p->ConfigurePoplarDevices(opts).ok());
 
   PoplarCompiler compiler;
 
@@ -445,17 +438,17 @@ main {
   EXPECT_FALSE(output_infos[2].IsResourceModified());
   EXPECT_FALSE(output_infos[3].IsResourceModified());
 
-  StreamExecutorMemoryAllocator allocator(platform, {stream_executor});
+  se::StreamExecutorMemoryAllocator allocator(platform, {stream_executor});
 
   se::DeviceMemoryBase buf0 = allocator.Allocate(0, sizeof(float) * 2, false)
                                   .ConsumeValueOrDie()
-                                  .Forget();
+                                  .Release();
   se::DeviceMemoryBase buf1 = allocator.Allocate(0, sizeof(float) * 2, false)
                                   .ConsumeValueOrDie()
-                                  .Forget();
+                                  .Release();
   se::DeviceMemoryBase buf2 = allocator.Allocate(0, sizeof(float) * 2, false)
                                   .ConsumeValueOrDie()
-                                  .Forget();
+                                  .Release();
 
   float b0[2] = {1.0, 2.0};
   stream_executor->SynchronousMemcpyH2D(b0, sizeof(float) * 2, &buf0);

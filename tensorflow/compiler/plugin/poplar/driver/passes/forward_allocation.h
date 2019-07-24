@@ -14,6 +14,7 @@ namespace xla {
 class HloModule;
 class HloComputation;
 class HloInstruction;
+class HloReachabilityMap;
 
 namespace poplarplugin {
 
@@ -26,7 +27,7 @@ class ForwardAllocation : public HloModulePass {
   StatusOr<bool> Run(HloModule* module) override;
 
  private:
-  absl::optional<TensorTarget> CreateForwardAllocationTarget(
+  bool CreateForwardAllocationTarget(
       HloReachabilityMap* reachability_map, HloInstruction* source,
       HloInstruction* target, const int64 input_index,
       HloInstruction* layout_producer, const int64 layout_output_index,
@@ -50,7 +51,7 @@ class ForwardAllocation : public HloModulePass {
 
   TensorAllocationMap& tensor_allocation_map;
   DeferredAllocations& deferred_allocations;
-  const InplaceInstructions& inplace_instructions;
+  TensorsWithLayouts& tensors_with_layout;
 };
 
 }  // namespace poplarplugin

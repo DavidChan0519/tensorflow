@@ -19,8 +19,6 @@ from __future__ import print_function
 # Naive LSTM to learn three-char time steps to one-char mapping
 import numpy as np
 from tensorflow.contrib import ipu
-from tensorflow.contrib.ipu import utils
-from tensorflow.contrib.ipu import popnn_rnn
 from tensorflow.python.platform import googletest
 from tensorflow.python.framework import test_util
 from tensorflow.python.framework import ops
@@ -32,9 +30,7 @@ from tensorflow.python.ops import rnn
 from tensorflow.python.ops import rnn_cell
 from tensorflow.python.ops import variables
 from tensorflow.python.client import session as sl
-from tensorflow.python.platform import test
 from tensorflow.python.training import gradient_descent
-from tensorflow.contrib.ipu import ipu_compiler
 
 dataType = np.float32
 
@@ -47,12 +43,13 @@ lr = 10
 
 
 def _PopnnLSTM(x, h, c, y):
-  lstm_cell = popnn_rnn.PopnnLSTM(
+  lstm_cell = ipu.popnn_rnn.PopnnLSTM(
       num_hidden,
       dtype=dataType,
       weights_initializer=init_ops.zeros_initializer(dtype=dataType),
       bias_initializer=init_ops.zeros_initializer(dtype=dataType))
-  outputs, _ = lstm_cell(x, initial_state=(h, c), training=True)
+  state = rnn_cell.LSTMStateTuple(c, h)
+  outputs, _ = lstm_cell(x, initial_state=state, training=True)
   softmax = nn.softmax_cross_entropy_with_logits_v2(
       logits=outputs[-1], labels=array_ops.stop_gradient(y))
   loss = math_ops.reduce_mean(softmax)
@@ -67,7 +64,7 @@ def _tfLSTM(x, h, c, y):
       forget_bias=0.,
       initializer=init_ops.zeros_initializer(dtype=dataType))
   state = rnn_cell.LSTMStateTuple(c, h)
-  outputs, states = rnn.dynamic_rnn(
+  outputs, _ = rnn.dynamic_rnn(
       lstm_cell, x, dtype=dataType, initial_state=state, time_major=True)
   softmax = nn.softmax_cross_entropy_with_logits_v2(
       logits=outputs[-1], labels=array_ops.stop_gradient(y))
@@ -83,9 +80,10 @@ def _RunLayer(layer_func, x, y):
     pc = array_ops.placeholder(dataType, shape=[batch_size, num_hidden])
     py = array_ops.placeholder(dataType, shape=y.shape)
   with ipu.ops.ipu_scope("/device:IPU:0"):
-    r = ipu_compiler.compile(layer_func, inputs=[px, ph, pc, py])
+    r = ipu.ipu_compiler.compile(layer_func, inputs=[px, ph, pc, py])
 
-  opts = utils.create_ipu_config(profiling=True, use_poplar_text_report=True)
+  opts = ipu.utils.create_ipu_config(
+      profiling=True, use_poplar_text_report=True)
   opts = ipu.utils.set_ipu_model_options(opts, compile_ipu_code=False)
   ipu.utils.configure_ipu_system(opts)
 
@@ -103,7 +101,7 @@ def get_one_hot(a, num_classes):
   return np.squeeze(np.eye(num_classes)[a.reshape(-1)])
 
 
-class LstmSizeTest(test_util.TensorFlowTestCase):
+class LstmTrainingTest(test_util.TensorFlowTestCase):
   # Check that the loss goes down (and is identical to reference version).
   def testTraining(self):
     np.random.seed(42)

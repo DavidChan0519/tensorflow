@@ -14,6 +14,7 @@ py_library(
       "__init__.py",
       "python/autoshard.py",
       "python/autoshard_cnn.py",
+      "python/gradient_accumulation_optimizer.py",
       "python/internal.py",
       "python/ipu_compiler.py",
       "python/ipu_infeed_queue.py",
@@ -21,6 +22,7 @@ py_library(
       "python/ipu_optimizer.py",
       "python/loops.py",
       "python/ops.py",
+      "python/popnn_embedding.py",
       "python/popnn_normalization.py",
       "python/popnn_rnn.py",
       "python/poprand.py",
@@ -57,6 +59,19 @@ tf_py_test(
     name = "ops_test",
     size = "small",
     srcs = ["python/tests/ops_test.py"],
+    additional_deps = [
+        ":ipu",
+        ":test_util",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:framework_test_lib",
+        "//tensorflow/python:layers",
+    ],
+)
+
+tf_py_test(
+    name = "embedding_lookup_test",
+    size = "medium",
+    srcs = ["python/tests/embedding_lookup_test.py"],
     additional_deps = [
         ":ipu",
         ":test_util",
@@ -152,6 +167,24 @@ tf_py_test(
 )
 
 tf_py_test(
+    name = "dump_poplar_info",
+    size = "small",
+    srcs = ["python/tests/dump_poplar_info.py"],
+    additional_deps = [
+        ":ipu",
+        ":test_util",
+        "//tensorflow/compiler/plugin/poplar:ipu_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:control_flow_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+    ],
+)
+
+tf_py_test(
     name = "conditional_test",
     size = "small",
     srcs = ["python/tests/conditional_test.py"],
@@ -183,10 +216,24 @@ tf_py_test(
 )
 
 tf_py_test(
-    name = "resnet18_nobn_test",
+    name = "resnet_test",
     size = "large",
     shard_count = 2,
-    srcs = ["size_speed_tests/resnet18_nobn_test.py"],
+    srcs = ["size_speed_tests/resnet_test.py"],
+    additional_deps = [
+        ":ipu",
+        ":test_util",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:framework_test_lib",
+        "//tensorflow/python:layers",
+    ],
+)
+
+tf_py_test(
+    name = "matmul_test",
+    size = "large",
+    shard_count = 3,
+    srcs = ["size_speed_tests/matmul_test.py"],
     additional_deps = [
         ":ipu",
         ":test_util",
@@ -311,7 +358,8 @@ tf_py_test(
 
 tf_py_test(
     name = "infeed_outfeed_test",
-    size = "medium",
+    size = "large",
+    shard_count = 2,
     srcs = ["python/tests/infeed_outfeed_test.py"],
     additional_deps = [
         ":ipu",
@@ -390,12 +438,33 @@ tf_py_test(
     ],
 )
 
+tf_py_test(
+    name = "sharded_and_replicated_test",
+    size = "large",
+    tags = ['exclusive'],
+    srcs = ["python/tests/sharded_and_replicated_test.py"],
+    additional_deps = [
+        ":ipu",
+        ":test_util",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/compiler/plugin/poplar:test_utils_py",
+        "//tensorflow/contrib/compiler:xla",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:platform",
+        "//tensorflow/python:state_ops",
+        "//tensorflow/python:variables",
+    ],
+)
+
 test_suite(
     name = "all_tests",
     tests = [
         "autoshard_cnn_test",
         "case_test",
         "conditional_test",
+        "dump_poplar_info",
+        "embedding_lookup_test",
         "infeed_outfeed_test",
         "mapping_test",
         "multi_ipu_test",
@@ -405,6 +474,7 @@ test_suite(
         "dropout_test",
         "remapping_test",
         "replicated_graph_test",
+        "sharded_and_replicated_test",
         "sharded_inplace_test",
         "sort_op_test",
         "while_loop_perf_test",
@@ -417,7 +487,8 @@ test_suite(
     name = "size_speed_tests",
     tests = [
         "combined_weights_test",
-        "resnet18_nobn_test",
+        "matmul_test",
+        "resnet_test",
         "lstm_size_test",
     ],
 )

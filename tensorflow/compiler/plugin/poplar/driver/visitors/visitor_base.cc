@@ -68,6 +68,10 @@ static std::map<std::string, CustomCallFn> custom_call_map = {
     {"scaled_inplace", CreateScaledInplace},
     {"conv_scaled_inplace", CreateConvScaledInplace},
     {"padding_reduce_window", CreatePaddingReduceWindow},
+    {"implicit_binary", CreateBinaryElementwiseOp},
+    {"implicit_binary_inplace", CreateBinaryElementwiseOp},
+    {"implicit_ternary", CreateTernaryElementwiseOp},
+    {"implicit_ternary_inplace", CreateTernaryElementwiseOp},
 };
 
 BaseVisitor::BaseVisitor(CompilerResources& res) : resources_(res) {}
@@ -100,12 +104,7 @@ Status BaseVisitor::HandleElementwiseBinary(HloInstruction* inst) {
 }
 
 Status BaseVisitor::HandleCompare(HloInstruction* inst) {
-  VLOG(1) << "Processing " << inst->name();
-  TF_ASSIGN_OR_RETURN(
-      poplar::program::Program prog,
-      CreateComparisonOp(resources_, inst, GetOutputShape(inst), tensor_map));
-  sequence.add(prog);
-  return Status::OK();
+  return HandleElementwiseBinary(inst);
 }
 
 Status BaseVisitor::HandleConvert(HloInstruction* inst) {
@@ -132,18 +131,18 @@ Status BaseVisitor::HandleCopy(HloInstruction* inst) {
 
 Status BaseVisitor::HandleClamp(HloInstruction* inst) {
   VLOG(1) << "Processing " << inst->name();
-  TF_ASSIGN_OR_RETURN(
-      poplar::program::Program prog,
-      CreateClampOp(resources_, inst, GetOutputShape(inst), tensor_map));
+  TF_ASSIGN_OR_RETURN(poplar::program::Program prog,
+                      CreateTernaryElementwiseOp(
+                          resources_, inst, GetOutputShape(inst), tensor_map));
   sequence.add(prog);
   return Status::OK();
 }
 
 Status BaseVisitor::HandleSelect(HloInstruction* inst) {
   VLOG(1) << "Processing " << inst->name();
-  TF_ASSIGN_OR_RETURN(
-      poplar::program::Program prog,
-      CreateSelectOp(resources_, inst, GetOutputShape(inst), tensor_map));
+  TF_ASSIGN_OR_RETURN(poplar::program::Program prog,
+                      CreateTernaryElementwiseOp(
+                          resources_, inst, GetOutputShape(inst), tensor_map));
   sequence.add(prog);
   return Status::OK();
 }
@@ -152,7 +151,7 @@ Status BaseVisitor::HandleTupleSelect(HloInstruction* inst) {
   VLOG(1) << "Processing " << inst->name();
   TF_ASSIGN_OR_RETURN(
       poplar::program::Program prog,
-      CreateSelectOp(resources_, inst, GetOutputShape(inst), tensor_map));
+      CreateTupleSelectOp(resources_, inst, GetOutputShape(inst), tensor_map));
   sequence.add(prog);
   return Status::OK();
 }
@@ -435,13 +434,27 @@ Status BaseVisitor::HandleInfeed(HloInstruction* inst) {
 
 Status BaseVisitor::HandleOutfeed(HloInstruction* inst) {
   VLOG(1) << "Processing " << inst->name();
-
-  if (resources_.annotations.outfeed_infos.size() > 1) {
-    return InvalidArgument("Only one outfeed supported per graph");
+  if (resources_.annotations.outfeed_infos.size()) {
+    return InvalidArgument("Only one IPUOutfeedQueue supported per graph.");
   }
 
+  poplar::program::Sequence seq;
+  poplar::Graph& graph = GetGraph(resources_, inst);
+
   HloOutfeedInstruction* outfeed = Cast<HloOutfeedInstruction>(inst);
-  poplar::program::Sequence& seq = sequence;
+  xla::poplarplugin::PoplarFeedConfig outfeed_config;
+  outfeed_config.ParseFromString(outfeed->outfeed_config());
+
+  // Check that the replication factor matches.
+  if (resources_.replication_factor != outfeed_config.replication_factor()) {
+    return xla::FailedPrecondition(
+        "Current program has been created with replication_factor %d, however "
+        "the IPUOutfeedQueue has been configured with replication_factor %d. "
+        "Either reduce the number of IPUs in your TensorFlow device, or set "
+        "the `replication_factor` to %d when creating IPUOutfeedQueue.",
+        resources_.replication_factor, outfeed_config.replication_factor(),
+        resources_.replication_factor);
+  }
 
   // operand 1 is the input
   // operand 2 is the token
@@ -463,17 +476,12 @@ Status BaseVisitor::HandleOutfeed(HloInstruction* inst) {
   } else {
     TF_ASSIGN_OR_RETURN(
         poplar::Tensor in,
-        FindInstructionInput(tensor_map, resources_, inst, 0, sequence));
+        FindInstructionInput(tensor_map, resources_, inst, 0, seq));
     input_tensors.emplace_back(in);
   }
 
   for (unsigned i = 0; i < input_tensors.size(); ++i) {
     poplar::Tensor& in = input_tensors[i];
-    poplar::Graph& graph = GetMasterGraph(resources_);
-
-    if (HasReplicatedGraph(resources_)) {
-      in = graph.getNonReplicatedTensor(in);
-    }
 
     auto fifo = graph.addDeviceToHostFIFO(GetOutfeedCopyHandle(inst->name(), i),
                                           in.elementType(), in.numElements());
@@ -481,12 +489,10 @@ Status BaseVisitor::HandleOutfeed(HloInstruction* inst) {
     seq.add(poplar::program::Copy(in, fifo, false));
   }
 
-  FeedInfo info;
-  info.stream_prefix = outfeed->name();
-  info.config = outfeed->outfeed_config();
-  info.shape = outfeed->operands()[0]->shape();
-
+  FeedInfo info(outfeed->name(), outfeed_config,
+                outfeed->operands()[0]->shape());
   resources_.annotations.outfeed_infos.push_back(info);
+  sequence.add(seq);
 
   return Status::OK();
 }
@@ -578,6 +584,22 @@ Status BaseVisitor::HandleTriangularSolve(HloInstruction* inst) {
 }
 
 Status BaseVisitor::HandleCholesky(HloInstruction* inst) {
+  return Unimplemented(inst);
+}
+
+Status BaseVisitor::HandlePartitionId(HloInstruction* inst) {
+  return Unimplemented(inst);
+}
+
+Status BaseVisitor::HandleRngGetAndUpdateState(HloInstruction* inst) {
+  return Unimplemented(inst);
+}
+
+Status BaseVisitor::HandleCopyStart(HloInstruction* inst) {
+  return Unimplemented(inst);
+}
+
+Status BaseVisitor::HandleCopyDone(HloInstruction* inst) {
   return Unimplemented(inst);
 }
 

@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_XLA_PLUGIN_POPLAR_DRIVER_POPLAR_TRANSFER_MANAGER_H_
 #define TENSORFLOW_COMPILER_XLA_PLUGIN_POPLAR_DRIVER_POPLAR_TRANSFER_MANAGER_H_
 
+#include "absl/synchronization/notification.h"
+
 #include "tensorflow/compiler/xla/service/cpu/xfeed_manager.h"
 #include "tensorflow/compiler/xla/service/generic_transfer_manager.h"
 #include "tensorflow/core/platform/macros.h"
@@ -72,6 +74,12 @@ class PoplarXfeedQueueManager {
   // Sets a maximum size on the fifo the manager owns.
   void set_size(size_t size);
 
+  // Sets the queue name.
+  void set_queue_name(const std::string& name);
+
+  // Gets the queue name.
+  const std::string queue_name() const;
+
   // Returns the number enqueued buffers.
   size_t size() const;
 
@@ -83,7 +91,7 @@ class PoplarXfeedQueueManager {
   size_t WaitForBuffers(size_t num_expected = 1);
 
  private:
-  const string queue_name_;
+  string queue_name_;
 
   mutable tensorflow::mutex mu_;
 
@@ -169,7 +177,7 @@ class PoplarOutfeedBuffer : public cpu::runtime::XfeedBuffer {
   int32 length_;
   StatusOr<Shape> status_;
   void* destination_;
-  tensorflow::Notification done_;
+  absl::Notification done_;
 };
 
 class PoplarTransferManager : public GenericTransferManager {

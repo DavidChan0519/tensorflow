@@ -69,7 +69,7 @@ class NormGraphCachingTest(test_util.TensorFlowTestCase):
       ok = [
           '__seed*', '*OnTileCopy*',
           'vs/conv2d/Conv2D/convolution.*/Conv_1x1/Convolve',
-          'vs/batch_normalization/FusedBatchNorm/batch-norm-inference.*/'
+          'vs/batch_normalization/FusedBatchNorm*/batch-norm-inference.*/'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
@@ -129,21 +129,23 @@ class NormGraphCachingTest(test_util.TensorFlowTestCase):
       # Two BN for forwards (on shards 0 and 1) and two BN for grad
       # (note that we don't cache gradient application)
       ok = [
-          '__seed*', '*OnTileCopy*', 'Copy_',
+          '__seed*',
+          '*OnTileCopy*',
+          'Copy_',
           'vs/conv1/Conv2D/convolution.*/Conv_1x1',
           'vs/conv3/Conv2D/convolution.*/Conv_1x1',
-          'vs/batch_normalization/FusedBatchNorm/batch-norm-training.*/',
-          'vs/batch_normalization_2/FusedBatchNorm/batch-norm-training.*/',
+          'vs/batch_normalization/FusedBatchNorm*/batch-norm-training.*/',
+          'vs/batch_normalization_2/FusedBatchNorm*/batch-norm-training.*/',
           'Sum/reduce.*/ReduceFinalStage/IntermediateToOutput/Reduce',
-          'gradients/vs/batch_normalization_2/FusedBatchNorm_grad/FusedBatchNormGrad/batch-norm-grad.*/',
-          'gradients/vs/batch_normalization_1/FusedBatchNorm_grad/FusedBatchNormGrad/batch-norm-grad.*/',
+          'gradients/vs/batch_normalization_2/FusedBatchNorm*_grad/FusedBatchNormGrad*/batch-norm-grad.*/',
+          'gradients/vs/batch_normalization_1/FusedBatchNorm*_grad/FusedBatchNormGrad*/batch-norm-grad.*/',
           'GradientDescent/update_vs/batch_normalization/',
           'GradientDescent/update_vs/batch_normalization_1/',
           'GradientDescent/update_vs/batch_normalization_2/',
+          'gradients/vs/conv1/Conv2D_grad/Conv2DBackpropFilter/fusion.*/Conv_4x4',
+          'gradients/vs/conv1/Conv2D_grad/Conv2DBackpropFilter/fusion.*/AddTo',
           'gradients/vs/conv3/Conv2D_grad/Conv2DBackpropFilter/fusion.*/Conv_4x4',
           'gradients/vs/conv3/Conv2D_grad/Conv2DBackpropFilter/fusion.*/AddTo',
-          'gradients/vs/conv2/Conv2D_grad/Conv2DBackpropFilter/fusion*/Conv_4x4',
-          'gradients/vs/conv2/Conv2D_grad/Conv2DBackpropFilter/fusion.*/AddTo'
       ]
 
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))

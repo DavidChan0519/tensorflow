@@ -22,33 +22,38 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_POPLAR_EXECUTOR_H_
 #define TENSORFLOW_COMPILER_PLUGIN_POPLAR_DRIVER_POPLAR_EXECUTOR_H_
 
-#include "tensorflow/stream_executor/host/host_stream.h"
-#include "tensorflow/stream_executor/host/host_timer.h"
-
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_annotations.h"
 #include "tensorflow/compiler/plugin/poplar/driver/config.pb.h"
+#include "tensorflow/compiler/plugin/poplar/driver/poplar_feed_config.pb.h"
 #include "tensorflow/compiler/plugin/poplar/driver/poplar_transfer_manager.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/input_output_aliasing_map.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/spsc_outfeed_queue.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/spsc_queue.h"
 #include "tensorflow/compiler/plugin/poplar/driver/trace.pb.h"
 
 #include "tensorflow/compiler/xla/literal.h"
-#include "tensorflow/compiler/xla/service/device_memory_allocator.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/statusor.h"
 
+#include "tensorflow/compiler/xla/statusor.h"
 #include "tensorflow/stream_executor/blas.h"
+#include "tensorflow/stream_executor/device_description.h"
+#include "tensorflow/stream_executor/device_memory_allocator.h"
+#include "tensorflow/stream_executor/host/host_stream.h"
+#include "tensorflow/stream_executor/host/host_timer.h"
 #include "tensorflow/stream_executor/lib/error.h"
-#include "tensorflow/stream_executor/lib/statusor.h"
 #include "tensorflow/stream_executor/rng.h"
 #include "tensorflow/stream_executor/stream_executor.h"
 #include "tensorflow/stream_executor/stream_executor_internal.h"
 
-#include "tensorflow/core/framework/dataset.h"
+#include "tensorflow/core/common_runtime/process_function_library_runtime.h"
+
+#include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/lib/gtl/array_slice.h"
 #include "tensorflow/core/lib/io/path.h"
 
+#include <condition_variable>
 #include <list>
 #include <mutex>
 
@@ -59,6 +64,17 @@ limitations under the License.
 #include <poplar/Tensor.hpp>
 
 namespace se = stream_executor;
+
+namespace tensorflow {
+class TensorBuffer;
+class FunctionLibraryDefinition;
+class ProcessFunctionLibraryRuntime;
+namespace data {
+class IteratorBase;
+class IteratorContext;
+class FunctionHandleCache;
+}  // namespace data
+}  // namespace tensorflow
 
 namespace xla {
 
@@ -111,8 +127,8 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   }
 
   void* Allocate(uint64 size) override;
-  void* AllocateSubBuffer(se::DeviceMemoryBase* mem, uint64 offset_bytes,
-                          uint64 size_bytes) override;
+  void* GetSubBuffer(se::DeviceMemoryBase* mem, uint64 offset_bytes,
+                     uint64 size_bytes) override;
   void Deallocate(se::DeviceMemoryBase* mem) override;
 
   void* HostMemoryAllocate(uint64 size) override { return new char[size]; }
@@ -203,7 +219,8 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
     return false;
   }
 
-  se::DeviceDescription* PopulateDeviceDescription() const override;
+  StatusOr<std::unique_ptr<se::DeviceDescription>> CreateDeviceDescription()
+      const override;
 
   Status EnablePeerAccessTo(StreamExecutorInterface* other) override {
     return Status::OK();
@@ -250,7 +267,10 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   Status ConfigurePoplarDevice(const IpuOptions&);
 
-  const poplar::Device& GetPoplarDevice() const { return poplar_device_; }
+  bool HasPoplarDevice();
+
+  // Requires HasPoplarDevice() to return true.
+  const poplar::Device& GetPoplarDevice() { return poplar_device_; };
 
   const poplar::OptionFlags& GetOptionsFlags() const { return option_flags_; }
 
@@ -302,11 +322,11 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
         .disable_graph_convolution_caching();
   }
 
-  bool NormInputRecomputationEnabled() const {
+  bool InstructionRecomputationEnabled() const {
     // Re-computation of non linearities is enabled by default unless the user
     // has specifically told us not to do it.
-    return current_config_.speed_size_config().has_recompute_norm_inputs()
-               ? current_config_.speed_size_config().recompute_norm_inputs()
+    return current_config_.speed_size_config().has_allow_recompute()
+               ? current_config_.speed_size_config().allow_recompute()
                : false;
   }
 
@@ -318,20 +338,15 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
     return current_config_.retain_control_dependencies();
   }
 
-  int64 GetNumberOfReplicas() const {
-    if (current_config_.device_config_size() > ordinal_) {
-      return current_config_.device_config(ordinal_).num_replicas();
-    } else {
-      return 0;
-    }
-  }
-
   int64 GetMaxAllReduceBufferSize() const {
     return current_config_.max_cross_replica_sum_buffer_size();
   }
 
-  void AddCompileBeginEventRecord(const std::string& module_name,
-                                  const std::string& xla_graph);
+  int64 GetMaxInterIpuCopyBufferSize() const {
+    return current_config_.max_inter_ipu_copies_buffer_size();
+  }
+
+  void AddCompileBeginEventRecord(const std::string& module_name);
 
   void AddCompileEndEventRecord(const std::string& module_name,
                                 const std::string& compilation_report,
@@ -351,7 +366,7 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   StatusOr<se::DeviceMemoryBase> ExecuteEngine(
       se::StreamExecutor* executor, xla::poplarplugin::PoplarExecutable&,
-      xla::DeviceMemoryAllocator* allocator, const Args&);
+      se::DeviceMemoryAllocator* allocator, const Args&);
 
   StatusOr<se::DeviceMemoryBase> GetTupleBufferByIndex(
       const se::DeviceMemoryBase& base, int64 value);
@@ -369,9 +384,21 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   static poplar::DeviceManager& GetDeviceManager();
 
   void CreateInfeedDatasetIterator(
-      const std::string&, std::unique_ptr<tensorflow::data::IteratorBase>,
-      std::unique_ptr<tensorflow::data::IteratorContext>,
+      const PoplarFeedConfig&, std::unique_ptr<tensorflow::data::IteratorBase>&,
+      std::unique_ptr<tensorflow::data::IteratorContext>&,
+      std::unique_ptr<tensorflow::data::FunctionHandleCache>&,
+      std::unique_ptr<tensorflow::FunctionLibraryDefinition>&,
+      std::unique_ptr<tensorflow::ProcessFunctionLibraryRuntime>&,
       const std::vector<xla::Shape>&);
+
+  // Lock the outfeed queue and dequeue all the tensors from a given feed.
+  // Fails if the outfeed with the given name does not exist.
+  std::vector<std::vector<tensorflow::Tensor>> GetTensorsFromOutfeed(
+      const std::string& feed_id);
+
+  Status RegisterOutfeeds(const OutfeedInfos& outfeed_infos);
+
+  void ResetSeed(int seed);
 
  private:
   struct TensorControl {
@@ -435,7 +462,7 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
   class OutputAllocation {
    public:
     virtual se::DeviceMemoryBase GetAllocation(
-        xla::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
+        se::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
         const Args&, const InputOutputAliasingMap::OutputInfo&,
         const ArgsHandleMap&, const int) const = 0;
 
@@ -449,7 +476,7 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
         : constants_(constants) {}
 
     se::DeviceMemoryBase GetAllocation(
-        xla::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
+        se::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
         const Args&, const InputOutputAliasingMap::OutputInfo&,
         const ArgsHandleMap&, const int) const override;
 
@@ -467,7 +494,7 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
           input_output_aliasing_map_(io_map) {}
 
     se::DeviceMemoryBase GetAllocation(
-        xla::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
+        se::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
         const Args&, const InputOutputAliasingMap::OutputInfo&,
         const ArgsHandleMap&, const int) const override;
 
@@ -482,20 +509,20 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
     BufferOutputAllocation(){};
 
     se::DeviceMemoryBase GetAllocation(
-        xla::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
+        se::DeviceMemoryAllocator*, const xla::Shape&, const int64, int64&,
         const Args&, const InputOutputAliasingMap::OutputInfo&,
         const ArgsHandleMap&, const int) const override;
   };
 
   se::DeviceMemoryBase HandleOutputBuffer(
-      xla::DeviceMemoryAllocator* allocator,
+      se::DeviceMemoryAllocator* allocator,
       const OutputAllocation& allocation_info, const xla::Shape& shape,
       const int64 output_index, int64& flat_tensor_index, const Args& args,
       const InputOutputAliasingMap::OutputInfo& output_info);
 
   se::DeviceMemoryBase GetOutputBuffer(
       const xla::poplarplugin::PoplarExecutable& executable,
-      xla::DeviceMemoryAllocator* allocator,
+      se::DeviceMemoryAllocator* allocator,
       const OutputAllocation& allocation_info, const xla::Shape& shape,
       const Args& args, const InputOutputAliasingMap& output_info);
 
@@ -506,6 +533,11 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   // Create a new trace event object
   tensorflow::IpuTraceEvent NewTraceEvent();
+
+  // A function used to connect device to host streams, which only copies data
+  // from the 0th replica and the rest is ignored.
+  void ConnectReplicatedDeviceToHost(const std::string& stream_name,
+                                     TensorControl* tc);
 
   // Functions which move the resource variables to/from the device
   Status MoveDeviceToHost();
@@ -530,29 +562,42 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   // Connect buffers provided by transfer manager to Poplar
   // deviceToHostFIFO()
-  void ConnectOutfeedToStreamCallback(se::StreamExecutor* executor,
-                                      const OutfeedInfos& outfeed_infos,
-                                      const uint32 replication_factor);
-
-  // Creates and launches the thread which will fetch inputs from
-  // the InfeedDatasetIterator and enqueue them in the TransferManager.
-  // The thread is joined when the pointer is deleted.
-  void LaunchInfeedThread(se::StreamExecutor* executor,
-                          const InfeedInfos& infeed_infos);
+  void ConnectOutfeedToStreamCallback(const OutfeedInfos& outfeed_infos);
 
   std::function<void()> CreateInfeedIOThreadFunction(
-      se::StreamExecutor* executor, const InfeedInfos& infeed_infos);
+      const InfeedInfos& infeed_infos);
+  std::function<void()> CreateOutfeedIOThreadFunction(
+      const OutfeedInfos& outfeed_infos);
 
-  // Sets cancellation flags and notifies the threads running in thread_pool_
-  void StopThreadPool();
+  // Creates and launches the threads which send/recieve data from the Poplar
+  // stream callbacks.
+  void LaunchIOThreads(const InfeedInfos& infeed_infos,
+                       const OutfeedInfos& outfeed_infos);
+
+  // Sets cancellation flags and notifies the threads running to stop.
+  void StopIOThreads(const OutfeedInfos& outfeed_infos);
 
   void DeferredDeallocation();
+
+  void ConnectSeedCallback();
 
   int ordinal_;
 
   std::recursive_mutex mutex_;
 
+  std::mutex outfeeds_mutex_;
+
+  std::condition_variable outfeeds_cond_var_;
+
+  std::atomic<bool> infeed_thread_cancelled_;
+
+  std::atomic<bool> outfeed_thread_cancelled_;
+
+  std::atomic<bool> outfeeds_done_;
+
   poplar::Engine* current_engine_;
+
+  int64 current_replication_factor_;
 
   bool device_open_;
 
@@ -579,43 +624,58 @@ class PoplarExecutor : public se::internal::StreamExecutorInterface {
 
   std::list<tensorflow::IpuTraceEvent> reports_;
 
-  std::atomic<bool> infeed_thread_cancelled_;
-
   static const int NUM_THREADS = 1;
-  tensorflow::thread::ThreadPool thread_pool_;
+  tensorflow::thread::ThreadPool infeed_thread_pool_;
+  tensorflow::thread::ThreadPool outfeed_thread_pool_;
 
   struct InfeedDatasetIterator {
+    InfeedDatasetIterator(
+        int64 replication_factor,
+        std::unique_ptr<tensorflow::data::IteratorBase> iterator,
+        std::unique_ptr<tensorflow::data::IteratorContext> iterator_ctx,
+        std::unique_ptr<tensorflow::data::FunctionHandleCache> handle_cache,
+        std::unique_ptr<tensorflow::FunctionLibraryDefinition> flib_def,
+        std::unique_ptr<tensorflow::ProcessFunctionLibraryRuntime> process_flib,
+        const std::vector<xla::Shape>& shapes);
+
     std::unique_ptr<tensorflow::data::IteratorBase> iterator;
     std::unique_ptr<tensorflow::data::IteratorContext> iterator_ctx;
+    std::unique_ptr<tensorflow::data::FunctionHandleCache> handle_cache;
+    std::unique_ptr<tensorflow::FunctionLibraryDefinition> flib_def;
+    std::unique_ptr<tensorflow::ProcessFunctionLibraryRuntime> process_flib;
     const std::vector<xla::Shape> shapes;
 
     using QueueType = SPSCQueue<tensorflow::TensorBuffer*, 2048>;
+    std::vector<std::vector<std::unique_ptr<QueueType>>> tensor_queues;
+  };
 
-    std::vector<std::unique_ptr<QueueType>> tensor_queues;
+  struct OutfeedContext {
+    OutfeedContext(const FeedInfo& outfeed_info);
+    OutfeedContext() = delete;
 
-    InfeedDatasetIterator(
-        std::unique_ptr<tensorflow::data::IteratorBase> iterator,
-        std::unique_ptr<tensorflow::data::IteratorContext> iterator_ctx,
-        const std::vector<xla::Shape>& shapes)
-        : iterator(std::move(iterator)),
-          iterator_ctx(std::move(iterator_ctx)),
-          shapes(std::move(shapes)) {
-      for (uint64 i = 0; i < shapes.size(); i++) {
-        void* ptr = tensorflow::port::AlignedMalloc(sizeof(QueueType), 64);
+    using QueueType = SPSCOutfeedQueue<2048>;
 
-        tensor_queues.emplace_back(
-            new (ptr) QueueType(nullptr, [](tensorflow::TensorBuffer*& buffer) {
-              if (buffer) {
-                buffer->Unref();
-                buffer = nullptr;
-              }
-            }));
-      }
-    }
+    const PoplarFeedConfig config;
+    const std::vector<xla::Shape> shapes;
+    std::vector<tensorflow::DataType> tf_data_types;
+    std::vector<tensorflow::TensorShape> tf_shapes;
+    std::vector<std::vector<std::unique_ptr<QueueType>>>
+        callback_to_io_thread_queues;
+    std::queue<std::vector<tensorflow::Tensor>> io_thread_output_queues;
+    // Mutex to prevent TF CPU op reading from the outfeed whilst we are
+    // executing.
+    // TODO T8971 - this still doesn't help when we do sess.run([graph,
+    // outfeed]) because the outfeed op can execute before the graph op.
+    std::mutex mutex;
   };
 
   absl::flat_hash_map<std::string, std::unique_ptr<InfeedDatasetIterator>>
       infeed_dataset_iterators_;
+
+  absl::flat_hash_map<std::string, std::unique_ptr<OutfeedContext>>
+      outfeed_contexts_;
+
+  std::mt19937_64 seed_gen;
 };
 
 }  // namespace poplarplugin

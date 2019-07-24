@@ -20,11 +20,10 @@ limitations under the License.
 namespace xla {
 namespace poplarplugin {
 
-HloIpuInterCopy::HloIpuInterCopy(HloInstruction* instruction)
-    : HloPoplarInstruction(instruction->shape(), {instruction},
+HloIpuInterCopy::HloIpuInterCopy(absl::Span<HloInstruction* const> operands)
+    : HloPoplarInstruction(GetHloPoplarInstructionShape(operands), operands,
                            GetPoplibsCustomOpTargetString(
-                               PoplibsOp::Poputil, PoplibsOp::IpuInterCopy),
-                           {}) {}
+                               PoplibsOp::Poputil, PoplibsOp::IpuInterCopy)) {}
 
 absl::flat_hash_set<int64> HloIpuInterCopy::AllocatingIndices() const {
   return {};
@@ -40,11 +39,12 @@ bool HloIpuInterCopy::IsPopOpsElementwise() const { return false; }
 std::unique_ptr<HloInstruction> HloIpuInterCopy::CloneWithNewOperandsImpl(
     const Shape& shape, absl::Span<HloInstruction* const> new_operands,
     HloCloneContext* context) const {
-  return CreateIpuInterCopy(new_operands[0]);
+  return CreateIpuInterCopy(new_operands);
 }
 
-std::unique_ptr<HloInstruction> CreateIpuInterCopy(HloInstruction* operand) {
-  return absl::make_unique<HloIpuInterCopy>(operand);
+std::unique_ptr<HloInstruction> CreateIpuInterCopy(
+    absl::Span<HloInstruction* const> operands) {
+  return absl::make_unique<HloIpuInterCopy>(operands);
 }
 
 }  // namespace poplarplugin

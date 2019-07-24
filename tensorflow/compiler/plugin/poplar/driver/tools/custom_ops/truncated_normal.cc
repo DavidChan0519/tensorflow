@@ -21,10 +21,12 @@ namespace xla {
 namespace poplarplugin {
 
 HloTruncatedNormalInstruction::HloTruncatedNormalInstruction(const Shape& shape)
-    : HloPoplarInstruction(shape, {},
-                           GetPoplibsCustomOpTargetString(
-                               PoplibsOp::Poprand, PoplibsOp::TruncatedNormal),
-                           {}) {}
+    : HloPoplarInstruction(
+          shape, {},
+          GetPoplibsCustomOpTargetString(PoplibsOp::Poprand,
+                                         PoplibsOp::TruncatedNormal)) {
+  set_custom_call_has_side_effect(true);
+}
 
 absl::flat_hash_set<int64> HloTruncatedNormalInstruction::AllocatingIndices()
     const {

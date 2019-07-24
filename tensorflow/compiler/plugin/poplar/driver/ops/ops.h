@@ -10,10 +10,10 @@
 
 #include "tensorflow/compiler/xla/service/hlo_instructions.h"
 #include "tensorflow/compiler/xla/service/hlo_opcode.h"
+#include "tensorflow/compiler/xla/statusor.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/gtl/array_slice.h"
-#include "tensorflow/stream_executor/lib/statusor.h"
 
 #include <poplar/Program.hpp>
 #include <poplin/Convolution.hpp>
@@ -41,6 +41,8 @@ namespace poplarplugin {
 struct CompilerResources;
 class SubComputationVisitor;
 
+class PoplarExecutor;
+
 enum class NormType {
   BatchNorm,
   GroupNorm,
@@ -61,7 +63,7 @@ typedef void (*popops_inplace_fn)(poplar::Graph& graph, poplar::Tensor A,
 
 StatusOr<std::shared_ptr<SubComputationVisitor>> GetOrCompileSubComputation(
     CompilerResources& res, const ArgVectors& inputs,
-    const HloComputation* comp, bool inplace_inputs = false,
+    const HloComputation* comp,
     const std::vector<const SubComputationVisitor*>& dependent_subcomputations =
         {});
 
@@ -105,8 +107,7 @@ void SetFlagIfNotPresent(poplar::OptionFlags& opts, const std::string& key,
                          const std::string& value);
 
 // Try and dump the profiler report to a file if a OOM exception occurs.
-void DumpIfPoplarOutOfMemoryAllocationException(
-    poplar::OptionFlags report_options);
+void DumpIfPoplarOutOfMemoryAllocationException(const PoplarExecutor*);
 
 StatusOr<poplin::ConvParams> GetConvolutionParameters(
     const HloInstruction* operand_op, int64 input_index, int64 kernel_index);
@@ -149,6 +150,10 @@ StatusOr<poplar::program::Program> CreateBinaryElementwiseOp(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output, TensorMap& tensor_map);
 
+StatusOr<poplar::program::Program> CreateTernaryElementwiseOp(
+    CompilerResources& res, const HloInstruction* inst,
+    const xla::Shape& output, TensorMap& tensor_map);
+
 StatusOr<poplar::program::Program> CreateComparisonOp(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output, TensorMap& tensor_map);
@@ -182,20 +187,14 @@ StatusOr<poplar::program::Program> CreateMatMulBiasAddOp(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output_shape, TensorMap& tensor_map);
 
-StatusOr<poplar::program::Program> CreateSelectOp(CompilerResources& res,
-                                                  const HloInstruction* inst,
-                                                  const xla::Shape& output,
-                                                  TensorMap& tensor_map);
+StatusOr<poplar::program::Program> CreateTupleSelectOp(
+    CompilerResources& res, const HloInstruction* inst,
+    const xla::Shape& output, TensorMap& tensor_map);
 
 StatusOr<poplar::program::Program> CreateCastOp(CompilerResources& res,
                                                 const HloInstruction* inst,
                                                 const xla::Shape& output,
                                                 TensorMap& tensor_map);
-
-StatusOr<poplar::program::Program> CreateClampOp(CompilerResources& res,
-                                                 const HloInstruction* inst,
-                                                 const xla::Shape& output,
-                                                 TensorMap& tensor_map);
 
 StatusOr<poplar::program::Program> CreateSimpleReduction(
     CompilerResources& res, const HloInstruction* inst,
@@ -338,6 +337,11 @@ StatusOr<poplar::program::Program> CreateWideConstant(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output_shape, TensorMap& tensor_map);
 
+StatusOr<poplar::program::Program> CreateIota(CompilerResources& res,
+                                              const HloInstruction* inst,
+                                              const xla::Shape& output_shape,
+                                              TensorMap& tensor_map);
+
 StatusOr<poplar::program::Program> CreateConditionalOp(
     CompilerResources& res, const HloInstruction* inst,
     const xla::Shape& output, TensorMap& tensor_map);
@@ -399,6 +403,10 @@ StatusOr<poplar::program::Program> CreateNormStatistics(
 
 StatusOr<poplar::program::Program> CreateScatter(
     CompilerResources& res, const HloScatterInstruction* inst,
+    TensorMap& tensor_map);
+
+StatusOr<poplar::program::Sequence> CreateGather(
+    CompilerResources& res, const HloGatherInstruction* inst,
     TensorMap& tensor_map);
 
 /* Optimization tests */

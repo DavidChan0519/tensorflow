@@ -12,7 +12,6 @@ BinaryOpsTest.testS64Comparisons # No S64
 PoolGradTest.testMaxPool # Tests MaxPoolGradGrad
 OutOfMemoryTest.testOutputOutOfMemory # Don't do out of memory yet
 WhileTest.testCountingLoopHandrolledC64 # C64
-CategoricalTest.testSamplingCorrectness # Failing due to input size to poplibs reduction
 Pooling3DTest.testMaxPoolGradValidPadding1_1_3d  # 3D grad_grad
 Pooling3DTest.testMaxPoolGradValidPadding2_1_6_3d  # 3D grad_grad
 Pooling3DTest.testMaxPoolGradValidPadding2_2_3d  # 3D grad_grad
@@ -24,11 +23,9 @@ RandomOpsTest.testTruncatedNormalIsInRange  # Too slow
 RandomOpsTest.testShuffle1d # Need to implement 'sort'
 MatrixBandPartTest  # Too slow
 UnaryOpsTest.testAllTypeOps # Need bitwise reductions
-QrOpTest.testLarge2000x2000 # Assertion in reduction
+QrOpTest # No QR support
 GatherTest.testHigherRank # Bad
 MatrixTriangularSolveOpTest.testBatch # Arithmetic precision?
-XlaOpsTest.testShiftRightLogical # using UINT32
-XlaOpsTest.testShiftRightArithmetic # using UINT32
 EagerTest.testIdentityOnVariable # Copy back from device failing
 EagerTest.testAssignAddVariable
 EagerTest.testReadAssignRead
@@ -47,7 +44,7 @@ AdjustSaturationTest
 ResamplerOpsTest # Don't support the op
 ListDiffTest.testNonOverlapping # no int64 iota
 ListDiffTest.testEmptyY # no int64 iota
-CategoricalTest.testDeterminismMultinomial # No int64 iota
+CategoricalTest.testDeterminismMultinomial # disable until poplar CPU random works
 CumsumTest.test6D # Too long
 CumsumTest.test3D # Too long
 CumprodTest.test6D # Too long
@@ -60,6 +57,7 @@ BinaryOpsTest.testNextAfter # Unsigned int
 SelfAdjointEigOpTest # seg fault
 SvdOpTest # Seg fault
 CondTest.testCondConstPropagation # Switch node in cluster
+CondTest.testCondNoInputs # Switch node in cluster
 SegmentReductionOpsTest.testUnsortedSegmentOps1DIndices1DDataNegativeIndices #Scatter negative indices
 CategoricalTest.testCategoricalIsNotConstant # disable until poplar CPU random works
 CategoricalTest.testStatelessMultinomialIsInRange # No U64
@@ -69,20 +67,43 @@ RandomOpsTest.testTruncatedNormalIsNotConstant # disable until poplar CPU random
 XlaAddNTest # Disable due to variants in lists
 WhileTest.testMap # Disable due to variants in lists
 WhileTest.testMaxItersSimpleV2 # Disable due to variants in lists
-ListOpsTest.testDoNotConstantFoldVariants # Disable due to variants in lists
-ListOpsTest.testElementShape # Disable due to variants in lists
-ListOpsTest.testEmptyTensorListMax # Disable due to variants in lists
-ListOpsTest.testGetSet # Disable due to variants in lists
-ListOpsTest.testGetSetReserved # Disable due to variants in lists
-ListOpsTest.testGetSetReservedNonScalar # Disable due to variants in lists
-ListOpsTest.testListFromTensor # Disable due to variants in lists
-ListOpsTest.testPushInEmptyListWithUnknownElementShape # Disable due to variants in lists
-ListOpsTest.testPushPop # Disable due to variants in lists
-ListOpsTest.testPushPopSeparateLists # Disable due to variants in lists
-ListOpsTest.testSetDoesNotUpdatePushIndex # Disable due to variants in lists
-ListOpsTest.testSetStackReservedUnknownElementShape # Disable due to variants in lists
-ListOpsTest.testStack # Disable due to variants in lists
-ListOpsTest.testStackWithUninitializedTensors # Disable due to variants in lists
+ListOpsTest # Disable due to variants in lists
 StatelessRandomOpsTest.testDeterminism # poplibs CPU mode does not obey seed
 StatelessRandomOpsTest.testRandomUniformIsInRange # poplar CPU model random uniform int doesn't obey limits
 StatelessRandomOpsTest.testTruncatedNormal # Tests float64
+ResizeBilinearTest.test112x112To512x512 # Too slow
+ResizeBilinearTest.test112x112To512x512 # Too slow
+ResizeBilinearTest.test256x48To2048x384 # Too slow
+ResizeBilinearTest.test320x60To2048x384 # Too slow
+ResizeBilinearTest.test448x84To2048x384 # Too slow
+ResizeBilinearTest.test69x69To545x545 # Too slow
+ResizeBilinearTest.test86x86To545x545 # Too slow
+ResizeBilinearTest.test103x103To545x545 # Too slow
+ResizeBilinearTest.test120x120To545x545 # Too slow
+ResizeBilinearTest.test57x57To456x456 # Too slow
+ResizeBilinearTest.test72x72To456x456 # Too slow
+ResizeBilinearTest.test86x86To456x456 # Too slow
+ResizeBilinearTest.test100x100To456x456 # Too slow
+ResizeBilinearTest.test256x256To224x224 # Too slow
+ResizeBilinearTest.test256x256To299x299 # Too slow
+ResizeBilinearGradTest.test100x100To456x456 # Too slow
+ResizeBilinearGradTest.test69x69To545x545 # Too slow
+ResizeBilinearGradTest.test86x86To545x545 # Too slow
+ResizeBilinearGradTest.test103x103To545x545 # Too slow
+ResizeBilinearGradTest.test120x120To545x545 # Too slow
+ResizeBilinearGradTest.test57x57To456x456 # Too slow
+ResizeBilinearGradTest.test72x72To456x456 # Too slow
+ResizeBilinearGradTest.test86x86To456x456 # Too slow
+ResizeBilinearGradTest.test100x100To456x456 # Too slow
+ResizeBilinearGradTest.test112x112To512x512 # Too slow
+CategoricalTest.testEmpty # Integer output
+NonMaxSuppressionTest # Complex reductions
+XlaOpsNumericalTest.testShiftRightLogical # Unsigned int
+XlaOpsNumericalTest.testShiftRightArithmetic  # Unsigned int
+XlaSortOpTest.testTopK_200000
+XlaSortOpTest.testTopKLarge
+XlaSortOpTest.testTopK2D_200000
+XlaSortOpTest.testTopK2DLarge
+XlaSortOpTest.testInTopKLarge
+XlaSortOpTest.testInTopKLarge
+InverseOpTest # matrix inversing

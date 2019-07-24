@@ -29,8 +29,9 @@ namespace poplarplugin {
 namespace {
 // Map from name to the number of the first x operands which are inplace
 static std::map<std::string, uint64> fused_inplace_info_map = {
-    {"conv_biasadd", 1},        {"matmul_biasadd", 1}, {"bias_apply", 1},
-    {"conv_scaled_inplace", 1}, {"scaled_inplace", 1},
+    {"conv_biasadd", 1},   {"matmul_biasadd", 1},
+    {"bias_apply", 1},     {"conv_scaled_inplace", 1},
+    {"scaled_inplace", 1}, {"implicit_binary_inplace", 1},
 };
 
 // Only add a dependency iff `to` was not already reachable from `from`.
@@ -73,23 +74,17 @@ bool IsUsedAsInplace(const HloInstruction* user, const HloInstruction* inst,
   return intersection.size();
 }
 
+bool IsUniqueOperand(HloInstruction* inplace, HloInstruction* inplace_parent) {
+  return inplace->OperandIndices(inplace_parent).size() == 1;
+}
+
 bool IsNotDependencyOfPeers(HloInstruction* inplace,
                             HloInstruction* inplace_parent,
                             HloReachabilityMap* reachability_map,
                             std::vector<HloInstruction*>& added_dependencies) {
   for (auto* peer : inplace_parent->users()) {
     if (peer == inplace) {
-      unsigned int num_uses = 0;
-      for (auto* operand : inplace->operands()) {
-        if (operand == inplace_parent) {
-          num_uses++;
-        }
-      }
-      if (num_uses > 1) {
-        return false;
-      } else {
-        continue;
-      }
+      continue;
     }
     if (reachability_map->IsReachable(inplace, peer)) {
       return false;
@@ -152,6 +147,12 @@ bool IsInplaceReadWrite(HloInstruction* inst,
   // Go trough all the inplace operands.
   for (auto op_idx : inplace_desc.GetInplaceOperandIndexes()) {
     HloInstruction* op = inst->mutable_operand(op_idx);
+    // Apart from tuples, we expect all the inplace operands to be only used
+    // once as an operand.
+    if (inst->opcode() != HloOpcode::kTuple && !IsUniqueOperand(inst, op)) {
+      is_inplace = false;
+      break;
+    }
     // Verify that inplace is not a dependency of any of the peers (cond 2).
     if (!IsNotDependencyOfPeers(inst, op, reachability_map,
                                 added_dependencies)) {
@@ -173,8 +174,7 @@ bool IsInplaceReadWrite(HloInstruction* inst,
 // the current reachability graph.
 bool IsInplaceReadOnly(HloInstruction* inst,
                        HloReachabilityMap* reachability_map,
-                       InplaceWorkList& worklist,
-                       const InplaceInstructions& inplace_instructions) {
+                       InplaceWorkList& worklist) {
   // For read only instructions, not only do we need to consider whether `inst`
   // is inplace read/only, but we also need to consider the indirect source of
   // inst and all the indirect consumers of it.
@@ -288,7 +288,7 @@ bool IsInplaceReadOnly(HloInstruction* inst,
           to_visit.push(user);
         } else if (IsUsedAsInplace(user, node,
                                    HloInstructionType::kInplaceReadWrite) &&
-                   inplace_instructions.contains(user)) {
+                   IsUsedInplace(user)) {
           // If a kInplaceReadWrite user is using the current node as an inplace
           // input and the user is actually inplace, then add it to
           // inplace_read_write_users.
@@ -404,6 +404,7 @@ HloInstructionDescription::HloInstructionDescription(
     case HloOpcode::kSubtract:
     case HloOpcode::kAnd:
     case HloOpcode::kOr:
+    case HloOpcode::kXor:
     case HloOpcode::kShiftLeft:
     case HloOpcode::kShiftRightArithmetic:
     case HloOpcode::kShiftRightLogical:
@@ -562,8 +563,7 @@ HloInstructionDescription::HloInstructionDescription(
     case HloOpcode::kRoundNearestAfz:
     case HloOpcode::kSelect:
     case HloOpcode::kSelectAndScatter:
-    case HloOpcode::kTupleSelect:
-    case HloOpcode::kXor: {
+    case HloOpcode::kTupleSelect: {
       type_ = HloInstructionType::kNotInplace;
       break;
     }
@@ -635,10 +635,9 @@ const std::string HloInstructionDescription::ToString() const {
   return str_stream.str();
 }
 
-bool HloInstructionDescription::IsInplace(
-    HloInstruction* inst, HloReachabilityMap* reachability_map,
-    InplaceWorkList& worklist,
-    const InplaceInstructions& inplace_instructions) {
+bool HloInstructionDescription::IsInplace(HloInstruction* inst,
+                                          HloReachabilityMap* reachability_map,
+                                          InplaceWorkList& worklist) {
   auto inst_description = HloInstructionDescription(inst);
   switch (inst_description.GetType()) {
     case HloInstructionType::kInplaceGetTupleElement: {
@@ -648,8 +647,7 @@ bool HloInstructionDescription::IsInplace(
       return IsInplaceReadWrite(inst, reachability_map);
     }
     case HloInstructionType::kInplaceReadOnly: {
-      return IsInplaceReadOnly(inst, reachability_map, worklist,
-                               inplace_instructions);
+      return IsInplaceReadOnly(inst, reachability_map, worklist);
     }
     default: { return false; }
   }

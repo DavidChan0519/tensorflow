@@ -22,6 +22,7 @@ import os
 
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.data.ops import readers
+from tensorflow.python.data.util import structure
 from tensorflow.python.distribute import input_ops
 from tensorflow.python.eager import context
 from tensorflow.python.framework import errors
@@ -198,10 +199,8 @@ class AutoShardDatasetTest(test.TestCase):
 
   @test_util.run_in_graph_and_eager_modes
   def testZip(self):
-    src1 = dataset_ops.Dataset.from_tensor_slices(self._createTFRecordFiles())
-    dataset1 = src1.flat_map(readers.TFRecordDataset)
-    src2 = dataset_ops.Dataset.from_tensor_slices(self._createTextFiles())
-    dataset2 = src2.flat_map(readers.TextLineDataset)
+    dataset1 = readers.TFRecordDataset(self._createTFRecordFiles())
+    dataset2 = readers.TextLineDataset(self._createTextFiles())
 
     dataset = dataset_ops.Dataset.zip((dataset1, dataset2))
     dataset = input_ops.auto_shard_dataset(
@@ -212,10 +211,8 @@ class AutoShardDatasetTest(test.TestCase):
 
   @test_util.run_in_graph_and_eager_modes
   def testConcat(self):
-    src1 = dataset_ops.Dataset.from_tensor_slices(self._createTFRecordFiles())
-    dataset1 = src1.flat_map(readers.TFRecordDataset)
-    src2 = dataset_ops.Dataset.from_tensor_slices(self._createTextFiles())
-    dataset2 = src2.flat_map(readers.TextLineDataset)
+    dataset1 = readers.TFRecordDataset(self._createTFRecordFiles())
+    dataset2 = readers.TextLineDataset(self._createTextFiles())
 
     dataset = dataset1.concatenate(dataset2)
     dataset = input_ops.auto_shard_dataset(
@@ -235,8 +232,7 @@ class AutoShardDatasetTest(test.TestCase):
 
   @test_util.run_in_graph_and_eager_modes
   def testTextLineReader(self):
-    src = dataset_ops.Dataset.from_tensor_slices(self._createTextFiles())
-    dataset = src.flat_map(readers.TextLineDataset)
+    dataset = readers.TextLineDataset(self._createTextFiles())
 
     dataset = input_ops.auto_shard_dataset(
         dataset, self._num_shards, self._shard_index)
@@ -245,8 +241,7 @@ class AutoShardDatasetTest(test.TestCase):
 
   @test_util.run_in_graph_and_eager_modes
   def testTextLineReaderWithFlatMap(self):
-    dataset = dataset_ops.Dataset.from_tensor_slices(self._createTextFiles())
-    dataset = dataset.flat_map(readers.TextLineDataset)
+    dataset = readers.TextLineDataset(self._createTextFiles())
     dataset = input_ops.auto_shard_dataset(
         dataset, self._num_shards, self._shard_index)
 
@@ -254,10 +249,8 @@ class AutoShardDatasetTest(test.TestCase):
 
   @test_util.run_in_graph_and_eager_modes
   def testFixedLengthReaderWithFlatMap(self):
-    dataset = dataset_ops.Dataset.from_tensor_slices(
-        self._createFixedLengthRecordFiles())
-    dataset = dataset.flat_map(
-        lambda f: readers.FixedLengthRecordDataset(f, self._record_bytes))
+    dataset = readers.FixedLengthRecordDataset(
+        self._createFixedLengthRecordFiles(), self._record_bytes)
     dataset = input_ops.auto_shard_dataset(
         dataset, self._num_shards, self._shard_index)
 
@@ -272,9 +265,9 @@ class _TestDataset(dataset_ops.UnaryUnchangedStructureDataset):
     temp_variant_tensor = gen_dataset_ops.prefetch_dataset(
         input_dataset._variant_tensor,
         buffer_size=1,
-        **dataset_ops.flat_structure(self))
+        **self._flat_structure)
     variant_tensor = gen_dataset_ops.model_dataset(
-        temp_variant_tensor, **dataset_ops.flat_structure(self))
+        temp_variant_tensor, **self._flat_structure)
     super(_TestDataset, self).__init__(input_dataset, variant_tensor)
 
 
@@ -283,9 +276,8 @@ class CloneDatasetTest(test.TestCase):
   def _assert_datasets_equal(self, ds1, ds2):
     # First lets assert the structure is the same.
     self.assertTrue(
-        ds1._element_structure.is_compatible_with(ds2._element_structure))
-    self.assertTrue(
-        ds2._element_structure.is_compatible_with(ds1._element_structure))
+        structure.are_compatible(ds1._element_structure,
+                                 ds2._element_structure))
 
     # Now create iterators on both and assert they produce the same values.
     it1 = dataset_ops.make_initializable_iterator(ds1)

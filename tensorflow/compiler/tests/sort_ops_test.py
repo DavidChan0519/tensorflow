@@ -32,7 +32,7 @@ from tensorflow.python.platform import test
 class XlaSortOpTest(xla_test.XLATestCase):
 
   def _assertOpOutputMatchesExpected(self, op, args, expected):
-    with self.cached_session() as session:
+    with self.session() as session:
       with self.test_scope():
         placeholders = [
             array_ops.placeholder(dtypes.as_dtype(arg.dtype), arg.shape)
@@ -74,44 +74,49 @@ class XlaSortOpTest(xla_test.XLATestCase):
                 -np.arange(101, dtype=value_type)
             ])
 
-  def testTopK(self):
-    supported_types = set(
-        [dtypes.bfloat16.as_numpy_dtype, np.float32, np.int32, np.uint32])
+  def _testTopK(self, array_size, k_options, dtype):
+    for x in [np.arange(array_size)]:
+      np.random.shuffle(x)
+      for k in k_options:
+        indices = x.argsort()[::-1][:k]
+
+        def topk(v, k=k):
+          return nn_ops.top_k(v, k=k, sorted=True)
+
+        self._assertOpOutputMatchesExpected(
+            topk, [x.astype(dtype)],
+            expected=[x[indices].astype(dtype), indices])
+
+  def testTopK_200000(self):
+    supported_types = set([np.float32, np.int32, np.uint32])
     for dtype in supported_types.intersection(self.numeric_types):
-      # Use small input size for bfloat16. Otherwise, we'll get duplicate values
-      # after conversion to bfloat16, so the possible resulting index array is
-      # no longer unique.
+      array_size = 200 * 1000
+      k_options = [0, 100, 1000]
+    self._testTopK(array_size, k_options, dtype)
+
+  def testTopK_2000(self):
+    supported_types = set(
+      [dtypes.bfloat16.as_numpy_dtype, np.float32, np.int32, np.uint32])
+    for dtype in supported_types.intersection(self.numeric_types):
+      # Use small input size for 16 bit formats. Otherwise, we'll get duplicate
+      # values after conversion to bfloat16, so the possible resulting index
+      # array is no longer unique.
       if dtype == dtypes.bfloat16.as_numpy_dtype:
         array_size = 20
         k_options = [0, 1, 2, 10, 20]
       else:
-        array_size = 200 * 1000
-        k_options = [0, 1, 2, 10, 20, 100, 1000, 200 * 1000]
-      for x in [np.arange(array_size)]:
-        np.random.shuffle(x)
-        for k in k_options:
-          indices = x.argsort()[::-1][:k]
+        array_size = 2000
+        k_options = [0, 1, 2, 10, 20, 100, 1000]
+    self._testTopK(array_size, k_options, dtype)
 
-          def topk(v, k=k):
-            return nn_ops.top_k(v, k=k, sorted=True)
-
-          self._assertOpOutputMatchesExpected(
-              topk, [x.astype(dtype)],
-              expected=[x[indices].astype(dtype), indices])
-
-  def testTopK2D(self):
-    supported_types = set(
-        [dtypes.bfloat16.as_numpy_dtype, np.float32, np.int32, np.uint32])
+  def testTopKLarge(self):
+    supported_types = set([np.float32, np.int32, np.uint32])
     for dtype in supported_types.intersection(self.numeric_types):
-      # Use small input size for bfloat16. Otherwise, we'll get duplicate values
-      # after conversion to bfloat16, so the possible resulting index array is
-      # no longer unique.
-      if dtype == dtypes.bfloat16.as_numpy_dtype:
-        array_size = 10
-        k_options = [0, 1, 2, 10]
-      else:
-        array_size = 200 * 1000
-        k_options = [0, 1, 2, 10, 20, 100, 1000, 200 * 1000]
+      array_size = 200 * 1000
+      k_options = [200 * 1000]
+      self._testTopK(array_size, k_options, dtype)
+
+  def _testTopK2D(self, array_size, k_options, dtype):
       batch = 16
       for x in [np.arange(batch * array_size)]:
         np.random.shuffle(x)
@@ -127,6 +132,37 @@ class XlaSortOpTest(xla_test.XLATestCase):
               topk, [x.astype(dtype)],
               expected=[expected.astype(dtype), indices])
 
+  def testTopK2D_200000(self):
+    supported_types = set(
+      [np.float32, np.int32, np.uint32])
+    for dtype in supported_types.intersection(self.numeric_types):
+      array_size = 200 * 1000
+      k_options = [0, 100, 1000]
+      self._testTopK2D(array_size, k_options, dtype)
+
+  def testTopK2D_2000(self):
+    supported_types = set(
+      [dtypes.bfloat16.as_numpy_dtype, np.float32, np.int32, np.uint32])
+    for dtype in supported_types.intersection(self.numeric_types):
+      # Use small input size for 16 bit formats. Otherwise, we'll get duplicate
+      # values after conversion to bfloat16, so the possible resulting index
+      # array is no longer unique.
+      if dtype == dtypes.bfloat16.as_numpy_dtype:
+        array_size = 10
+        k_options = [0, 1, 2, 10]
+      else:
+        array_size = 2000
+        k_options = [0, 1, 2, 10, 20, 100, 1000]
+      self._testTopK2D(array_size, k_options, dtype)
+
+  def testTopK2DLarge(self):
+    supported_types = set(
+      [np.float32, np.int32, np.uint32])
+    for dtype in supported_types.intersection(self.numeric_types):
+      array_size = 200 * 1000
+      k_options = [200 * 1000]
+      self._testTopK2D(array_size, k_options, dtype)
+
   def testTopKZeros(self):
     """Tests that positive and negative zeros sort correctly."""
     # Only bfloat16 is implemented.
@@ -134,7 +170,7 @@ class XlaSortOpTest(xla_test.XLATestCase):
     if bfloat16 not in self.numeric_types:
       return
 
-    with self.cached_session() as sess:
+    with self.session() as sess:
       p = array_ops.placeholder(dtypes.bfloat16)
       with self.test_scope():
         topk = nn_ops.top_k(p, k=4)
@@ -152,7 +188,7 @@ class XlaSortOpTest(xla_test.XLATestCase):
     if bfloat16 not in self.numeric_types:
       return
 
-    with self.cached_session() as sess:
+    with self.session() as sess:
       p = array_ops.placeholder(dtypes.bfloat16)
       with self.test_scope():
         topk = nn_ops.top_k(p, k=6)
@@ -166,11 +202,9 @@ class XlaSortOpTest(xla_test.XLATestCase):
               dtype=bfloat16), results[0])
       self.assertEqual(list([2, 1, 0, 4, 5, 3]), list(results[1]))
 
-  def testInTopK(self):
+  def _testInTopK(self, array_size, k_options):
     supported_types = set([np.int32, np.int64])
     for dtype in supported_types.intersection(self.numeric_types):
-      array_size = 200 * 1000
-      k_options = [0, 1, 2, 10, 20, 100, 1000, 200 * 1000]
       batch = 16
       for x in [np.arange(batch * array_size)]:
         np.random.shuffle(x)
@@ -184,10 +218,15 @@ class XlaSortOpTest(xla_test.XLATestCase):
             return nn_ops.in_top_k(predictions, targets, k)
 
           self._assertOpOutputMatchesExpected(
-              in_topk,
-              [x.astype(np.float32), y.astype(dtype)],
-              expected=[expected])
+            in_topk,
+            [x.astype(np.float32), y.astype(dtype)],
+            expected=[expected])
 
+  def testInTopK(self):
+      self._testInTopK(200 * 1000, [0, 1, 2, 10, 20, 100, 1000])
+
+  def testInTopKLarge(self):
+    self._testInTopK(200 * 1000, [200 * 1000])
 
 if __name__ == "__main__":
   test.main()

@@ -28,7 +28,7 @@ tf_proto_library(
       "driver/trace.proto",
     ],
     cc_api_version = 2,
-    default_header = True,
+    make_default_target_header_only = True,
     j2objc_api_version = 1,
 )
 
@@ -37,15 +37,19 @@ xla_proto_library(
     srcs = [
       "driver/backend_config.proto",
       "driver/poplar_executable.proto",
+      "driver/poplar_feed_config.proto",
     ],
-    deps = ["//tensorflow/compiler/xla:xla_data_proto"],
+    deps = [
+      "//tensorflow/compiler/xla:xla_data_proto",
+      "//tensorflow/core:protos_all_cc",
+    ],
 )
 
 tf_proto_library(
     name = "poplibs_ops",
     srcs = ["kernels/poplibs_ops.proto"],
     cc_api_version = 2,
-    default_header = True,
+    make_default_target_header_only = True,
     j2objc_api_version = 1,
 )
 
@@ -73,25 +77,28 @@ cc_library(
     srcs = [
         "driver/passes/allocation_finder.cc",
         "driver/passes/casts_elimination.cc",
-        "driver/passes/combine_all_reduce.cc",
+        "driver/passes/combine_instructions.cc",
         "driver/passes/commutative_instruction_reorder_operands.cc",
         "driver/passes/computation_flattener.cc",
         "driver/passes/constant_slice_folding.cc",
         "driver/passes/convolution_classifier.cc",
         "driver/passes/custom_op_replacer.cc",
         "driver/passes/dependency_replacer.cc",
+        "driver/passes/elementwise_broadcast_converter.cc",
         "driver/passes/expression_outliner.cc",
         "driver/passes/forward_allocation.cc",
         "driver/passes/fuse_ops_early.cc",
         "driver/passes/fuse_ops_late.cc",
         "driver/passes/fuse_wide_const.cc",
+        "driver/passes/gradient_accumulation_fuser.cc",
         "driver/passes/hlo_computation_name_uniquify.cc",
         "driver/passes/inplace_finder.cc",
         "driver/passes/inplace_util.cc",
         "driver/passes/inter_ipu_copy_inserter.cc",
-        "driver/passes/norm_input_recomputation.cc",
         "driver/passes/not_supported_gather_expander.cc",
         "driver/passes/not_supported_scatter_expander.cc",
+        "driver/passes/recompute_instructions.cc",
+        "driver/passes/replication_factor_to_constant.cc",
         "driver/passes/root_token_replacer.cc",
         "driver/passes/scheduler.cc",
         "driver/passes/sharding_pass.cc",
@@ -106,6 +113,7 @@ cc_library(
 
         # Place HloPoplarInstructionFactory files below here.
         "driver/tools/custom_ops/dropout_hlo.cc",
+        "driver/tools/custom_ops/arg_min_max.cc",
         "driver/tools/custom_ops/group_norm_infer.cc",
         "driver/tools/custom_ops/group_norm_train.cc",
         "driver/tools/custom_ops/group_norm_grad.cc",
@@ -115,9 +123,12 @@ cc_library(
         "driver/tools/custom_ops/onehot.cc",
         "driver/tools/custom_ops/norm.cc",
         "driver/tools/custom_ops/pooling.cc",
+        "driver/tools/custom_ops/print_tensor.cc",
         "driver/tools/custom_ops/relu.cc",
         "driver/tools/custom_ops/remap.cc",
+        "driver/tools/custom_ops/replication_factor.cc",
         "driver/tools/custom_ops/sigmoid.cc",
+        "driver/tools/custom_ops/stateful_gradient_accumulate.cc",
         "driver/tools/custom_ops/stateless_random.cc",
         "driver/tools/custom_ops/tanh.cc",
         "driver/tools/custom_ops/truncated_normal.cc",
@@ -126,35 +137,42 @@ cc_library(
         "driver/tools/hlo_hash.cc",
         "driver/tools/hlo_matcher.cc",
         "driver/tools/input_output_aliasing_map.cc",
+        "driver/tools/instruction_colocator_helper.cc",
         "driver/tools/matcher_predicates.cc",
         "driver/tools/single_hlo_matcher.cc",
         "driver/tools/util.cc",
         "driver/tools/while_loop_util.cc",
-        "driver/schedulers/sync_list_scheduler.cc",
+        "driver/schedulers/ipu_scheduler.cc",
+        "driver/schedulers/look_ahead_scheduler.cc",
+        "driver/schedulers/sync_list_scheduler.cc"
     ],
     hdrs = [
         "driver/compiler_annotations.h",
+        "driver/compiler_information.h",
         "driver/passes/allocation_finder.h",
         "driver/passes/casts_elimination.h",
-        "driver/passes/combine_all_reduce.h",
+        "driver/passes/combine_instructions.h",
         "driver/passes/commutative_instruction_reorder_operands.h",
         "driver/passes/computation_flattener.h",
         "driver/passes/constant_slice_folding.h",
         "driver/passes/convolution_classifier.h",
         "driver/passes/custom_op_replacer.h",
         "driver/passes/dependency_replacer.h",
+        "driver/passes/elementwise_broadcast_converter.h",
         "driver/passes/expression_outliner.h",
         "driver/passes/forward_allocation.h",
         "driver/passes/fuse_ops_early.h",
         "driver/passes/fuse_ops_late.h",
         "driver/passes/fuse_wide_const.h",
+        "driver/passes/gradient_accumulation_fuser.h",
         "driver/passes/hlo_computation_name_uniquify.h",
         "driver/passes/inplace_finder.h",
         "driver/passes/inplace_util.h",
         "driver/passes/inter_ipu_copy_inserter.h",
-        "driver/passes/norm_input_recomputation.h",
         "driver/passes/not_supported_gather_expander.h",
         "driver/passes/not_supported_scatter_expander.h",
+        "driver/passes/recompute_instructions.h",
+        "driver/passes/replication_factor_to_constant.h",
         "driver/passes/root_token_replacer.h",
         "driver/passes/scheduler.h",
         "driver/passes/sharding_pass.h",
@@ -162,6 +180,7 @@ cc_library(
         "driver/passes/while_loop_to_repeat_simplify.h",
         "driver/passes/wide_const_finder.h",
         "driver/tools/classification_predicates.h",
+        "driver/tools/custom_ops/arg_min_max.h",
         "driver/tools/custom_ops/dropout_hlo.h",
         "driver/tools/custom_ops/hlo_poplar_instruction.h",
         "driver/tools/custom_ops/ipu_inter_copy.h",
@@ -169,23 +188,31 @@ cc_library(
         "driver/tools/custom_ops/onehot.h",
         "driver/tools/custom_ops/norm.h",
         "driver/tools/custom_ops/pooling.h",
+        "driver/tools/custom_ops/print_tensor.h",
         "driver/tools/custom_ops/relu.h",
         "driver/tools/custom_ops/remap.h",
+        "driver/tools/custom_ops/replication_factor.h",
         "driver/tools/custom_ops/sigmoid.h",
+        "driver/tools/custom_ops/stateful_gradient_accumulate.h",
         "driver/tools/custom_ops/stateless_random.h",
         "driver/tools/custom_ops/tanh.h",
         "driver/tools/custom_ops/truncated_normal.h",
         "driver/tools/find_all_users.h",
         "driver/tools/flags.h",
+        "driver/tools/hash.h",
         "driver/tools/hlo_hash.h",
         "driver/tools/hlo_matcher.h",
         "driver/tools/input_output_aliasing_map.h",
+        "driver/tools/instruction_colocator_helper.h",
         "driver/tools/matcher_predicates.h",
         "driver/tools/meta_graph.h",
         "driver/tools/single_hlo_matcher.h",
         "driver/tools/util.h",
         "driver/tools/while_loop_util.h",
-        "driver/schedulers/sync_list_scheduler.h",
+        "driver/schedulers/ipu_scheduler.h",
+        "driver/schedulers/look_ahead_scheduler.h",
+        "driver/schedulers/sync_list_scheduler.h"
+
     ],
     deps = [
         ":common",
@@ -202,7 +229,7 @@ cc_library(
         "//tensorflow/compiler/tf2xla:common",
         "//tensorflow/core:framework_headers_lib",
         "//third_party/eigen3",
-        "@protobuf_archive//:protobuf_headers",
+        "@com_google_protobuf//:protobuf_headers",
     ],
 )
 
@@ -221,6 +248,7 @@ cc_library(
         "driver/ops/conv_ops.cc",
         "driver/ops/custom_ops/custom_ops.cc",
         "driver/ops/custom_ops/poplibs_ops.cc",
+        "driver/ops/custom_ops/popnn/arg_min_max.cc",
         "driver/ops/custom_ops/popnn/lstm.cc",
         "driver/ops/custom_ops/popnn/norm.cc",
         "driver/ops/custom_ops/popnn/onehot.cc",
@@ -231,9 +259,13 @@ cc_library(
         "driver/ops/custom_ops/poprand/dropout.cc",
         "driver/ops/custom_ops/poprand/random.cc",
         "driver/ops/custom_ops/poputil/ipu_inter_copy.cc",
+        "driver/ops/custom_ops/poputil/print_tensor.cc",
         "driver/ops/custom_ops/poputil/remap.cc",
+        "driver/ops/custom_ops/poputil/replication_factor.cc",
+        "driver/ops/custom_ops/poputil/stateful_gradient_accumulate.cc",
         "driver/ops/dot_graph_caching.cc",
         "driver/ops/graph_caching_util.cc",
+        "driver/ops/gather_ops.cc",
         "driver/ops/map_ops.cc",
         "driver/ops/maths_ops.cc",
         "driver/ops/norm_graph_caching.cc",
@@ -251,6 +283,9 @@ cc_library(
         "driver/ops/scatter_ops.cc",
         "driver/tensor.cc",
         "driver/tools/conversions.cc",
+        "driver/tools/convolution_preplanning.cc",
+        "driver/tools/data_initializer.cc",
+        "driver/tools/mapping_helper.cc",
         "driver/tools/poplar_util.cc",
         "driver/visitors/deferred_allocation_visitor.cc",
         "driver/visitors/entry_visitor.cc",
@@ -278,7 +313,11 @@ cc_library(
         "driver/poplar_transfer_manager.h",
         "driver/tensor.h",
         "driver/tools/conversions.h",
+        "driver/tools/convolution_preplanning.h",
+        "driver/tools/data_initializer.h",
+        "driver/tools/mapping_helper.h",
         "driver/tools/spsc_queue.h",
+        "driver/tools/spsc_outfeed_queue.h",
         "driver/vertex_templates.h",
         "driver/visitors/deferred_allocation_visitor.h",
         "driver/visitors/entry_visitor.h",
@@ -327,7 +366,7 @@ cc_library(
         "@jsoncpp_git//:jsoncpp",
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_poplar//poplar:poplar_headers",
-        "@protobuf_archive//:protobuf_headers",
+        "@com_google_protobuf//:protobuf_headers",
     ],
     alwayslink = True,
 )
@@ -337,6 +376,7 @@ cc_library(
     srcs = [
         "kernels/datastream/feeds.cc",
         "kernels/ipu_kernels.cc",
+        "kernels/popnn/arg_min_max.cc",
         "kernels/popnn/lstm.cc",
         "kernels/popnn/norm.cc",
         "kernels/popnn/onehot.cc",
@@ -344,10 +384,14 @@ cc_library(
         "kernels/popnn/relu.cc",
         "kernels/popnn/sigmoid.cc",
         "kernels/popnn/tanh.cc",
+        "kernels/poprand/categorical.cc",
         "kernels/poprand/dropout_xla.cc",
         "kernels/poprand/random.cc",
         "kernels/popops/all_reduce.cc",
+        "kernels/poputil/print_tensor.cc",
         "kernels/poputil/remap.cc",
+        "kernels/poputil/replication_factor.cc",
+        "kernels/poputil/stateful_gradient_accumulate.cc",
     ],
     hdrs = [
         "kernels/ipu_kernels_common.h",
@@ -359,9 +403,10 @@ cc_library(
         "//tensorflow/core:framework_headers_lib",
         "//tensorflow/compiler/tf2xla:xla_compiler",
         "//tensorflow/compiler/xla/client/lib:pooling",
+        "//tensorflow/compiler/xla/client/lib:prng",
         "//third_party/eigen3",
         "@jsoncpp_git//:jsoncpp",
-        "@protobuf_archive//:protobuf_headers",
+        "@com_google_protobuf//:protobuf_headers",
     ],
     alwayslink = True,
 )
@@ -459,7 +504,10 @@ tf_custom_op_py_library(
 cc_library(
     name = "poputil_ops",
     srcs = [
+        "ops/poputil/print_tensor.cc",
         "ops/poputil/remap.cc",
+        "ops/poputil/replication_factor.cc",
+        "ops/poputil/stateful_gradient_accumulate.cc",
     ],
     deps = ["//tensorflow/core:framework"],
     alwayslink = True,
@@ -523,6 +571,7 @@ cc_library(
         "//tensorflow/compiler/tf2xla:xla_compiler",
         "//tensorflow/core:framework_headers_lib",
         "//tensorflow/core/kernels:constant_op",
+        "//tensorflow/core/kernels:no_op",
     ],
     linkopts = [
         "$(locations @local_config_poplar//poplar:poplar_lib)",
@@ -549,7 +598,7 @@ cc_library(
         "//tensorflow/compiler/tf2xla:xla_compiler",
         "//tensorflow/core:framework_headers_lib",
         "//third_party/eigen3",
-        "@protobuf_archive//:protobuf_headers",
+        "@com_google_protobuf//:protobuf_headers",
     ],
     linkstatic=1,
     alwayslink = True,
@@ -582,6 +631,19 @@ tf_cc_test(
 tf_cc_test(
     name = "conversions_test",
     srcs = ["tests/conversions_test.cc"],
+    extra_copts = [
+        "-fexceptions",
+    ],
+    deps = [
+        ":poplar_lib",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+    ],
+)
+
+tf_cc_test(
+    name = "allreduce_lookahead_scheduler_test",
+    srcs = ["tests/allreduce_lookahead_scheduler_test.cc"],
     extra_copts = [
         "-fexceptions",
     ],
@@ -718,6 +780,16 @@ tf_cc_test(
 )
 
 tf_cc_test(
+    name = "while_loop_alias_copy_test",
+    srcs = ["tests/while_loop_alias_copy_test.cc"],
+    deps = [
+        ":poplar_lib",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+    ],
+)
+
+tf_cc_test(
     name = "commutative_instruction_reorder_operands_test",
     srcs = ["tests/commutative_instruction_reorder_operands_test.cc"],
     deps = [
@@ -760,8 +832,8 @@ tf_cc_test(
 )
 
 tf_cc_test(
-    name = "combine_all_reduce_test",
-    srcs = ["tests/combine_all_reduce_test.cc"],
+    name = "combine_instructions_test",
+    srcs = ["tests/combine_instructions_test.cc"],
     size = "small",
     deps = [
         ":optimizers",
@@ -778,24 +850,6 @@ tf_cc_test(
         ":optimizers",
         "//tensorflow/compiler/xla/service:hlo_matchers",
         "//tensorflow/compiler/xla/tests:hlo_test_base",
-    ],
-)
-
-tf_cc_test(
-    name = "ipu_outfeed_test",
-    srcs = ["tests/ipu_outfeed_test.cc"],
-    size = "small",
-    extra_copts = [
-        "-fexceptions",
-    ],
-    deps = [
-        ":poplar_lib",
-        ":test_utils",
-        "//tensorflow/compiler/xla/service:hlo_matchers",
-        "//tensorflow/compiler/xla/tests:hlo_test_base",
-        "//tensorflow/compiler/xla/tests:client_library_test_base",
-        "//tensorflow/compiler/xla/tests:local_client_test_base",
-        "//tensorflow/compiler/xla/client/lib:arithmetic",
     ],
 )
 
@@ -945,14 +999,51 @@ tf_cc_test(
 )
 
 tf_cc_test(
-    name = "norm_input_recomputation_test",
-    srcs = ["tests/norm_input_recomputation_test.cc"],
+    name = "recomputation_test",
+    srcs = ["tests/recomputation_test.cc"],
     extra_copts = [
         "-fexceptions",
     ],
     deps = [
         ":poplar_lib",
         "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+    ],
+)
+
+tf_cc_test(
+    name = "data_initializer_test",
+    srcs = ["tests/data_initializer_test.cc"],
+    extra_copts = [
+        "-fexceptions",
+    ],
+    deps = [
+        ":poplar_lib",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+    ],
+)
+
+tf_cc_test(
+    name = "elementwise_broadcast_converter_test",
+    srcs = ["tests/elementwise_broadcast_converter_test.cc"],
+    deps = [
+        ":optimizers",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/service:hlo_query",
+        "//tensorflow/compiler/xla/service:shape_inference",
+        "//tensorflow/compiler/xla/tests:hlo_test_base",
+    ],
+)
+
+tf_cc_test(
+    name = "gradient_accumulation_fuser_test",
+    srcs = ["tests/gradient_accumulation_fuser_test.cc"],
+    deps = [
+        ":optimizers",
+        "//tensorflow/compiler/xla/service:hlo_matchers",
+        "//tensorflow/compiler/xla/service:hlo_query",
+        "//tensorflow/compiler/xla/service:shape_inference",
         "//tensorflow/compiler/xla/tests:hlo_test_base",
     ],
 )
@@ -965,6 +1056,23 @@ py_library(
         "//tensorflow/compiler/tf2xla/python:xla",
     ],
     srcs_version = "PY2AND3"
+)
+
+py_test(
+    name = "arg_min_max_test",
+    size = "medium",
+    shard_count = 2,
+    srcs = ["tests/arg_min_max_test.py"],
+    deps = [
+        ":test_utils_py",
+        ":ipu_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+    ],
+    srcs_version = "PY2AND3",
 )
 
 py_test(
@@ -1281,22 +1389,6 @@ py_test(
 )
 
 py_test(
-    name = "ipu_engine_cache_test",
-    size = "medium",
-    srcs = ["tests/ipu_engine_cache_test.py"],
-    deps = [
-        ":test_utils_py",
-        ":ipu_ops_py",
-        "//tensorflow/compiler/tests:xla_test",
-        "//tensorflow/python:array_ops",
-        "//tensorflow/python:framework",
-        "//tensorflow/python:math_ops",
-        "//tensorflow/python:platform",
-    ],
-    srcs_version = "PY2AND3",
-)
-
-py_test(
     name = "casts_elimination_test",
     size = "medium",
     srcs = ["tests/casts_elimination_test.py"],
@@ -1501,6 +1593,55 @@ py_test(
     srcs_version = "PY2AND3",
 )
 
+py_test(
+    name = "replication_normalise_test",
+    size = "medium",
+    srcs = ["tests/replication_normalise_test.py"],
+    deps = [
+        ":test_utils_py",
+        ":ipu_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:layers",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+    ],
+    srcs_version = "PY2AND3",
+)
+
+py_test(
+    name = "stateful_gradient_accumulate_test",
+    size = "medium",
+    srcs = ["tests/stateful_gradient_accumulate_test.py"],
+    deps = [
+        ":test_utils_py",
+        ":ipu_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+    ],
+    srcs_version = "PY2AND3",
+)
+
+py_test(
+    name = "replicated_stateful_gradient_accumulate_test",
+    size = "large",
+    srcs = ["tests/replicated_stateful_gradient_accumulate_test.py"],
+    deps = [
+        ":test_utils_py",
+        ":ipu_ops_py",
+        ":popops_ops_py",
+        "//tensorflow/compiler/tests:xla_test",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+    ],
+    srcs_version = "PY2AND3",
+)
 
 
 test_suite(
@@ -1510,7 +1651,7 @@ test_suite(
         "allocation_finder_test",
         "batch_norm_test",
         "casts_elimination_test",
-        "combine_all_reduce_test",
+        "combine_instructions_test",
         "commutative_instruction_reorder_operands_test",
         "constant_slice_folding_test",
         "conv3d_test",
@@ -1519,10 +1660,12 @@ test_suite(
         "conv_test",
         "conversions_test",
         "convolution_classifier_test",
+        "data_initializer_test",
         "deferred_allocation_visitor_test",
         "dependency_replacer_test",
         "device_test",
         "dynamic_slice_layout_test",
+        "elementwise_broadcast_converter_test",
         "estimator_test",
         "expression_outliner_test",
         "f16_test",
@@ -1531,6 +1674,7 @@ test_suite(
         "fuse_ops_test",
         "fuse_wide_const_test",
         "fused_batch_norm_test",
+        "gradient_accumulation_fuser_test",
         "graph_compile_io_map_test",
         "group_norm_test",
         "hlo_computation_name_uniquify_test",
@@ -1538,32 +1682,34 @@ test_suite(
         "hlo_matcher_test",
         "inplace_test",
         "inter_ipu_copy_inserter_test",
-        "ipu_engine_cache_test",
         "ipu_model_device_test",
-        "ipu_outfeed_test",
         "lstm_test",
         "matmul_test",
         "monitored_session_test",
         "multi_run_test",
         "norm_graph_caching_sharded_test",
         "norm_graph_caching_test",
-        "norm_input_recomputation_test",
+        "recomputation_test",
+        "replication_normalise_test",
         "not_supported_gather_expander_test",
         "not_supported_scatter_expander_test",
         "pop_datastream_test",
         "popops_custom_ops_test",
         "reduce_test",
+        "replicated_stateful_gradient_accumulate_test",
         "root_token_replacer_test",
         "scheduler_test",
         "sharding_pass_test",
         "simple_network_test",
         "sort_op_test",
+        "stateful_gradient_accumulate_test",
         "sync_list_scheduler_test",
         "synthetic_data_test",
         "tensor_array_test",
         "topk_onehot_test",
         "update_op_dependencies_test",
         "variable_test",
+        "while_loop_alias_copy_test",
         "while_loop_condition_simplify_test",
         "while_loop_to_repeat_simplify_test",
         "wide_const_expansion_test",

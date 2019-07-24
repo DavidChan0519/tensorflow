@@ -9,7 +9,6 @@ import numpy as np
 from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
 from tensorflow.compiler.plugin.poplar.driver.trace_pb2 import IpuTraceEvent
 from tensorflow.compiler.plugin.poplar.tests import test_utils as tu
-from tensorflow.contrib.ipu import ipu_compiler
 from tensorflow.contrib import ipu
 from tensorflow.keras import layers
 from tensorflow.python.client import session as sl
@@ -47,7 +46,7 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
       pc = array_ops.placeholder(np.float32, [2], name="c")
       report = gen_ipu_ops.ipu_event_trace()
 
-    out = ipu_compiler.compile(my_graph, [pa, pb, pc])
+    out = ipu.ipu_compiler.compile(my_graph, [pa, pb, pc])
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
@@ -74,12 +73,11 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
 
           tiles = set()
           for tensor in js['mappings'][mods[0]]:
-            for tile in tensor['tiles']:
-              tiles.add(tile['tile_id'])
+            for tile in tensor[7]:
+              tiles.add(tile[0])
 
-          self.assertEqual(len(tiles), 2)
-          self.assertTrue(0 in tiles)
-          self.assertTrue(1216 in tiles)
+          self.assertEqual(len(tiles), 3)
+          self.assertEqual(tiles, set((0, 1, 1216)))
 
   def testMultipleConfigureIpuShouldFail(self):
     def my_graph(pa, pb, pc):
@@ -94,9 +92,8 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
       pa = array_ops.placeholder(np.float32, [2], name="a")
       pb = array_ops.placeholder(np.float32, [2], name="b")
       pc = array_ops.placeholder(np.float32, [2], name="c")
-      report = gen_ipu_ops.ipu_event_trace()
 
-    out = ipu_compiler.compile(my_graph, [pa, pb, pc])
+    out = ipu.ipu_compiler.compile(my_graph, [pa, pb, pc])
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
@@ -122,10 +119,9 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
       pa = array_ops.placeholder(np.float32, [2], name="a")
       pb = array_ops.placeholder(np.float32, [2], name="b")
       pc = array_ops.placeholder(np.float32, [2], name="c")
-      report = gen_ipu_ops.ipu_event_trace()
 
     with ops.device("/device:IPU:0"):
-      out = ipu_compiler.compile(my_graph, [pa, pb, pc])
+      out = ipu.ipu_compiler.compile(my_graph, [pa, pb, pc])
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
@@ -162,7 +158,7 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
       pc = array_ops.placeholder(np.float32, [2], name="c")
       report = gen_ipu_ops.ipu_event_trace()
 
-    out = ipu_compiler.compile(my_graph, [pa, pb, pc])
+    out = ipu.ipu_compiler.compile(my_graph, [pa, pb, pc])
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
@@ -191,12 +187,11 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
 
           tiles = set()
           for tensor in js['mappings'][mods[0]]:
-            for tile in tensor['tiles']:
-              tiles.add(tile['tile_id'])
+            for tile in tensor[7]:
+              tiles.add(tile[0])
 
-          self.assertEqual(len(tiles), 2)
-          self.assertTrue(0 in tiles)
-          self.assertTrue(1216 in tiles)
+          self.assertEqual(len(tiles), 5)
+          self.assertEqual(tiles, set((0, 1, 2, 1216, 1217)))
 
   def testMultiIpuTraining(self):
     def my_graph(inp, lab):
@@ -223,7 +218,7 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
       lab = array_ops.placeholder(np.float32, [1, 8], name="labels")
       report = gen_ipu_ops.ipu_event_trace()
 
-    out = ipu_compiler.compile(my_graph, [inp, lab])
+    out = ipu.ipu_compiler.compile(my_graph, [inp, lab])
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
@@ -281,7 +276,7 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
       bias = array_ops.placeholder(np.float32, [8], name="bias")
       report = gen_ipu_ops.ipu_event_trace()
 
-    out = ipu_compiler.compile(my_graph, [inp, bias])
+    out = ipu.ipu_compiler.compile(my_graph, [inp, bias])
 
     cfg = ipu.utils.create_ipu_config(profiling=True)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
@@ -309,10 +304,10 @@ class MultiIpuTest(test_util.TensorFlowTestCase):
 
       self.assertEqual(num_compiles, 1)
 
-      # There is 1 piece of global exchange (aprt from progId)
+      # There is 1 piece of global exchange (apart from progId)
       wl = [
-          'switchControlBroadcast*/GlobalPreAll',
-          '*_to_/custom-call/GlobalPreAll',
+          'switchControlBroadcast*/GlobalPre',
+          '*_to_/custom-call/GlobalPre',
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(ge_list, wl))
 

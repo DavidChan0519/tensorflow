@@ -19,7 +19,6 @@ from __future__ import print_function
 import numpy as np
 import test_util as tu
 
-from tensorflow.contrib.ipu import ipu_compiler
 from tensorflow.contrib import ipu
 from tensorflow.python.client import session as sl
 from tensorflow.python.framework import errors
@@ -31,10 +30,6 @@ from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import googletest
-from tensorflow.contrib.ipu.python import popops_cross_replica_sum
-from tensorflow.contrib.ipu import ipu_infeed_queue
-from tensorflow.contrib.ipu import ipu_outfeed_queue
-from tensorflow.contrib.ipu import loops
 
 
 def next_feed_id():
@@ -52,17 +47,17 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
       with ops.device("/device:IPU:0"):
         x = inp + inp
 
-        return [popops_cross_replica_sum.cross_replica_sum(x)]
+        return [ipu.popops_cross_replica_sum.cross_replica_sum(x)]
 
     with ops.device('cpu'):
       inp = array_ops.placeholder(np.float32, [4], name="data")
 
-    out = ipu_compiler.compile(my_graph, [inp])
+    out = ipu.ipu_compiler.compile(my_graph, [inp])
 
     cfg = ipu.utils.create_ipu_config(
         profiling=False, max_cross_replica_sum_buffer_size=10000)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    cfg = ipu.utils.auto_select_ipus(cfg, 2, number_of_replicas=2)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
     ipu.utils.configure_ipu_system(cfg)
 
     with sl.Session() as sess:
@@ -76,6 +71,40 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
       # Test that the output is just the input
       self.assertAllClose(result[0], 4 * data)
 
+  def testCrossReplicaSumDifferentTypes(self):
+    def my_graph(x, y):
+      with ops.device("/device:IPU:0"):
+        x = x + x
+        y = y + y + 1
+        return [
+            ipu.popops_cross_replica_sum.cross_replica_sum(x),
+            ipu.popops_cross_replica_sum.cross_replica_sum(y)
+        ]
+
+    with ops.device('cpu'):
+      x = array_ops.placeholder(np.float32, [4], name="data")
+      y = array_ops.placeholder(np.int32, [4], name="data")
+
+    out = ipu.ipu_compiler.compile(my_graph, [x, y])
+
+    cfg = ipu.utils.create_ipu_config(
+        profiling=False, max_cross_replica_sum_buffer_size=10000)
+    cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
+      sess.run(variables.global_variables_initializer())
+
+      ones = np.ones([4])
+      fd = {x: ones, y: ones}
+
+      result = sess.run(out, fd)
+
+      # Test that the output is just the input
+      self.assertAllClose(result[0], 4 * ones)
+      self.assertAllClose(result[1], 6 * ones)
+
   def testCreateSimpleReplicatedGraphVariable(self):
     def my_graph():
       with ops.device("/device:IPU:0"):
@@ -86,14 +115,14 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
               shape=[4],
               initializer=init_ops.constant_initializer(10.0))
         x = x + x
-        return [popops_cross_replica_sum.cross_replica_sum(x)]
+        return [ipu.popops_cross_replica_sum.cross_replica_sum(x)]
 
-    out = ipu_compiler.compile(my_graph, [])
+    out = ipu.ipu_compiler.compile(my_graph, [])
 
     cfg = ipu.utils.create_ipu_config(
         profiling=False, max_cross_replica_sum_buffer_size=10000)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    cfg = ipu.utils.auto_select_ipus(cfg, 2, number_of_replicas=2)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
     ipu.utils.configure_ipu_system(cfg)
 
     with sl.Session() as sess:
@@ -108,30 +137,30 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
     shape = [2]
     dataset = tu.create_single_increasing_dataset(3, shape)
 
-    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(
+    infeed_queue = ipu.ipu_infeed_queue.IPUInfeedQueue(
         dataset, feed_name=next_feed_id(), replication_factor=2)
-    outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(
+    outfeed_queue = ipu.ipu_outfeed_queue.IPUOutfeedQueue(
         feed_name=next_feed_id(), replication_factor=2)
 
     def body(v, x):
-      v = popops_cross_replica_sum.cross_replica_sum(v + x)
+      v = ipu.popops_cross_replica_sum.cross_replica_sum(v + x)
       outfeed = outfeed_queue.enqueue(v)
       return (v, outfeed)
 
     def my_net():
       v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
-      r = loops.repeat(5, body, [v], infeed_queue)
+      r = ipu.loops.repeat(5, body, [v], infeed_queue)
       return r
 
     with ipu.ops.ipu_scope("/device:IPU:0"):
-      res = ipu_compiler.compile(my_net, inputs=[])
+      res = ipu.ipu_compiler.compile(my_net, inputs=[])
 
     outfed = outfeed_queue.dequeue()
 
     cfg = ipu.utils.create_ipu_config(
         profiling=False, max_cross_replica_sum_buffer_size=10000)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    cfg = ipu.utils.auto_select_ipus(cfg, 2, number_of_replicas=2)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
     ipu.utils.configure_ipu_system(cfg)
 
     with sl.Session() as sess:
@@ -160,30 +189,30 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
     shape = [2]
     dataset = tu.create_single_increasing_dataset(3, shape)
 
-    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(
+    infeed_queue = ipu.ipu_infeed_queue.IPUInfeedQueue(
         dataset, feed_name=next_feed_id(), replication_factor=2)
-    outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(
+    outfeed_queue = ipu.ipu_outfeed_queue.IPUOutfeedQueue(
         feed_name=next_feed_id(), replication_factor=2)
 
     def body(v, x):
-      out = popops_cross_replica_sum.cross_replica_sum(v + x)
+      out = ipu.popops_cross_replica_sum.cross_replica_sum(v + x)
       outfeed = outfeed_queue.enqueue((v, out))
       return (out, outfeed)
 
     def my_net():
       v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
-      r = loops.repeat(5, body, [v], infeed_queue)
+      r = ipu.loops.repeat(5, body, [v], infeed_queue)
       return r
 
     with ipu.ops.ipu_scope("/device:IPU:0"):
-      res = ipu_compiler.compile(my_net, inputs=[])
+      res = ipu.ipu_compiler.compile(my_net, inputs=[])
 
     outfed = outfeed_queue.dequeue()
 
     cfg = ipu.utils.create_ipu_config(
         profiling=False, max_cross_replica_sum_buffer_size=10000)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    cfg = ipu.utils.auto_select_ipus(cfg, 2, number_of_replicas=2)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
     ipu.utils.configure_ipu_system(cfg)
 
     with sl.Session() as sess:
@@ -223,30 +252,30 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
     shape = [2]
     dataset = tu.create_single_increasing_dataset(3, shape)
 
-    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(
+    infeed_queue = ipu.ipu_infeed_queue.IPUInfeedQueue(
         dataset, feed_name=next_feed_id(), replication_factor=2)
-    outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(
+    outfeed_queue = ipu.ipu_outfeed_queue.IPUOutfeedQueue(
         feed_name=next_feed_id(), replication_factor=2)
 
     def body(v, x):
-      out = popops_cross_replica_sum.cross_replica_sum(v + x)
+      out = ipu.popops_cross_replica_sum.cross_replica_sum(v + x)
       outfeed = outfeed_queue.enqueue({"last": v, "this": out})
       return (out, outfeed)
 
     def my_net():
       v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
-      r = loops.repeat(5, body, [v], infeed_queue)
+      r = ipu.loops.repeat(5, body, [v], infeed_queue)
       return r
 
     with ipu.ops.ipu_scope("/device:IPU:0"):
-      res = ipu_compiler.compile(my_net, inputs=[])
+      res = ipu.ipu_compiler.compile(my_net, inputs=[])
 
     outfed = outfeed_queue.dequeue()
 
     cfg = ipu.utils.create_ipu_config(
         profiling=False, max_cross_replica_sum_buffer_size=10000)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    cfg = ipu.utils.auto_select_ipus(cfg, 2, number_of_replicas=2)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
     ipu.utils.configure_ipu_system(cfg)
 
     with sl.Session() as sess:
@@ -316,20 +345,20 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
               dtype=np.int32,
               shape=[100],
               initializer=init_ops.constant_initializer(10))
-        y1 = popops_cross_replica_sum.cross_replica_sum(x1 + x1)
-        z1 = popops_cross_replica_sum.cross_replica_sum(x1 * x1)
-        y2 = popops_cross_replica_sum.cross_replica_sum(x2 + x2)
-        z2 = popops_cross_replica_sum.cross_replica_sum(x2 * x2)
+        y1 = ipu.popops_cross_replica_sum.cross_replica_sum(x1 + x1)
+        z1 = ipu.popops_cross_replica_sum.cross_replica_sum(x1 * x1)
+        y2 = ipu.popops_cross_replica_sum.cross_replica_sum(x2 + x2)
+        z2 = ipu.popops_cross_replica_sum.cross_replica_sum(x2 * x2)
         return [
-            popops_cross_replica_sum.cross_replica_sum(z1 + y1),
-            popops_cross_replica_sum.cross_replica_sum(z2 + y2)
+            ipu.popops_cross_replica_sum.cross_replica_sum(z1 + y1),
+            ipu.popops_cross_replica_sum.cross_replica_sum(z2 + y2)
         ]
 
-    out = ipu_compiler.compile(my_graph, [])
+    out = ipu.ipu_compiler.compile(my_graph, [])
     cfg = ipu.utils.create_ipu_config(
         profiling=False, max_cross_replica_sum_buffer_size=10000)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    cfg = ipu.utils.auto_select_ipus(cfg, 2, number_of_replicas=2)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
     ipu.utils.configure_ipu_system(cfg)
 
     with sl.Session() as sess:
@@ -346,9 +375,9 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
     shape = [2]
     dataset = tu.create_single_increasing_dataset(3, shape)
 
-    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(
+    infeed_queue = ipu.ipu_infeed_queue.IPUInfeedQueue(
         dataset, feed_name=next_feed_id(), replication_factor=2)
-    outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(
+    outfeed_queue = ipu.ipu_outfeed_queue.IPUOutfeedQueue(
         feed_name=next_feed_id(), replication_factor=2)
 
     def body(v, x):
@@ -357,18 +386,18 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
 
     def my_net():
       v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
-      r = loops.repeat(5, body, [v], infeed_queue)
+      r = ipu.loops.repeat(5, body, [v], infeed_queue)
       return r
 
     with ipu.ops.ipu_scope("/device:IPU:0"):
-      res = ipu_compiler.compile(my_net, inputs=[])
+      res = ipu.ipu_compiler.compile(my_net, inputs=[])
 
     outfed = outfeed_queue.dequeue()
 
     cfg = ipu.utils.create_ipu_config(
         profiling=False, max_cross_replica_sum_buffer_size=10000)
     cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
-    cfg = ipu.utils.auto_select_ipus(cfg, 2, number_of_replicas=2)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
     ipu.utils.configure_ipu_system(cfg)
 
     with sl.Session() as sess:
@@ -376,6 +405,70 @@ class ReplicatedGraphTest(test_util.TensorFlowTestCase):
       with self.assertRaisesRegexp(
           errors.FailedPreconditionError,
           'This is not a valid replicated graph because'):
+        result = sess.run(res)
+
+  def testCreateSimpleReplicatedInfeedWrongReplicationFactor(self):
+    shape = [2]
+    dataset = tu.create_single_increasing_dataset(3, shape)
+
+    infeed_queue = ipu.ipu_infeed_queue.IPUInfeedQueue(
+        dataset, feed_name=next_feed_id(), replication_factor=4)
+
+    def body(v, x):
+      v = ipu.popops_cross_replica_sum.cross_replica_sum(v + x)
+      return v
+
+    def my_net():
+      v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
+      r = ipu.loops.repeat(5, body, [v], infeed_queue)
+      return r
+
+    with ipu.ops.ipu_scope("/device:IPU:0"):
+      res = ipu.ipu_compiler.compile(my_net, inputs=[])
+
+    cfg = ipu.utils.create_ipu_config(
+        profiling=False, max_cross_replica_sum_buffer_size=10000)
+    cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
+      sess.run(infeed_queue.initializer)
+      with self.assertRaisesRegexp(
+          errors.FailedPreconditionError,
+          'Current program has been created with replication_factor 2'):
+        result = sess.run(res)
+
+  def testCreateSimpleReplicatedOutfeedWrongReplicationFactor(self):
+    shape = [2]
+    dataset = tu.create_single_increasing_dataset(3, shape)
+
+    outfeed_queue = ipu.ipu_outfeed_queue.IPUOutfeedQueue(
+        feed_name=next_feed_id(), replication_factor=4)
+
+    def body(v):
+      v = ipu.popops_cross_replica_sum.cross_replica_sum(v)
+      outfeed = outfeed_queue.enqueue(v)
+      return (v, outfeed)
+
+    def my_net():
+      v = constant_op.constant(0.0, shape=shape, dtype=np.float32)
+      r = ipu.loops.repeat(5, body, [v])
+      return r
+
+    with ipu.ops.ipu_scope("/device:IPU:0"):
+      res = ipu.ipu_compiler.compile(my_net, inputs=[])
+
+    cfg = ipu.utils.create_ipu_config(
+        profiling=False, max_cross_replica_sum_buffer_size=10000)
+    cfg = ipu.utils.set_ipu_model_options(cfg, compile_ipu_code=False)
+    cfg = ipu.utils.auto_select_ipus(cfg, 2)
+    ipu.utils.configure_ipu_system(cfg)
+
+    with sl.Session() as sess:
+      with self.assertRaisesRegexp(
+          errors.FailedPreconditionError,
+          'Current program has been created with replication_factor 2'):
         result = sess.run(res)
 
 

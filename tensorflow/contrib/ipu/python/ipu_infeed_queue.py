@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =============================================================================
-"""Contains class for creating input infeeds into TF graphs targeting the IPU.
+"""
+Infeed queue
+~~~~~~~~~~~~
 """
 
 from __future__ import absolute_import
@@ -21,7 +23,7 @@ from __future__ import print_function
 
 from tensorflow.compiler.plugin.poplar.ops import gen_pop_datastream_ops
 from tensorflow.python.data.ops import dataset_ops
-from tensorflow.python.data.ops.dataset_ops import Dataset
+from tensorflow.python.data.util import structure
 from tensorflow.python.framework import ops
 
 
@@ -57,7 +59,7 @@ class IPUInfeedQueue:
     # The resulting dataset has a nested structure of: {features, labels}.
     dataset = dataset.map(dataset_parser)
 
-    infeed_queue = ipu_infeed_queue.IPUInfeedQueue(dataset)
+    infeed_queue = ipu.ipu_infeed_queue.IPUInfeedQueue(dataset, feed_name="training_infeed")
 
     # dataset can no longer be used beyond this point.
 
@@ -112,7 +114,7 @@ class IPUInfeedQueue:
 
     """
 
-    for output_shape in dataset_ops.flat_structure(dataset)["output_shapes"]:
+    for output_shape in dataset._flat_structure["output_shapes"]:
       if isinstance(output_shape, list) or isinstance(output_shape, tuple):
         raise ValueError("Nested list/tuple input shapes are not supported")
       if not output_shape.is_fully_defined():
@@ -120,12 +122,17 @@ class IPUInfeedQueue:
 tf.Dataset.batch, set `drop_remainder=True`.""".format(output_shape))
 
     with ops.device('/device:CPU:0'):
-      # Apply the dataset and take ownership.
-      dataset = dataset._apply_options()
-      self._structure = dataset._element_structure
-      self._flat_structure = dataset_ops.flat_structure(dataset)
+      self._replication_factor = replication_factor
+      self._dataset = dataset
+      self._structure = dataset_ops.get_structure(self._dataset)
+      self._flat_structure = dataset._flat_structure
       # Batch the dataset to take replication into account.
-      self._dataset = dataset.batch(replication_factor, drop_remainder=True)
+      if self._replication_factor > 1:
+        self._dataset = self._dataset.batch(
+            self._replication_factor, drop_remainder=True)
+      # Apply the dataset and take ownership.
+      self._dataset = self._dataset._apply_options()
+
       try:
         ds_variant = self._dataset._variant_tensor
       except TypeError:
@@ -136,9 +143,10 @@ tf.Dataset.batch, set `drop_remainder=True`.""".format(output_shape))
       # Dataset iterator creator.
       self._initializer = gen_pop_datastream_ops.ipu_consume_dataset(
           input_dataset=ds_variant,
-          id=self._id,
+          feed_id=self._id,
+          replication_factor=self._replication_factor,
           device_ordinal=device_ordinal,
-          **dataset_ops.flat_structure(self._dataset))
+          **self._dataset._flat_structure)
 
     self._dequeued = False
     self._initialized = False
@@ -154,9 +162,11 @@ tf.Dataset.batch, set `drop_remainder=True`.""".format(output_shape))
       A nested structure of `tf.Tensor` objects.
     """
     flat_ret = gen_pop_datastream_ops.pop_datastream_infeed_dequeue(
-        infeed_id=self._id, **self._flat_structure)
+        feed_id=self._id,
+        replication_factor=self._replication_factor,
+        **self._flat_structure)
     self._dequeued = True
-    return self._structure._from_tensor_list(flat_ret)
+    return structure.from_tensor_list(self._structure, flat_ret)
 
   @property
   def dequeued(self):
@@ -170,7 +180,7 @@ tf.Dataset.batch, set `drop_remainder=True`.""".format(output_shape))
   @property
   def number_of_tuple_elements(self):
     """Returns the number of IPUInfeedQueue tuple elements."""
-    return len(self._structure._flat_shapes)
+    return len(structure.get_flat_tensor_specs(self._structure))
 
   @property
   def initializer(self):

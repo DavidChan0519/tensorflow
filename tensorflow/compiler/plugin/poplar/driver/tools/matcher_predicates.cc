@@ -1,28 +1,26 @@
 #include "tensorflow/compiler/plugin/poplar/driver/tools/matcher_predicates.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/custom_ops/norm.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/custom_ops/pooling.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/custom_ops/relu.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/custom_ops/sigmoid.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/plugin/poplar/kernels/custom_kernels_util.h"
 
 #include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_pass_interface.h"
 #include "tensorflow/compiler/xla/service/hlo_query.h"
+#include "tensorflow/compiler/xla/service/pattern_matcher.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/window_util.h"
-
 namespace xla {
+
+namespace m = match;
+
 namespace poplarplugin {
 
 static bool IsAllFloatValue(const HloInstruction* inst, const double value) {
   return !ShapeUtil::IsZeroElementArray(inst->shape()) &&
          inst->literal().IsAllFloat(value);
-}
-
-bool IsFloatType(const HloInstruction* inst) {
-  return ShapeUtil::ElementIsFloating(inst->shape());
-}
-
-bool IsTruncatedNormal(const HloInstruction* inst) {
-  return inst->metadata().op_type() == "TruncatedNormal";
 }
 
 bool IsRandomNormal(const HloInstruction* inst) {
@@ -40,14 +38,6 @@ bool IsConstantZero(const HloInstruction* inst) {
          inst->literal().IsAll(0);
 }
 
-bool IsConstantHalf(const HloInstruction* inst) {
-  return IsAllFloatValue(inst, 0.5);
-}
-
-bool IsConstantOne(const HloInstruction* inst) {
-  return IsAllFloatValue(inst, 1.0);
-}
-
 bool IsExternalPadding(const HloInstruction* inst) {
   if (inst->opcode() != HloOpcode::kPad) {
     return false;
@@ -58,50 +48,6 @@ bool IsExternalPadding(const HloInstruction* inst) {
     if (d.interior_padding() > 0) return false;
   }
   return true;
-}
-
-bool IsAveragePool(const HloInstruction* inst) {
-  return inst->metadata().op_type() == "AvgPool";
-}
-
-bool Is2DMaxPool(const HloInstruction* inst) {
-  if (inst->opcode() != HloOpcode::kReduceWindow) {
-    return false;
-  }
-
-  if (inst->metadata().op_type() == "MaxPool") {
-    const Window& window(inst->window());
-    unsigned reduction_dims = 0;
-    for (int64 i = 0; i < window.dimensions_size(); i++) {
-      auto& d = window.dimensions(i);
-      if (d.size() != 1 || d.stride() != 1 || d.padding_low() != 0 ||
-          d.padding_high() != 0) {
-        reduction_dims++;
-      }
-    }
-    return inst->window().dimensions_size() == 4 && reduction_dims == 2;
-  }
-  return false;
-}
-
-bool Is2DMaxPoolGrad(const HloInstruction* inst) {
-  if (inst->opcode() != HloOpcode::kSelectAndScatter) {
-    return false;
-  }
-
-  if (inst->metadata().op_type() == "MaxPoolGrad") {
-    const Window& window(inst->window());
-    unsigned reduction_dims = 0;
-    for (int64 i = 0; i < window.dimensions_size(); i++) {
-      auto& d = window.dimensions(i);
-      if (d.size() != 1 || d.stride() != 1 || d.padding_low() != 0 ||
-          d.padding_high() != 0) {
-        reduction_dims++;
-      }
-    }
-    return inst->window().dimensions_size() == 4 && reduction_dims == 2;
-  }
-  return false;
 }
 
 bool Is2DReductionWindow(const HloInstruction* inst) {
@@ -121,6 +67,7 @@ bool Is2DReductionWindow(const HloInstruction* inst) {
   }
   return reduction_count == 2;
 }
+
 bool IsScalar(const HloInstruction* inst) {
   return ShapeUtil::IsScalar(inst->shape());
 }
@@ -182,21 +129,6 @@ bool IsOutputFeed(const HloInstruction* inst) {
   return false;
 }
 
-bool IsTfReluGradOp(const HloInstruction* inst) {
-  const std::string& tf_core_op = inst->metadata().op_type();
-  return tf_core_op == "ReluGrad";
-}
-
-bool IsTfReluGradGeOp(const HloInstruction* inst) {
-  const std::string& tf_core_op = inst->metadata().op_type();
-  return tf_core_op == "ReluGrad" &&
-         inst->comparison_direction() == ComparisonDirection::kGt;
-}
-
-bool IsTrueParameter(const HloInstruction* inst) {
-  return inst->opcode() == HloOpcode::kParameter;
-}
-
 bool Is1DVector(const HloInstruction* inst) {
   return inst->shape().rank() == 1;
 }
@@ -252,15 +184,6 @@ bool IsOpWithWindowNoStride(const HloInstruction* inst) {
     default:
       return false;
   }
-}
-
-bool IsScalarConstantNegativeInfinity(const HloInstruction* inst) {
-  return IsScalarConstant(inst) &&
-         IsAllFloatValue(inst, -std::numeric_limits<double>::infinity());
-}
-
-bool IsScalarConstantOne(const HloInstruction* inst) {
-  return IsScalarConstant(inst) && IsAllFloatValue(inst, 0);
 }
 
 bool IsPaddingReduceWindow(const HloInstruction* inst) {
@@ -344,33 +267,26 @@ bool IsNormGradient(const HloInstruction* inst) {
          DynCast<HloGroupNormGradInstruction>(inst);
 }
 
-bool IsGTEIndex0(const HloInstruction* inst) {
-  return inst->opcode() == HloOpcode::kGetTupleElement &&
-         inst->tuple_index() == 0;
-}
-
-bool IsGTEIndex1(const HloInstruction* inst) {
-  return inst->opcode() == HloOpcode::kGetTupleElement &&
-         inst->tuple_index() == 1;
-}
-
-bool IsGTEIndex2(const HloInstruction* inst) {
-  return inst->opcode() == HloOpcode::kGetTupleElement &&
-         inst->tuple_index() == 2;
-}
-
 bool IsNonLinearity(const HloInstruction* inst) {
-  return !IsNonLinearityGradient(inst) &&
-         (IsPopOpsFusion(inst, "relu") || IsPopOpsFusion(inst, "sigmoid"));
+  return DynCast<HloReluInstruction>(inst) != nullptr ||
+         DynCast<HloSigmoidInstruction>(inst) != nullptr;
 }
 
 bool IsNonLinearityGradient(const HloInstruction* inst) {
-  return IsPopOpsFusion(inst, "relugrad") ||
-         IsPopOpsFusion(inst, "sigmoidgrad");
+  return DynCast<HloReluGradInstruction>(inst) != nullptr ||
+         DynCast<HloSigmoidGradInstruction>(inst) != nullptr;
 }
 
 bool IsCompareEqual(const HloInstruction* inst) {
   return inst->comparison_direction() == ComparisonDirection::kEq;
+}
+
+bool IsSupportedAllReduce(const HloInstruction* inst) {
+  if (auto all_reduce = DynCast<HloAllReduceInstruction>(inst)) {
+    auto root = all_reduce->to_apply()->root_instruction();
+    return Match(root, m::Add(m::Parameter(0), m::Parameter(1)));
+  }
+  return false;
 }
 
 }  // namespace poplarplugin

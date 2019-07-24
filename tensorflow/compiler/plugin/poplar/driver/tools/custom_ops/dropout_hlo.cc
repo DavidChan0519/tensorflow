@@ -29,11 +29,13 @@ HloDropoutInstruction::HloDropoutInstruction(HloInstruction* X,
           {X, seed},
           GetPoplibsCustomOpTargetString(PoplibsOp::Poprand,
                                          PoplibsOp::Dropout),
-          {}),
+          rate_, scale_, seed_mod, should_use_user_seed),
       scale(scale_),
       rate(rate_),
       seed_modifier(seed_mod),
-      is_user_seed(should_use_user_seed) {}
+      is_user_seed(should_use_user_seed) {
+  set_custom_call_has_side_effect(true);
+}
 
 absl::flat_hash_set<int64> HloDropoutInstruction::AllocatingIndices() const {
   return {};

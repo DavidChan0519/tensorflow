@@ -13,7 +13,8 @@
 # limitations under the License.
 # =============================================================================
 """
-Utility functions related to the Graphcore IPU.
+General utility functions
+~~~~~~~~~~~~~~~~~~~~~~~~~
 """
 
 from tensorflow.compiler.plugin.poplar.driver.trace_pb2 import IpuTraceEvent
@@ -22,7 +23,6 @@ from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
 from tensorflow.core.framework import attr_value_pb2
 from tensorflow.python.client import session as session_lib
 from tensorflow.python.framework import ops
-from tensorflow.python.platform import tf_logging as logging
 
 import json
 import re
@@ -64,7 +64,8 @@ def create_ipu_config(profiling=False,
                       merge_infeed_io_copies=False,
                       disable_graph_convolution_caching=False,
                       retain_control_dependencies=False,
-                      max_cross_replica_sum_buffer_size=0):
+                      max_cross_replica_sum_buffer_size=0,
+                      max_inter_ipu_copies_buffer_size=0):
   """Create an empty IPU session configuration structure.
 
   Args:
@@ -101,6 +102,8 @@ def create_ipu_config(profiling=False,
       scheduler.
     max_cross_replica_sum_buffer_size: The maximum number of bytes that can be
       waiting before a cross replica sum op is scheduled.
+    max_inter_ipu_copies_buffer_size: The maximum number of bytes that can be
+      waiting before a inter IPU copy between IPUs is scheduled.
 
   Returns:
     An IpuOptions configuration protobuf, suitable for passing to
@@ -133,6 +136,7 @@ def create_ipu_config(profiling=False,
 
   opts.retain_control_dependencies = retain_control_dependencies
   opts.max_cross_replica_sum_buffer_size = max_cross_replica_sum_buffer_size
+  opts.max_inter_ipu_copies_buffer_size = max_inter_ipu_copies_buffer_size
 
   return opts
 
@@ -291,20 +295,23 @@ def set_ipu_model_options(opts, compile_ipu_code=True):
   return opts
 
 
-def set_recomputation_options(opts, recompute_norm_inputs=True):
+def set_recomputation_options(opts, allow_recompute=True):
   """Set re-computation options.
 
   Args:
-    recompute_norm_inputs: Whether or not to re-compute the norm inputs
-      during training. Enabling this option can reduce memory usage at the
-      expense of extra computation.
+    allow_recompute: Whether or not to re-compute instructions during training.
+                     If this is enabled then we will attempt to pattern match
+                     instructions in the forward pass and recompute them in
+                     the backward pass to avoid having to preserve that
+                     memory. Enabling this option can reduce memory usage at
+                     the expense of extra computation.
 
   Returns:
     The IpuOptions configuration protobuf.
   """
 
-  opts.speed_size_config.recompute_norm_inputs = recompute_norm_inputs
-  opts.speed_size_config.has_recompute_norm_inputs = True
+  opts.speed_size_config.allow_recompute = allow_recompute
+  opts.speed_size_config.has_allow_recompute = True
 
   return opts
 
@@ -338,7 +345,7 @@ def set_floating_point_behaviour_options(opts,
   return opts
 
 
-def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
+def auto_select_ipus(opts, num_ipus):
   """Configure the IPUs to be used by the session.
 
   The configuration describes a system consisting of multiple Tensorflow
@@ -383,9 +390,6 @@ def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
   Args:
     opts: An IpuOptions session control protobuf.
     num_ipus: List of IPUs per Tensorflow device
-    sharded: Deprecated.
-    number_of_replicas: The number of replicas to divide the device into. This
-      should be a divisor of the number of IPUs.
 
   Returns:
     The IpuOptions configuration protobuf, configured for auto-selecting a set
@@ -397,30 +401,18 @@ def auto_select_ipus(opts, num_ipus, sharded=False, number_of_replicas=None):
   if not isinstance(num_ipus, (int, list, tuple)):
     raise Exception("`num_ipus` must be an integer, list or tuple.")
 
-  if number_of_replicas is not None:
-    if type(number_of_replicas) is not type(num_ipus):
-      raise Exception("`number_of_replicas` must be same type as `num_ipus`")
-
-  if sharded:
-    logging.warning("`sharded` has been deprecated.  Mark operations with a "
-                    "sharding attribute to enable sharding")
-
   if isinstance(num_ipus, int):
     dev = opts.device_config.add()
     dev.auto_count = num_ipus
-    if isinstance(number_of_replicas, (int)):
-      dev.num_replicas = number_of_replicas
   else:
     for i, n in enumerate(num_ipus):
       dev = opts.device_config.add()
       dev.auto_count = n
-      if isinstance(number_of_replicas, (list, tuple)):
-        dev.num_replicas = number_of_replicas[i]
 
   return opts
 
 
-def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
+def select_ipus(opts, indices):
   """Configure the IPUs to be used by the session.
 
   The configuration describes a system consisting of multiple Tensorflow
@@ -589,10 +581,7 @@ def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
 
   Args:
     opts: An IpuOptions session control protobuf.
-    indicies: List of IPU configuration indicies.
-    sharded: Deprecated.
-    number_of_replicas: The number of replicas to divide the device into. This
-      should be a divisor of the number of IPUs.
+    indices: List of IPU configuration indices.
   Returns:
     The IpuOptions configuration protobuf, with a number of devices selected by
     IPU configuration index.
@@ -602,23 +591,37 @@ def select_ipus(opts, indices, sharded=False, number_of_replicas=None):
     raise Exception("IPU devices have already been configured.")
 
   if not isinstance(indices, (list, tuple)):
-    raise Exception("`indicies` must be a list or tuple.")
+    raise Exception("`indices` must be a list or tuple.")
 
-  if number_of_replicas is not None:
-    if not isinstance(number_of_replicas, (list, tuple)):
-      raise Exception("`number_of_replicas` must be a list or tuple.")
-
-  if sharded:
-    logging.warning("`sharded` has been deprecated.  Mark operations with a "
-                    "sharding attribute to enable sharding")
+  if len(set(indices)) != len(indices):
+    raise Exception("All device indeicies in `indices` must be unique.")
 
   for n, i in enumerate(indices):
     dev = opts.device_config.add()
     dev.cfg_index = i
-    if isinstance(number_of_replicas, (list, tuple)):
-      dev.num_replicas = number_of_replicas[n]
 
   return opts
+
+
+def reset_ipu_seed(seed, device="/device:IPU:0", cpu_device="cpu"):
+  """Reset the seed used to generate stateful random numbers and perform
+  stochastic rounding.
+
+  Args:
+    seed: The new random number generator seed.
+    device: The device to which the seed will be applied.
+    cpu_device: The CPU device which is on the same hardware to the IPU device.
+
+  Returns:
+    None
+  """
+  g = ops.Graph()
+  with g.as_default():
+    with ops.device(cpu_device):
+      cfg_op = gen_ipu_ops.ipu_reset_seed(device, seed)
+
+  with session_lib.Session(graph=g) as sess:
+    sess.run(cfg_op)
 
 
 def extract_all_strings_from_event_trace(events):
@@ -768,20 +771,6 @@ def extract_execute_reports(events):
       except UnicodeDecodeError:
         pass
   return result
-
-
-def extract_graphviz_from_compilation_event(evt):
-  """Return the final optimized XLA graph from a COMPILE_BEGIN event.
-
-  Args:
-    evt: An IpuTraceEvent which is of type COMPILE_BEGIN.
-
-  Returns:
-    A DOT file string of the main XLA computation.
-  """
-  if evt.type != IpuTraceEvent.COMPILE_BEGIN:
-    raise Exception("`evt` must be a COMPILE_BEGIN event")
-  return evt.compile_begin.xla_graph
 
 
 def get_memory_size_from_events(events):

@@ -54,21 +54,18 @@ class DropoutOp : public PoplibsOpDef {
 
     const HloDropoutInstruction* dropout_instruction =
         dynamic_cast<const HloDropoutInstruction*>(inst);
-    assert(op && "Expected operation to be an xla::poplarplugin::DropoutOp");
+    assert(dropout_instruction &&
+           "Expected operation to be an xla::poplarplugin::DropoutOp");
 
-    // The probabilty that any given element of "x" will be disgarded.
+    // The probabilty that any given element of "x" will be discarded.
     double rate = dropout_instruction->Rate();
 
-    // The value to scale the non-droped elements by.
+    // The value to scale the non-dropped elements by.
     double scale = dropout_instruction->Scale();
 
     // If false, pass in user_seed, else pass in global_seed.
     bool is_user_seed = dropout_instruction->IsUserSeed();
     int32_t seed_modifier = dropout_instruction->SeedModifier();
-
-    // The global seed value we use.
-    std::srand(std::time(nullptr));
-    int32_t global_seed = std::rand();
 
     // Create an empty tensor for the dropout. This is internal to the poprand
     // implementation but is exposed anyway so we need to provide it.
@@ -109,8 +106,8 @@ class DropoutOp : public PoplibsOpDef {
 
     // Perform the actual dropout by calling into the poprand function.
     poplar::Tensor final_output =
-        poprand::dropout(graph, &as_unsgined, seed_modifier, input, reference,
-                         rate, scale, seq, "Dropout");
+        poprand::dropout(graph, &as_unsgined, seed_modifier, input, input, rate,
+                         scale, seq, GetDebugName(inst));
 
     // Mark that tensor as our output.
     TF_CHECK_OK(AddOutputTensor(tensor_map, inst, 0, final_output));

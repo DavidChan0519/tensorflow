@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 package xla.poplarplugin;
-
+// NEXT ID 12
 message IpuOptions {
 
   // Structure for setting an idividual Poplar OptionFlag for OptionFlags
@@ -66,9 +66,6 @@ message IpuOptions {
       // Set this to acquire a specific IPU hardware configuration.
       int32 cfg_index = 2;
     }
-
-    // Number of replicas (should be a divisor of the number of IPUs
-    int32 num_replicas = 3;
   };
   repeated DeviceConfig device_config = 4;
 
@@ -81,8 +78,8 @@ message IpuOptions {
     bool disable_graph_convolution_caching = 2;
 
     // Option to enable re-computation of non linearities.
-    bool recompute_norm_inputs = 3;
-    bool has_recompute_norm_inputs = 4;
+    bool allow_recompute = 3;
+    bool has_allow_recompute = 4;
 
     // Merge all streaming reads into a block to reduce the host-sync round-trip
     // count.  This may decrease the device->host read latency at the expense of
@@ -117,4 +114,8 @@ message IpuOptions {
     bool nanoo = 6;
   }
   FloatingPointBehaviour floating_point_behaviour = 10;
+
+  // The maximum number of bytes to wait before a inter IPU copy between IPUs is
+  // scheduled.
+  int64 max_inter_ipu_copies_buffer_size = 11;
 };

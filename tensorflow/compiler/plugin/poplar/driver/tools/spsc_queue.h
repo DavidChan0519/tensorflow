@@ -76,6 +76,16 @@ class SPSCQueue {
   }
 
   /**
+   * Advance the write position of the queue.
+   * This is only safe to call on the same thread which pushes to the queue.
+   *
+   */
+  inline void AdvanceWritePosition() {
+    write_position_ = (write_position_ + 1) % Capacity;
+    std::atomic_fetch_add(&size_, std::size_t{1});
+  }
+
+  /**
    * Push an element into the queue.
    *
    * \param item The element to push.
@@ -88,9 +98,7 @@ class SPSCQueue {
 
     post_apply_(buffer_[write_position_]);
     buffer_[write_position_] = item;
-    write_position_ = (write_position_ + 1) % Capacity;
-
-    std::atomic_fetch_add(&size_, std::size_t{1});
+    AdvanceWritePosition();
   }
 
   /**
@@ -123,6 +131,16 @@ class SPSCQueue {
   }
 
   /**
+   * Advance the read position of the queue.
+   * This is only safe to call on the same thread which pops from the queue.
+   *
+   */
+  inline void AdvanceReadPosition() {
+    read_position_ = (read_position_ + 1) % Capacity;
+    std::atomic_fetch_sub(&size_, std::size_t{1});
+  }
+
+  /**
    * Pop an element from the queue.
    *
    * \param item The element to pop into.
@@ -134,9 +152,7 @@ class SPSCQueue {
     assert(!IsEmpty());
 
     item = buffer_[read_position_];
-    read_position_ = (read_position_ + 1) % Capacity;
-
-    std::atomic_fetch_sub(&size_, std::size_t{1});
+    AdvanceReadPosition();
   }
 
   /**
@@ -184,7 +200,7 @@ class SPSCQueue {
    */
   inline bool IsEmpty() const { return std::atomic_load(&size_) == 0; }
 
- private:
+ protected:
   std::array<T, Capacity> buffer_;
 
   alignas(64) std::atomic<std::size_t> size_;

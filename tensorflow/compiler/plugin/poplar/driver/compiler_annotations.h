@@ -21,9 +21,9 @@ limitations under the License.
 
 #include "tensorflow/compiler/plugin/poplar/driver/passes/allocation_finder.h"
 #include "tensorflow/compiler/plugin/poplar/driver/passes/convolution_classifier.h"
-#include "tensorflow/compiler/plugin/poplar/driver/passes/inplace_finder.h"
-#include "tensorflow/compiler/plugin/poplar/driver/passes/inplace_util.h"
+#include "tensorflow/compiler/plugin/poplar/driver/poplar_feed_config.pb.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/input_output_aliasing_map.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -33,10 +33,16 @@ class HloInfeedInstruction;
 namespace poplarplugin {
 
 struct FeedInfo {
+  FeedInfo(const std::string& stream_prefix, const PoplarFeedConfig& config,
+           const Shape& shape)
+      : stream_prefix(stream_prefix), config(config), shape(shape) {}
+  FeedInfo() = delete;
+
   std::string stream_prefix;
-  std::string config;
+  PoplarFeedConfig config;
   Shape shape;
 };
+
 using OutfeedInfos = std::vector<FeedInfo>;
 using InfeedInfos = std::vector<FeedInfo>;
 
@@ -54,10 +60,11 @@ struct CompilerAnnotations {
 
   ConvClassification classification_map;
 
-  InplaceInstructions inplace_instructions;
-
   InfeedInfos infeed_infos;
+
   OutfeedInfos outfeed_infos;
+
+  TensorsWithLayouts tensors_with_layout;
 };
 
 }  // namespace poplarplugin

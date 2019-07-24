@@ -6,6 +6,7 @@
 #include "tensorflow/compiler/plugin/poplar/driver/compiler_resources.h"
 #include "tensorflow/compiler/plugin/poplar/driver/ops/ops.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tensor.h"
+#include "tensorflow/compiler/plugin/poplar/driver/tools/flags.h"
 #include "tensorflow/compiler/plugin/poplar/driver/tools/util.h"
 #include "tensorflow/compiler/plugin/poplar/driver/vertex_templates.h"
 
@@ -14,6 +15,7 @@
 #include "tensorflow/compiler/xla/service/hlo_query.h"
 #include "tensorflow/compiler/xla/window_util.h"
 
+#include <poplar/TensorCloneMethod.hpp>
 #include <popnn/Pooling.hpp>
 #include <popnn/PoolingDef.hpp>
 #include <popops/Cast.hpp>
@@ -21,6 +23,8 @@
 #include <popops/ElementWise.hpp>
 #include <popops/Pad.hpp>
 #include <popops/Reduce.hpp>
+#include <poputil/TileMapping.hpp>
+#include <poputil/Util.hpp>
 
 using ::absl::StrCat;
 
@@ -232,7 +236,6 @@ std::set<unsigned int> GetPoolingReductionDims(const Window& window) {
     }
   }
 
-  // TODO make sure this works with T5956.
   // When we have a single reduction dimension, add an adjacent dimension for
   // reduction as well.
   if (reduction_dims.size() == 1) {
@@ -336,8 +339,23 @@ StatusOr<poplar::program::Program> CreateSimpleReduction(
       reduction_dims.push_back(d);
     }
 
-    poplar::Tensor out = popops::reduce(graph, to_reduce, reduction_dims, op,
-                                        seq, GetDebugName(inst));
+    TF_ASSIGN_OR_RETURN(auto type, PoplarDataType(inst->shape()));
+    const auto shape = PoplarShapeFromXlaShape(inst->shape());
+    out = graph.addVariable(type, shape, GetDebugName(inst) + "/out");
+
+    const auto to_reduce_mapping = graph.getTileMapping(to_reduce);
+    std::vector<unsigned> tiles;
+    for (auto i = 0ul; i < to_reduce_mapping.size(); ++i) {
+      if (!to_reduce_mapping[i].empty()) {
+        tiles.push_back(i);
+      }
+    }
+
+    // Map the reduce output to the same number of tiles
+    poputil::mapTensorLinearly(
+        graph, out, 0, std::max<unsigned>(1, out.numElements() / tiles.size()));
+    popops::reduceWithOutput(graph, to_reduce, out, reduction_dims, op, seq,
+                             GetDebugName(inst));
 
     // Apply initial value
     Literal identity_literal = GetIdentityConstantLiteral(root, inst);
@@ -516,10 +534,6 @@ StatusOr<poplar::program::Program> CreatePoplibsPooling(
     return prog;
   }
 
-  if (reduction_dims.size() != 2) {
-    return xla::FailedPrecondition("Popnn pooling only supports 2D pooling.");
-  }
-
   const auto shuffle_in =
       GetShuffleInputDimensionsForPoplar(window, reduction_dims);
   to_reduce = to_reduce.dimShuffle(shuffle_in);
@@ -598,9 +612,6 @@ StatusOr<poplar::program::Program> CreatePoplibsMaxPoolGrad(
                       FindInstructionInput(tensor_map, res, inst, 2, seq));
 
   const auto reduction_dims = GetPoolingReductionDims(window);
-  if (reduction_dims.size() != 2) {
-    return xla::FailedPrecondition("Popnn pooling only supports 2D pooling.");
-  }
 
   const auto shuffle_in =
       GetShuffleInputDimensionsForPoplar(window, reduction_dims);
@@ -645,9 +656,6 @@ StatusOr<poplar::program::Program> CreatePoplibsPoolingGrad(
   std::vector<std::size_t> input_shape = *optional_input_shape;
 
   const auto reduction_dims = GetPoolingReductionDims(window);
-  if (reduction_dims.size() != 2) {
-    return xla::FailedPrecondition("Popnn pooling only supports 2D pooling.");
-  }
 
   const auto shuffle_in =
       GetShuffleInputDimensionsForPoplar(window, reduction_dims);
@@ -891,13 +899,16 @@ StatusOr<poplar::program::Program> CreateReplicatedAllReduce(
     const xla::Shape& output, TensorMap& tensor_map) {
   poplar::program::Sequence seq;
 
-  // If we aren't part of a replicated graph, then it's just an identity op
-  if (!res.replicated_graph) {
+  // If we aren't part of a replicated graph, then just duplicate the tensor.
+  if (res.replication_factor < 2) {
+    poplar::Graph& graph = GetGraph(res, inst);
     for (int i = 0; i < inst->operand_count(); ++i) {
       TF_ASSIGN_OR_RETURN(auto in,
                           FindInstructionInput(tensor_map, res, inst, i, seq));
-
-      TF_CHECK_OK(AddOutputTensor(tensor_map, inst, i, in));
+      auto out = poputil::duplicate(
+          graph, in, seq, StrCat(GetDebugName(inst), "/", i),
+          poplar::TensorCloneMethod::PRESERVE_ORDER_AND_ALIASES);
+      TF_CHECK_OK(AddOutputTensor(tensor_map, inst, i, out));
     }
   } else {
     // Collect all of the input tensors
@@ -907,49 +918,18 @@ StatusOr<poplar::program::Program> CreateReplicatedAllReduce(
                           FindInstructionInput(tensor_map, res, inst, i, seq));
     }
 
-    // Keep track of the permutation
-    std::vector<unsigned> input_tensors_perm(input_tensors.size());
-    std::iota(input_tensors_perm.begin(), input_tensors_perm.end(), 0);
+    // Create a concatenated and flattened tensor of the input tensors.
+    auto t = FlattenAndConcatenteTensors(input_tensors);
 
-    // Iteratively partition the tensors by element type
-    //  v itr
-    // [|i32,f16,f32,i32,f16,f32,i32,f16,f32]
-    auto itr = input_tensors_perm.begin();
-    while (itr != input_tensors_perm.end()) {
-      auto pred = [&](unsigned idx) {
-        return input_tensors[*itr].elementType() ==
-               input_tensors[idx].elementType();
-      };
+    // Replicated sum the concatenated tensor
+    auto out = popops::replicatedAllReduce(
+        GetReplicatedGraph(res), GetMasterGraph(res), t, popops::Operation::ADD,
+        seq, GetDebugName(inst));
 
-      // Partition the input tensor indices by element type
-      //  v itr       v p
-      // [|i32,i32,i32|f16,f32,f16,f32,f16,f32]
-      auto p = std::partition(itr, input_tensors_perm.end(), pred);
-      // Create a concatenated and flattened tensor of the partitioned inputs
-      std::vector<poplar::Tensor> flat_tensors(std::distance(itr, p));
-      std::transform(itr, p, flat_tensors.begin(), [&](const uint32 idx) {
-        return input_tensors[idx].flatten();
-      });
-      auto t = poplar::concat(flat_tensors);
-
-      // Replicated sum the concatenated tensor
-      auto out = popops::replicatedAllReduce(
-          res.replicated_graph.value(), res.main_graph, t,
-          popops::Operation::ADD, seq, GetDebugName(inst));
-
-      // Unconcat the result and unflatten
-      for (auto i = itr; i != p; ++i) {
-        auto a = out.slice(0, input_tensors[*i].numElements(), 0);
-        out = out.slice(input_tensors[*i].numElements(), out.numElements(), 0);
-
-        a = a.reshape(input_tensors[*i].shape());
-        TF_CHECK_OK(AddOutputTensor(tensor_map, inst, *i, a));
-      }
-
-      // Continue from the current partition point
-      //             v itr
-      // [i32,i32,i32|f16,f32,f16,f32,f16,f32]
-      itr = p;
+    // Unconcat the result and unflatten
+    auto output_tensors = SliceTensorIntoTensorsLike(out, input_tensors);
+    for (int64 i = 0; i != output_tensors.size(); ++i) {
+      TF_CHECK_OK(AddOutputTensor(tensor_map, inst, i, output_tensors[i]));
     }
   }
 

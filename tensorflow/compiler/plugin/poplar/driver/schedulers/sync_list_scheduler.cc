@@ -406,7 +406,7 @@ StatusOr<HloInstructionSequence> SyncListMemoryScheduler(
 }
 }  // namespace
 
-MemorySchedulerAlgorithm CreateSyncListMemoryScheduler(int64 max_syncs) {
+IpuSchedulerAlgorithm CreateSyncListMemoryScheduler(int64 max_syncs) {
   return [=](HloComputation* computation,
              const TuplePointsToAnalysis& points_to_analysis,
              const LogicalBuffer::SizeFunction& size_function,

@@ -521,7 +521,7 @@ xla::StatusOr<xla::XlaOp> MakeXlaBackpropFilterConvOp(
   // In the case of depthwise convolution with no multiplier,
   // the computation can be done by the batch_group_count parameter.
   bool use_batch_group_count = false;
-      //filter_tensor_shape.dim_size(num_dims - 1) == 1 && attrs.depthwise;
+      //filter_shape.dimensions(num_dims - 1) == 1 && attrs.depthwise;
 
   std::vector<std::pair<int64, int64>> padding(attrs.num_spatial_dims);
   std::vector<int64> rhs_dilation(attrs.num_spatial_dims);

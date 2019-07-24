@@ -157,6 +157,14 @@ class BaseVisitor : public DfsHloVisitor {
 
   Status HandleCholesky(HloInstruction* hlo) override;
 
+  Status HandlePartitionId(HloInstruction* hlo) override;
+
+  Status HandleRngGetAndUpdateState(HloInstruction* hlo) override;
+
+  Status HandleCopyStart(HloInstruction* hlo) override;
+
+  Status HandleCopyDone(HloInstruction* hlo) override;
+
   virtual poplar::program::Sequence GetSequence() const { return sequence; }
 
   // This should only be used for unit tests

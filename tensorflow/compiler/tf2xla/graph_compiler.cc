@@ -100,9 +100,12 @@ Status PrepareArguments(XlaOpKernelContext* ctx, Graph* graph,
         arg.name = resource->name();
         break;
       }
-      case XlaExpression::Kind::kTensorList:
-        return errors::Unimplemented(
-            "TensorList as function argument is not yet implemented.");
+      case XlaExpression::Kind::kTensorList: {
+        arg.kind = XlaCompiler::Argument::kTensorList;
+        const xla::XlaOp& tensor_list = expressions[i]->handle();
+        arg.shape = tensor_list.builder()->GetShape(tensor_list).ValueOrDie();
+        break;
+      }
       case XlaExpression::Kind::kInvalid:
         return errors::InvalidArgument("Invalid function argument");
     }
@@ -201,7 +204,7 @@ Status GraphCompiler::Compile() {
 
         AssignExpressionToTensor(control_dep_tensor.get(),
                                  XlaExpression::XlaOp(op0, tensor->dtype()));
-        tensor_inputs_.at(0) = control_dep_tensor.get();
+        tensor_inputs_.at(0) = TensorValue(control_dep_tensor.get());
       }
     }
 
@@ -372,8 +375,13 @@ Status GraphCompiler::CompileFunctionalNode(Node* n,
     if (result.outputs[i].is_constant) {
       xla_op_context.SetConstantOutput(i, result.outputs[i].constant_value);
     } else {
-      xla_op_context.SetOutput(
-          i, xla::GetTupleElement(output_handle, computation_output));
+      if (result.outputs[i].is_tensor_list) {
+        xla_op_context.SetTensorListOutput(
+            i, xla::GetTupleElement(output_handle, computation_output));
+      } else {
+        xla_op_context.SetOutput(
+            i, xla::GetTupleElement(output_handle, computation_output));
+      }
       ++computation_output;
     }
   }

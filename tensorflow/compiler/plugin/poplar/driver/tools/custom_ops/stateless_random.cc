@@ -23,7 +23,9 @@ namespace poplarplugin {
 HloStatelessRandom::HloStatelessRandom(
     const Shape& shape, absl::Span<HloInstruction* const> operands,
     const std::string& op_string)
-    : HloPoplarInstruction(shape, operands, op_string, {}) {}
+    : HloPoplarInstruction(shape, operands, op_string) {
+  set_custom_call_has_side_effect(true);
+}
 
 HloStatelessRandomUniform::HloStatelessRandomUniform(
     const Shape& shape, absl::Span<HloInstruction* const> operands)

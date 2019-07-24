@@ -473,21 +473,24 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
 
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
+
       ok = [
           '__seed*',
           'Copy_',
           'host-exchange-local-copy-',
-          'gradients/vs/conv2d_1/Conv2D_grad/Conv2DBackpropInput/fusion*/Conv_1x1/',
-          'vs/conv2d/BiasAdd/fusion.1/addToChannel',
-          'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/ReduceFinalStage/IntermediateToOutput/Reduce',
+          'vs/conv2d/BiasAdd/fusion*/addToChannel',
+          'vs/conv2d/Conv2D/convolution*',
+          'vs/conv2d_1/BiasAdd/fusion.2/addToChannel',
+          'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion.3/ReduceFinalStage/IntermediateToOutput/Reduce',
           'GradientDescent/update_vs/conv2d/bias/ResourceApplyGradientDescent/fusion*/negate/Op/Negate',
           'gradients/vs/conv2d/Conv2D_grad/Conv2DBackpropFilter/fusion*/Conv_4x4/',
           'gradients/vs/conv2d/Conv2D_grad/Conv2DBackpropFilter/fusion*/AddTo',
           'GradientDescent/update_vs/conv2d_1/bias/ResourceApplyGradientDescent/multiply*/Op/Multiply',
-          'GradientDescent/update_vs/conv2d_1/bias/ResourceApplyGradientDescent/subtract*/AddTo',
-          'vs/conv2d_1/BiasAdd/fusion*/addToChannel',
+          'GradientDescent/update_vs/conv2d_1/bias/ResourceApplyGradientDescent/fusion*/AddTo',
+          'vs/conv2d/BiasAdd/fusion*/addToChannel',
           'Sum/reduce*/ReduceFinalStage/IntermediateToOutput/Reduce',
       ]
+
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
 
   def testAvgPoolValid(self):
@@ -649,11 +652,9 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
 
       s = tu.extract_all_strings_from_event_trace(result)
       cs_list = tu.get_compute_sets_from_report(s)
-
       ok = [
           '__seed*', 'host-exchange-local-copy',
-          'xw_plus_b/MatMul/dot.*/Conv_1/Convolve',
-          'xw_plus_b/fusion/addToChannel'
+          'xw_plus_b/MatMul/dot.*/Conv_1/Convolve', 'xw_plus_b/fusion/Op/Add'
       ]
       self.assertTrue(tu.check_compute_sets_in_whitelist_entries(cs_list, ok))
 
@@ -692,7 +693,7 @@ class IpuFuseOpsTest(test_util.TensorFlowTestCase):
       ok = [
           '__seed*', 'host-exchange-local-copy', 'Copy_',
           'vs/conv2d/Conv2D/convolution.*/Conv_1x1', 'vs/conv2d/BiasAdd',
-          'vs/batch_normalization/FusedBatchNorm/batch-norm-inference.*/',
+          'vs/batch_normalization/FusedBatchNorm*/batch-norm-inference.*/',
           'vs/Relu/custom-call/Nonlinearity'
       ]
       self.assertTrue(tu.check_all_compute_sets_and_list(cs_list, ok))
